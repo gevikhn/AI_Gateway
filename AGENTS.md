@@ -27,9 +27,10 @@ Phase 2（仅 roadmap，暂不实现）:
 
 当前仓库以设计文档为主（docs-first）。当实现代码落地时，遵循以下结构：
 - `src/main.rs`: 启动、状态装配、路由挂载
+- `src/server.rs`: HTTP 入口、请求处理流程、上游转发与错误映射
 - `src/config.rs`: YAML 解析、`${ENV_VAR}` 插值、配置校验
 - `src/auth.rs`: `GW_TOKEN` 提取与校验
-- `src/proxy.rs`: URL 重写、header 处理、请求/响应流式转发
+- `src/proxy.rs`: 路由匹配、URL 重写、header 处理辅助函数
 - `tests/`: 跨模块集成测试（routing/auth/streaming/timeout）
 - `src/ratelimit.rs`（Phase 2 optional）
 - `src/reload.rs`（Phase 2 optional）

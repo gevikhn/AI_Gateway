@@ -1,17 +1,16 @@
 use ai_gw_lite::config::AppConfig;
-use std::process::ExitCode;
+use ai_gw_lite::server;
+use std::sync::Arc;
 
-fn main() -> ExitCode {
-    match run() {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(message) => {
-            eprintln!("{message}");
-            ExitCode::from(1)
-        }
+#[tokio::main]
+async fn main() {
+    if let Err(message) = run().await {
+        eprintln!("{message}");
+        std::process::exit(1);
     }
 }
 
-fn run() -> Result<(), String> {
+async fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         print_usage();
@@ -22,13 +21,7 @@ fn run() -> Result<(), String> {
     let config = AppConfig::load_from_file(&config_path)
         .map_err(|err| format!("failed to load config `{config_path}`: {err}"))?;
 
-    println!(
-        "Initialized ai-gw-lite skeleton. listen={} routes={}",
-        config.listen,
-        config.routes.len()
-    );
-
-    Ok(())
+    server::run_server(Arc::new(config)).await
 }
 
 fn parse_config_path(args: &[String]) -> Result<String, String> {

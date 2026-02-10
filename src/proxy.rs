@@ -186,6 +186,7 @@ fn normalize_path(path: &str) -> String {
 mod tests {
     use super::{
         build_upstream_url_for_route, match_route, prepare_upstream_headers, rewrite_path,
+        sanitize_response_headers,
     };
     use crate::config::{HeaderInjection, RouteConfig, UpstreamConfig};
     use http::{HeaderMap, HeaderValue};
@@ -256,6 +257,22 @@ mod tests {
         assert_eq!(
             outbound.get("authorization").and_then(|v| v.to_str().ok()),
             Some("Bearer injected")
+        );
+    }
+
+    #[test]
+    fn remove_hop_by_hop_from_response_headers() {
+        let mut upstream_headers = HeaderMap::new();
+        upstream_headers.insert("connection", HeaderValue::from_static("keep-alive"));
+        upstream_headers.insert("upgrade", HeaderValue::from_static("websocket"));
+        upstream_headers.insert("x-upstream-ok", HeaderValue::from_static("1"));
+
+        let sanitized = sanitize_response_headers(&upstream_headers);
+        assert!(!sanitized.contains_key("connection"));
+        assert!(!sanitized.contains_key("upgrade"));
+        assert_eq!(
+            sanitized.get("x-upstream-ok").and_then(|v| v.to_str().ok()),
+            Some("1")
         );
     }
 

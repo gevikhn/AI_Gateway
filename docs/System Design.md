@@ -301,8 +301,9 @@ cors:
 
 - `config.rs`：YAML 解析、插值（env）、校验
 - `auth.rs`：入站 token 提取与校验
-- `proxy.rs`：构造上游请求、header 处理、body/response 流式转发
-- `main.rs`：启动、路由挂载、全局状态
+- `proxy.rs`：路由匹配、URL 重写、header 处理辅助函数
+- `server.rs`：HTTP 入口、请求处理流程、上游转发与错误映射
+- `main.rs`：启动参数解析、配置加载、服务启动
 - `ratelimit.rs`（第二阶段）：固定窗口计数器
 - `reload.rs`（第二阶段）：热加载（notify + ArcSwap）
 
@@ -371,3 +372,21 @@ Codex 实现应交付：
 
 - 限流 + 并发控制
 - 配置热加载（notify）
+
+------
+
+## 12. 当前实现状态（2026-02-10）
+
+第一阶段已完成项（代码已落地）：
+
+- `axum + reqwest` 主链路已接入（服务启动、fallback 代理、上游流式转发）
+- 路由段边界匹配 + 最长前缀优先
+- 入站鉴权（Bearer / 自定义 header 来源）
+- 请求与响应两侧 hop-by-hop 头清洗
+- 上游 header 注入覆盖与敏感头移除
+- SSE 透传与基础超时映射
+- 单元测试 + e2e 测试覆盖核心 DoD
+
+说明：
+
+- 本节用于标注“当前代码实际状态”，若后续实现变化请同步更新。
