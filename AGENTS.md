@@ -1,6 +1,6 @@
 # Repository & Agent Guidelines / 仓库与代理协作规范
 
-本仓库当前为 docs-first。`docs/System Design.md` 是设计事实源（source of truth）；若本文件与其冲突，以 `docs/System Design.md` 为准。
+本仓库当前为 docs-first。`docs/System Design.md` 是设计事实源（source of truth）；若本文件与其冲突，以 `docs/System Design.md` 为准。`plan.md` 是实施执行事实源（execution source of truth），用于追踪任务状态与验证结果。
 
 ## Current Delivery Scope / 当前交付范围
 
@@ -19,6 +19,9 @@ Phase 2（仅 roadmap，暂不实现）:
 
 硬约束:
 - 未被任务显式要求时，不实现 Phase 2 能力（do not implement Phase 2 unless explicitly requested）。
+- 在进行任何项目改动前，必须先更新 `plan.md`（将对应任务标记为 `IN_PROGRESS` 并记录目标）。
+- 在完成任何项目改动后，必须再次更新 `plan.md`（状态、验证命令、结果、剩余事项）。
+- 任意单个源码文件不得超过 2000 行（hard cap）；超过或接近上限时必须拆分模块。
 
 ## Project Structure / 项目结构
 
@@ -30,6 +33,7 @@ Phase 2（仅 roadmap，暂不实现）:
 - `tests/`: 跨模块集成测试（routing/auth/streaming/timeout）
 - `src/ratelimit.rs`（Phase 2 optional）
 - `src/reload.rs`（Phase 2 optional）
+- `plan.md`: 实施计划、任务状态、执行记录（must-update during change lifecycle）
 
 要求:
 - 目录职责单一，避免将运行时代码与设计说明混放。
@@ -76,6 +80,16 @@ Header 处理:
 - 禁止记录入站 `Authorization`、`x-api-key` 或任何注入后的密钥头。
 - 禁止在错误消息中返回密钥信息。
 
+Rust 最佳实践约束（Community Baseline）:
+- 必须通过 `cargo fmt --all` 与 `cargo clippy --all-targets --all-features -- -D warnings`。
+- 生产路径禁止无理由使用 `unwrap`/`expect`/`panic!`；可恢复错误必须返回 `Result`。
+- 优先使用明确错误类型（typed errors），避免仅依赖字符串错误。
+- 异步上下文禁止阻塞调用；必须使用异步 API，必要时使用 `spawn_blocking` 隔离。
+- `unsafe` 默认为禁止；确需使用时必须附带 `SAFETY` 注释、最小作用域与测试覆盖。
+- 避免不必要 `clone`；优先借用（borrow）与迭代器，降低分配与拷贝。
+- 新增或变更的公共行为必须补充测试（单测或集成测试）。
+- 文件与模块保持单一职责（single responsibility），避免“大文件 + 大而全模块”。
+
 ## Testing Guidelines / 测试与 DoD（Phase 1）
 
 PR 合并前至少覆盖以下场景（minimum DoD）:
@@ -98,6 +112,8 @@ PR 合并前至少覆盖以下场景（minimum DoD）:
 PR 必填检查项:
 - [ ] 标注本次范围：Phase 1 还是 Phase 2
 - [ ] 说明与 `docs/System Design.md` 的对齐点
+- [ ] 改动前后均已更新 `plan.md`（任务状态 + 验证记录）
+- [ ] 无源码文件超过 2000 行，必要时已完成模块拆分
 - [ ] 提供测试证据（`cargo test` 输出或等效证据）
 - [ ] 提供关键代理行为样例（request/response 或 curl）
 

@@ -1,0 +1,35 @@
+listen: "127.0.0.1:8080"
+
+gateway_auth:
+  tokens:
+    - "gw_dev_token"
+  token_sources:
+    - type: "authorization_bearer"
+    - type: "header"
+      name: "x-gw-token"
+
+routes:
+  - id: "openai"
+    prefix: "/openai"
+    upstream:
+      base_url: "https://api.openai.com"
+      strip_prefix: true
+      connect_timeout_ms: 10000
+      request_timeout_ms: 60000
+      inject_headers:
+        - name: "authorization"
+          value: "Bearer sk-dev-placeholder"
+      remove_headers:
+        - "authorization"
+        - "x-forwarded-for"
+        - "forwarded"
+        - "cf-connecting-ip"
+        - "true-client-ip"
+      forward_xff: false
+
+cors:
+  enabled: false
+  allow_origins: []
+  allow_headers: []
+  allow_methods: []
+  expose_headers: []
