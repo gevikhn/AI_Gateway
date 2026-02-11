@@ -16,6 +16,12 @@ routes:
       strip_prefix: true
       connect_timeout_ms: 10000
       request_timeout_ms: 60000
+      # 可选：为该上游单独配置出站代理（http / https / socks）
+      # proxy:
+      #   protocol: "http"
+      #   address: "127.0.0.1:7890"
+      #   username: "proxy_user"
+      #   password: "proxy_pass"
       inject_headers:
         - name: "authorization"
           value: "Bearer sk-dev-placeholder"

@@ -50,6 +50,7 @@ Phase 1 范围:
 | M7 | 文档收口与交付说明 | DONE | `AGENTS.md`, `docs/System Design.md`, `plan.md` | 设计、规范、实施状态一致 |
 | M8 | 代码规范约束增强（Rust best practices） | DONE | `AGENTS.md`, `plan.md` | 增加 2000 行限制与 Rust 社区最佳实践约束 |
 | M9 | 人类使用手册（README） | DONE | `README.md`, `plan.md` | 提供配置、编译、运行、部署、排障说明 |
+| M10 | 上游代理能力（http/https/socks + 认证） | DONE | `src/config.rs`, `src/server.rs`, `tests/*`, `README.md`, `config/dev.yaml`, `docs/System Design.md`, `Cargo.toml`, `plan.md` | 可按路由配置出站代理并通过测试验证 |
 
 ## 4. 详细实施步骤（执行顺序）
 
@@ -124,6 +125,52 @@ Phase 1 范围:
 ## 6. 执行记录（Work Log）
 
 > 按时间倒序追加，每条记录必须包含：任务 ID、变更摘要、验证命令、结果。
+
+### 2026-02-11
+- 任务: M10
+- 变更（After Change）:
+  - 在 `UpstreamConfig` 增加可选 `proxy` 配置，支持 `protocol=http|https|socks`、`address`、`username/password`
+  - 新增配置校验：代理地址不可为空，用户名和密码必须成对出现且不能为空
+  - 在按路由构建 `reqwest::Client` 时接入代理配置，`socks` 映射为 `socks5h`，支持代理认证
+  - 为 `reqwest` 启用 `socks` feature
+  - 新增测试：代理配置解析/校验、代理 URL 构建、HTTP 代理 + Basic 认证链路 e2e
+  - 同步更新 `README.md`、`docs/System Design.md`、`config/dev.yaml` 的代理配置说明
+- 实际改动文件:
+  - `Cargo.toml`
+  - `src/config.rs`
+  - `src/server.rs`
+  - `src/proxy.rs`
+  - `tests/gateway_e2e.rs`
+  - `README.md`
+  - `docs/System Design.md`
+  - `config/dev.yaml`
+  - `plan.md`
+- 验证:
+  - `cargo fmt --all`
+  - `cargo test`
+  - `cargo clippy --all-targets --all-features -- -D warnings`
+- 结果: DONE
+- 剩余事项:
+  - 当前仅对 HTTP 代理链路做了端到端验证；`https/socks` 通过配置与 client 构建单测覆盖，后续可补充真实代理服务的 e2e
+
+### 2026-02-11
+- 任务: M10
+- 变更（Before Change）:
+  - 计划为 gateway -> upstream 链路增加可配置代理能力，支持 `http`/`https`/`socks` 三类代理协议
+  - 计划支持代理用户名/密码配置，并接入到按路由构建的 `reqwest::Client`
+  - 计划补充配置校验与测试（含代理鉴权透传验证）并同步更新文档示例
+- 拟改动文件:
+  - `src/config.rs`
+  - `src/server.rs`
+  - `src/proxy.rs`
+  - `tests/gateway_e2e.rs`
+  - `README.md`
+  - `config/dev.yaml`
+  - `Cargo.toml`
+  - `plan.md`
+- 验证:
+  - 完成后执行 `cargo fmt --all`、`cargo test`、`cargo clippy --all-targets --all-features -- -D warnings`
+- 结果: IN_PROGRESS
 
 ### 2026-02-10
 - 任务: M9

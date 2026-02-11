@@ -99,6 +99,12 @@ routes:
       strip_prefix: true
       connect_timeout_ms: 10000
       request_timeout_ms: 60000
+      # 可选：按路由配置出站代理
+      proxy:
+        protocol: "http" # http | https | socks
+        address: "127.0.0.1:7890"
+        username: "${PROXY_USERNAME}"
+        password: "${PROXY_PASSWORD}"
       inject_headers:
         - name: "authorization"
           value: "Bearer ${OPENAI_API_KEY}"
@@ -188,6 +194,7 @@ cors:
 | `inject_headers` | `array<object>` | 否 | `[]` | Header 名和值需合法 | 注入到上游请求；同名会覆盖。 |
 | `remove_headers` | `array<string>` | 否 | `[]` | 大小写不敏感 | 转发前移除的请求头。 |
 | `forward_xff` | `bool` | 否 | `false` | `true/false` | 是否保留/传递 `x-forwarded-for` 等来源 IP 头。 |
+| `proxy` | `object` | 否 | `null` | 协议为 `http/https/socks` | 按路由配置 gateway 到上游的出站代理。 |
 
 #### `inject_headers` 子项
 
@@ -203,6 +210,19 @@ inject_headers:
   - name: "authorization"
     value: "Bearer ${OPENAI_API_KEY}"
 ```
+
+#### `proxy` 子项（可选）
+
+| Key | 类型 | 必填 | 默认值 | 说明 |
+| --- | --- | --- | --- | --- |
+| `protocol` | `string` | 是 | 无 | 代理协议：`http` / `https` / `socks`。 |
+| `address` | `string` | 是 | 无 | 代理地址，格式 `host:port`。 |
+| `username` | `string` | 否 | `null` | 代理认证用户名。 |
+| `password` | `string` | 否 | `null` | 代理认证密码。 |
+
+约束：
+- `username` 与 `password` 必须同时出现或同时省略。
+- 建议通过 `${ENV_VAR}` 注入代理凭据，避免明文。
 
 ### 3.6 `cors` 字段（当前版本说明）
 

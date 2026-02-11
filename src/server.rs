@@ -1,5 +1,5 @@
 use crate::auth;
-use crate::config::{AppConfig, RouteConfig, UpstreamConfig};
+use crate::config::{AppConfig, ProxyProtocol, RouteConfig, UpstreamConfig, UpstreamProxyConfig};
 use crate::proxy;
 use axum::body::{Body, Bytes};
 use axum::extract::State;
@@ -199,10 +199,40 @@ fn build_upstream_clients(config: &AppConfig) -> Result<HashMap<String, reqwest:
     Ok(clients)
 }
 
-fn build_upstream_client(upstream: &UpstreamConfig) -> Result<reqwest::Client, reqwest::Error> {
-    reqwest::Client::builder()
-        .connect_timeout(Duration::from_millis(upstream.connect_timeout_ms))
+fn build_upstream_client(upstream: &UpstreamConfig) -> Result<reqwest::Client, String> {
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(Duration::from_millis(upstream.connect_timeout_ms));
+
+    if let Some(proxy) = &upstream.proxy {
+        let proxy_url = build_proxy_url(proxy)?;
+        let reqwest_proxy = reqwest::Proxy::all(proxy_url.as_str())
+            .map_err(|err| format!("invalid upstream.proxy config: {err}"))?;
+        builder = builder.proxy(reqwest_proxy);
+    }
+
+    builder
         .build()
+        .map_err(|err| format!("failed to build reqwest client: {err}"))
+}
+
+fn build_proxy_url(proxy: &UpstreamProxyConfig) -> Result<reqwest::Url, String> {
+    let scheme = match proxy.protocol {
+        ProxyProtocol::Http => "http",
+        ProxyProtocol::Https => "https",
+        ProxyProtocol::Socks => "socks5h",
+    };
+
+    let mut url = reqwest::Url::parse(&format!("{scheme}://{}", proxy.address.trim()))
+        .map_err(|err| format!("invalid upstream.proxy.address: {err}"))?;
+
+    if let (Some(username), Some(password)) = (&proxy.username, &proxy.password) {
+        url.set_username(username)
+            .map_err(|_| "invalid upstream.proxy.username".to_string())?;
+        url.set_password(Some(password))
+            .map_err(|_| "invalid upstream.proxy.password".to_string())?;
+    }
+
+    Ok(url)
 }
 
 fn is_sse_response(headers: &http::HeaderMap) -> bool {
@@ -239,9 +269,10 @@ fn enforce_response_deadline(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_app, build_upstream_clients};
+    use super::{build_app, build_proxy_url, build_upstream_clients};
     use crate::config::{
-        AppConfig, GatewayAuthConfig, RouteConfig, TokenSourceConfig, UpstreamConfig,
+        AppConfig, GatewayAuthConfig, ProxyProtocol, RouteConfig, TokenSourceConfig,
+        UpstreamConfig, UpstreamProxyConfig,
     };
     use axum::body::{Body, to_bytes};
     use axum::http::{Method, Request, StatusCode};
@@ -307,6 +338,12 @@ mod tests {
                 inject_headers: Vec::new(),
                 remove_headers: Vec::new(),
                 forward_xff: false,
+                proxy: Some(UpstreamProxyConfig {
+                    protocol: ProxyProtocol::Https,
+                    address: "127.0.0.1:8443".to_string(),
+                    username: None,
+                    password: None,
+                }),
             },
         });
 
@@ -314,6 +351,23 @@ mod tests {
         assert_eq!(clients.len(), 2);
         assert!(clients.contains_key("openai"));
         assert!(clients.contains_key("anthropic"));
+    }
+
+    #[test]
+    fn build_proxy_url_uses_expected_scheme_and_auth() {
+        let proxy = UpstreamProxyConfig {
+            protocol: ProxyProtocol::Socks,
+            address: "127.0.0.1:1080".to_string(),
+            username: Some("proxy-user".to_string()),
+            password: Some("proxy-pass".to_string()),
+        };
+
+        let proxy_url = build_proxy_url(&proxy).expect("proxy url should build");
+        assert_eq!(proxy_url.scheme(), "socks5h");
+        assert_eq!(proxy_url.username(), "proxy-user");
+        assert_eq!(proxy_url.password(), Some("proxy-pass"));
+        assert_eq!(proxy_url.host_str(), Some("127.0.0.1"));
+        assert_eq!(proxy_url.port_or_known_default(), Some(1080));
     }
 
     fn test_config() -> AppConfig {
@@ -334,6 +388,7 @@ mod tests {
                     inject_headers: Vec::new(),
                     remove_headers: Vec::new(),
                     forward_xff: false,
+                    proxy: None,
                 },
             }],
             cors: None,

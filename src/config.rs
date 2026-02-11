@@ -50,12 +50,32 @@ pub struct UpstreamConfig {
     pub remove_headers: Vec<String>,
     #[serde(default)]
     pub forward_xff: bool,
+    #[serde(default)]
+    pub proxy: Option<UpstreamProxyConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct HeaderInjection {
     pub name: String,
     pub value: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UpstreamProxyConfig {
+    pub protocol: ProxyProtocol,
+    pub address: String,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProxyProtocol {
+    Http,
+    Https,
+    Socks,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -182,6 +202,33 @@ impl AppConfig {
                 )));
             }
 
+            if let Some(proxy) = &route.upstream.proxy {
+                if proxy.address.trim().is_empty() {
+                    return Err(ConfigError::Validation(format!(
+                        "route `{}` upstream.proxy.address must not be empty",
+                        route.id
+                    )));
+                }
+
+                match (&proxy.username, &proxy.password) {
+                    (Some(username), Some(password))
+                        if username.trim().is_empty() || password.trim().is_empty() =>
+                    {
+                        return Err(ConfigError::Validation(format!(
+                            "route `{}` upstream.proxy.username/password must not be empty",
+                            route.id
+                        )));
+                    }
+                    (Some(_), Some(_)) | (None, None) => {}
+                    _ => {
+                        return Err(ConfigError::Validation(format!(
+                            "route `{}` upstream.proxy.username and upstream.proxy.password must be set together",
+                            route.id
+                        )));
+                    }
+                }
+            }
+
             for header in &route.upstream.inject_headers {
                 if header.name.trim().is_empty() {
                     return Err(ConfigError::Validation(format!(
@@ -257,7 +304,7 @@ fn default_request_timeout_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::AppConfig;
+    use super::{AppConfig, ProxyProtocol};
 
     #[test]
     fn parse_minimal_config() {
@@ -294,5 +341,62 @@ routes:
 
         let config = AppConfig::from_yaml_str(yaml).expect("config should parse");
         assert!(!config.gateway_auth.tokens[0].is_empty());
+    }
+
+    #[test]
+    fn parse_config_with_proxy() {
+        let yaml = r#"
+listen: "127.0.0.1:8080"
+gateway_auth:
+  tokens:
+    - "gw_token"
+routes:
+  - id: "openai"
+    prefix: "/openai"
+    upstream:
+      base_url: "https://api.openai.com"
+      proxy:
+        protocol: "socks"
+        address: "127.0.0.1:1080"
+        username: "proxy-user"
+        password: "proxy-pass"
+"#;
+
+        let config = AppConfig::from_yaml_str(yaml).expect("config should parse");
+        let proxy = config.routes[0]
+            .upstream
+            .proxy
+            .as_ref()
+            .expect("proxy should exist");
+        assert_eq!(proxy.protocol, ProxyProtocol::Socks);
+        assert_eq!(proxy.address, "127.0.0.1:1080");
+        assert_eq!(proxy.username.as_deref(), Some("proxy-user"));
+        assert_eq!(proxy.password.as_deref(), Some("proxy-pass"));
+    }
+
+    #[test]
+    fn reject_proxy_with_partial_auth() {
+        let yaml = r#"
+listen: "127.0.0.1:8080"
+gateway_auth:
+  tokens:
+    - "gw_token"
+routes:
+  - id: "openai"
+    prefix: "/openai"
+    upstream:
+      base_url: "https://api.openai.com"
+      proxy:
+        protocol: "http"
+        address: "127.0.0.1:8080"
+        username: "proxy-user"
+"#;
+
+        let error = AppConfig::from_yaml_str(yaml).expect_err("config should fail");
+        assert!(
+            error.to_string().contains(
+                "upstream.proxy.username and upstream.proxy.password must be set together"
+            )
+        );
     }
 }

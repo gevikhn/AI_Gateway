@@ -114,6 +114,12 @@ routes:
       strip_prefix: true
       connect_timeout_ms: 10000
       request_timeout_ms: 60000
+      # 可选：gateway -> upstream 出站代理
+      proxy:
+        protocol: "http" # http / https / socks
+        address: "127.0.0.1:7890"
+        username: "${PROXY_USERNAME}"
+        password: "${PROXY_PASSWORD}"
       # 上游鉴权注入（可自定义 header）
       inject_headers:
         - name: "authorization"
@@ -135,6 +141,9 @@ routes:
       strip_prefix: true
       connect_timeout_ms: 10000
       request_timeout_ms: 60000
+      proxy:
+        protocol: "socks"
+        address: "127.0.0.1:1080"
       inject_headers:
         - name: "x-api-key"
           value: "${ANTHROPIC_API_KEY}"
@@ -165,6 +174,19 @@ cors:
 
 - `${ENV_NAME}`：从环境变量读取（建议默认）
 - 若 env 不存在：启动时报错或按配置策略决定（建议启动失败，避免静默无鉴权）
+
+### 3.3 上游代理配置（可选）
+
+`routes[].upstream.proxy` 用于配置 gateway 到上游之间的代理链路：
+
+- `protocol`: `http` / `https` / `socks`
+- `address`: `host:port`
+- `username` 与 `password`: 可选，若配置必须同时提供
+
+实现要求：
+
+- 代理能力按路由生效（每条 route 可独立配置）
+- 不配置 `proxy` 时保持直连行为
 
 ------
 

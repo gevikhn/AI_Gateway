@@ -1,13 +1,14 @@
 use ai_gw_lite::config::{
-    AppConfig, GatewayAuthConfig, HeaderInjection, RouteConfig, TokenSourceConfig, UpstreamConfig,
+    AppConfig, GatewayAuthConfig, HeaderInjection, ProxyProtocol, RouteConfig, TokenSourceConfig,
+    UpstreamConfig, UpstreamProxyConfig,
 };
 use ai_gw_lite::server::build_app;
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::header::CONTENT_TYPE;
-use axum::http::{HeaderMap, HeaderValue, Response, StatusCode};
-use axum::routing::{get, post};
+use axum::http::{HeaderMap, HeaderValue, Request, Response, StatusCode};
+use axum::routing::{any, get, post};
 use futures_util::stream;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -16,6 +17,12 @@ use std::time::Duration;
 struct UpstreamCapture {
     authorization: Arc<Mutex<Option<String>>>,
     x_forwarded_for: Arc<Mutex<Option<String>>>,
+}
+
+#[derive(Clone, Default)]
+struct ProxyCapture {
+    proxy_authorization: Arc<Mutex<Option<String>>>,
+    target_uri: Arc<Mutex<Option<String>>>,
 }
 
 #[tokio::test]
@@ -214,6 +221,59 @@ async fn stalled_non_sse_body_is_bounded_by_request_timeout() {
     upstream_handle.abort();
 }
 
+#[tokio::test]
+async fn http_proxy_with_auth_is_used_for_upstream() {
+    let proxy_capture = ProxyCapture::default();
+    let proxy_server = Router::new()
+        .fallback(any(proxy_observer))
+        .with_state(proxy_capture.clone());
+    let (proxy_addr, proxy_handle) = spawn_router(proxy_server).await;
+
+    let mut config = gateway_config("proxy-target.local".to_string(), 2_000);
+    config.routes[0].upstream.base_url = "http://proxy-target.local".to_string();
+    config.routes[0].upstream.proxy = Some(UpstreamProxyConfig {
+        protocol: ProxyProtocol::Http,
+        address: proxy_addr.to_string(),
+        username: Some("proxy-user".to_string()),
+        password: Some("proxy-pass".to_string()),
+    });
+
+    let app = build_app(Arc::new(config)).expect("gateway app should build");
+    let (gateway_addr, gateway_handle) = spawn_router(app).await;
+
+    let response = reqwest::Client::new()
+        .get(format!("http://{gateway_addr}/openai/v1/models?mode=proxy"))
+        .header("authorization", "Bearer gw_token")
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.text().await.expect("body should be readable"),
+        r#"{"via":"proxy"}"#
+    );
+    assert_eq!(
+        proxy_capture
+            .proxy_authorization
+            .lock()
+            .expect("lock should succeed")
+            .as_deref(),
+        Some("Basic cHJveHktdXNlcjpwcm94eS1wYXNz")
+    );
+    assert_eq!(
+        proxy_capture
+            .target_uri
+            .lock()
+            .expect("lock should succeed")
+            .as_deref(),
+        Some("http://proxy-target.local/v1/models?mode=proxy")
+    );
+
+    gateway_handle.abort();
+    proxy_handle.abort();
+}
+
 async fn spawn_router(router: Router) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -267,6 +327,7 @@ fn gateway_config(upstream_addr: String, request_timeout_ms: u64) -> AppConfig {
                     "true-client-ip".to_string(),
                 ],
                 forward_xff: false,
+                proxy: None,
             },
         }],
         cors: None,
@@ -342,5 +403,29 @@ async fn upstream_sse_slow() -> Response<Body> {
     response
         .headers_mut()
         .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+    response
+}
+
+async fn proxy_observer(
+    State(capture): State<ProxyCapture>,
+    request: Request<Body>,
+) -> Response<Body> {
+    let proxy_auth = request
+        .headers()
+        .get("proxy-authorization")
+        .and_then(|value| value.to_str().ok())
+        .map(ToString::to_string);
+
+    *capture
+        .proxy_authorization
+        .lock()
+        .expect("lock should succeed") = proxy_auth;
+    *capture.target_uri.lock().expect("lock should succeed") = Some(request.uri().to_string());
+
+    let mut response = Response::new(Body::from(r#"{"via":"proxy"}"#));
+    *response.status_mut() = StatusCode::OK;
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     response
 }
