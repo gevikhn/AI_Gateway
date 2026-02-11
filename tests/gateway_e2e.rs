@@ -1,6 +1,7 @@
 use ai_gw_lite::config::{
-    AppConfig, ConcurrencyConfig, CorsConfig, GatewayAuthConfig, HeaderInjection, ProxyProtocol,
-    RateLimitConfig, RouteConfig, TokenSourceConfig, UpstreamConfig, UpstreamProxyConfig,
+    AppConfig, ConcurrencyConfig, CorsConfig, GatewayAuthConfig, HeaderInjection, LogFormat,
+    LoggingConfig, MetricsConfig, ObservabilityConfig, ProxyProtocol, RateLimitConfig, RouteConfig,
+    TokenSourceConfig, TracingConfig, UpstreamConfig, UpstreamProxyConfig,
 };
 use ai_gw_lite::server::build_app;
 use axum::Router;
@@ -352,7 +353,7 @@ async fn stalled_non_sse_body_is_bounded_by_request_timeout() {
     let upstream = Router::new().route("/v1/stall-body", get(upstream_stall_body));
     let (upstream_addr, upstream_handle) = spawn_router(upstream).await;
 
-    let config = gateway_config(upstream_addr.to_string(), 20);
+    let config = gateway_config(upstream_addr.to_string(), 80);
     let app = build_app(Arc::new(config)).expect("gateway app should build");
     let (gateway_addr, gateway_handle) = spawn_router(app).await;
 
@@ -537,6 +538,167 @@ async fn http_proxy_with_auth_is_used_for_upstream() {
     proxy_handle.abort();
 }
 
+#[tokio::test]
+async fn proxy_response_preserves_request_id() {
+    let upstream = Router::new()
+        .route("/v1/echo", post(upstream_echo))
+        .with_state(UpstreamCapture::default());
+    let (upstream_addr, upstream_handle) = spawn_router(upstream).await;
+
+    let config = gateway_config(upstream_addr.to_string(), 2_000);
+    let app = build_app(Arc::new(config)).expect("gateway app should build");
+    let (gateway_addr, gateway_handle) = spawn_router(app).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{gateway_addr}/openai/v1/echo"))
+        .header("authorization", "Bearer gw_token")
+        .header("x-request-id", "req-123")
+        .body("hello")
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(
+        response
+            .headers()
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok()),
+        Some("req-123")
+    );
+
+    gateway_handle.abort();
+    upstream_handle.abort();
+}
+
+#[tokio::test]
+async fn proxy_response_generates_request_id_when_missing() {
+    let upstream = Router::new()
+        .route("/v1/echo", post(upstream_echo))
+        .with_state(UpstreamCapture::default());
+    let (upstream_addr, upstream_handle) = spawn_router(upstream).await;
+
+    let config = gateway_config(upstream_addr.to_string(), 2_000);
+    let app = build_app(Arc::new(config)).expect("gateway app should build");
+    let (gateway_addr, gateway_handle) = spawn_router(app).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{gateway_addr}/openai/v1/echo"))
+        .header("authorization", "Bearer gw_token")
+        .body("hello")
+        .send()
+        .await
+        .expect("request should succeed");
+
+    let request_id = response
+        .headers()
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .expect("x-request-id should exist");
+    assert!(!request_id.is_empty());
+
+    gateway_handle.abort();
+    upstream_handle.abort();
+}
+
+#[tokio::test]
+async fn metrics_endpoint_requires_dedicated_token() {
+    let mut config = gateway_config(unused_local_addr().to_string(), 2_000);
+    config.observability = Some(ObservabilityConfig {
+        logging: LoggingConfig {
+            level: "info".to_string(),
+            format: LogFormat::Json,
+            to_stdout: true,
+            file: None,
+        },
+        metrics: MetricsConfig {
+            enabled: true,
+            path: "/metrics".to_string(),
+            token: "metrics_token".to_string(),
+        },
+        tracing: TracingConfig {
+            enabled: false,
+            sample_ratio: 0.05,
+            otlp: None,
+        },
+    });
+    let app = build_app(Arc::new(config)).expect("gateway app should build");
+    let (gateway_addr, gateway_handle) = spawn_router(app).await;
+
+    let unauthorized = reqwest::Client::new()
+        .get(format!("http://{gateway_addr}/metrics"))
+        .send()
+        .await
+        .expect("request should succeed");
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    let wrong_token = reqwest::Client::new()
+        .get(format!("http://{gateway_addr}/metrics"))
+        .header("authorization", "Bearer wrong_token")
+        .send()
+        .await
+        .expect("request should succeed");
+    assert_eq!(wrong_token.status(), StatusCode::UNAUTHORIZED);
+
+    gateway_handle.abort();
+}
+
+#[tokio::test]
+async fn metrics_endpoint_exposes_prometheus_metrics_with_valid_token() {
+    let mut config = gateway_config(unused_local_addr().to_string(), 2_000);
+    config.observability = Some(ObservabilityConfig {
+        logging: LoggingConfig {
+            level: "info".to_string(),
+            format: LogFormat::Json,
+            to_stdout: true,
+            file: None,
+        },
+        metrics: MetricsConfig {
+            enabled: true,
+            path: "/metrics".to_string(),
+            token: "metrics_token".to_string(),
+        },
+        tracing: TracingConfig {
+            enabled: false,
+            sample_ratio: 0.05,
+            otlp: None,
+        },
+    });
+    let app = build_app(Arc::new(config)).expect("gateway app should build");
+    let (gateway_addr, gateway_handle) = spawn_router(app).await;
+
+    let response = reqwest::Client::new()
+        .get(format!("http://{gateway_addr}/metrics"))
+        .header("authorization", "Bearer metrics_token")
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("text/plain; version=0.0.4")
+    );
+    assert!(
+        response
+            .headers()
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok())
+            .is_some(),
+        "metrics response should include request id"
+    );
+    let body = response
+        .text()
+        .await
+        .expect("metrics body should be readable");
+    assert!(body.contains("gateway_requests_total"));
+    assert!(body.contains("gateway_inflight_requests"));
+
+    gateway_handle.abort();
+}
+
 async fn spawn_router(router: Router) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -598,6 +760,7 @@ fn gateway_config(upstream_addr: String, request_timeout_ms: u64) -> AppConfig {
         cors: None,
         rate_limit: None,
         concurrency: None,
+        observability: None,
     }
 }
 

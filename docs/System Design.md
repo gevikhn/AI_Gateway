@@ -30,6 +30,7 @@
 - 启动时加载配置（静态配置）
 - 下游固定窗口限流（按 token + route）
 - 并发保护（下游全局 + 上游按 route + key）
+- 可观测性：结构化日志、`/metrics`、低采样 tracing（OTLP 可选）
 
 仍暂缓到后续阶段：
 
@@ -185,6 +186,28 @@ rate_limit:
 concurrency:
   downstream_max_inflight: 100
   upstream_per_key_max_inflight: 8
+
+observability:
+  logging:
+    level: "info"
+    format: "json" # json / text
+    to_stdout: true
+    file:
+      enabled: true
+      dir: "./logs"
+      prefix: "ai-gw-lite"
+      rotation: "daily" # minutely / hourly / daily / never
+      max_files: 7
+  metrics:
+    enabled: true
+    path: "/metrics"
+    token: "${GW_METRICS_TOKEN}"
+  tracing:
+    enabled: true
+    sample_ratio: 0.05
+    otlp:
+      endpoint: "http://127.0.0.1:4317"
+      timeout_ms: 3000
 ```
 
 > 当前已实现 `rate_limit` 与 `concurrency`；`reload` 与重试能力仍为后续阶段。
@@ -260,6 +283,22 @@ concurrency:
 
 - 下游：`503 {"error":"downstream_concurrency_exceeded"}`
 - 上游：`503 {"error":"upstream_concurrency_exceeded"}`
+
+### 3.7 可观测性配置（已实现）
+
+- `observability.logging`
+  - `level`：日志级别过滤（默认 `info`）
+  - `format`：`json` 或 `text`（默认 `json`）
+  - `to_stdout`：是否输出到控制台（默认 `true`）
+  - `file`：文件日志配置（目录、前缀、滚动周期、保留数量）
+- `observability.metrics`
+  - `enabled=true` 时启用 metrics 端点
+  - `path` 默认 `/metrics`，必须以 `/` 开头且不能与 `/healthz` 冲突
+  - `token` 为独立 metrics 鉴权 token（不复用 `GW_TOKEN`）
+- `observability.tracing`
+  - `enabled` 控制 tracing 开关
+  - `sample_ratio` 范围 `[0.0, 1.0]`（默认 `0.05`）
+  - `otlp` 可选；配置 `endpoint` 时导出到 OTLP collector
 
 ------
 
@@ -401,6 +440,7 @@ concurrency:
 - `auth.rs`：入站 token 提取与校验
 - `proxy.rs`：路由匹配、URL 重写、header 处理辅助函数
 - `server.rs`：HTTP 入口、请求处理流程、上游转发与错误映射
+- `observability.rs`：tracing 初始化、metrics 注册与 request-id 工具
 - `main.rs`：启动参数解析、配置加载、服务启动
 - `ratelimit.rs`：固定窗口限流计数器
 - `concurrency.rs`：下游/上游并发保护
@@ -408,7 +448,7 @@ concurrency:
 
 运行时共享状态（Arc）：
 
-- 当前：`Arc<AppConfig>` + `RateLimiter` + `ConcurrencyController`
+- 当前：`Arc<AppConfig>` + `RateLimiter` + `ConcurrencyController` + `ObservabilityRuntime`
 - 后续可演进：`ArcSwap<AppConfig>`（用于热加载）
 
 ------
@@ -440,6 +480,10 @@ concurrency:
 11. 并发行为（Phase 2）：
    - 下游并发超限返回 503
    - 上游相同 key 并发超限返回 503，不同 key 可并行
+12. 可观测性行为：
+   - `/metrics` 未授权返回 401，授权后返回 Prometheus 指标文本
+13. request-id 行为：
+   - 客户端提供 `x-request-id` 时网关回传同值；未提供时网关自动生成
 
 ------
 

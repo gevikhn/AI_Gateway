@@ -18,6 +18,8 @@ pub struct AppConfig {
     pub rate_limit: Option<RateLimitConfig>,
     #[serde(default)]
     pub concurrency: Option<ConcurrencyConfig>,
+    #[serde(default)]
+    pub observability: Option<ObservabilityConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -124,6 +126,124 @@ pub struct ConcurrencyConfig {
     pub downstream_max_inflight: Option<usize>,
     #[serde(default)]
     pub upstream_per_key_max_inflight: Option<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ObservabilityConfig {
+    #[serde(default)]
+    pub logging: LoggingConfig,
+    #[serde(default)]
+    pub metrics: MetricsConfig,
+    #[serde(default)]
+    pub tracing: TracingConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LoggingConfig {
+    #[serde(default = "default_observability_log_level")]
+    pub level: String,
+    #[serde(default = "default_log_format")]
+    pub format: LogFormat,
+    #[serde(default = "default_true")]
+    pub to_stdout: bool,
+    #[serde(default)]
+    pub file: Option<LogFileConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LogFormat {
+    #[default]
+    Json,
+    Text,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LogFileConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_log_file_dir")]
+    pub dir: String,
+    #[serde(default = "default_log_file_prefix")]
+    pub prefix: String,
+    #[serde(default = "default_log_rotation")]
+    pub rotation: LogRotation,
+    #[serde(default = "default_log_file_max_files")]
+    pub max_files: usize,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LogRotation {
+    Minutely,
+    Hourly,
+    #[default]
+    Daily,
+    Never,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetricsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_metrics_path")]
+    pub path: String,
+    #[serde(default)]
+    pub token: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TracingConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_trace_sample_ratio")]
+    pub sample_ratio: f64,
+    #[serde(default)]
+    pub otlp: Option<OtlpConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OtlpConfig {
+    pub endpoint: String,
+    #[serde(default = "default_otlp_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            level: default_observability_log_level(),
+            format: default_log_format(),
+            to_stdout: true,
+            file: None,
+        }
+    }
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            path: default_metrics_path(),
+            token: String::new(),
+        }
+    }
+}
+
+impl Default for TracingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            sample_ratio: default_trace_sample_ratio(),
+            otlp: None,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -363,6 +483,85 @@ impl AppConfig {
             }
         }
 
+        if let Some(observability) = &self.observability {
+            if observability.logging.level.trim().is_empty() {
+                return Err(ConfigError::Validation(
+                    "`observability.logging.level` must not be empty".to_string(),
+                ));
+            }
+            if !observability.logging.to_stdout
+                && !matches!(
+                    observability.logging.file.as_ref(),
+                    Some(file) if file.enabled
+                )
+            {
+                return Err(ConfigError::Validation(
+                    "`observability.logging` must enable at least one sink (`to_stdout` or `file.enabled`)"
+                        .to_string(),
+                ));
+            }
+            if let Some(file) = &observability.logging.file
+                && file.enabled
+            {
+                if file.dir.trim().is_empty() {
+                    return Err(ConfigError::Validation(
+                        "`observability.logging.file.dir` must not be empty".to_string(),
+                    ));
+                }
+                if file.prefix.trim().is_empty() {
+                    return Err(ConfigError::Validation(
+                        "`observability.logging.file.prefix` must not be empty".to_string(),
+                    ));
+                }
+                if file.max_files == 0 {
+                    return Err(ConfigError::Validation(
+                        "`observability.logging.file.max_files` must be > 0".to_string(),
+                    ));
+                }
+            }
+
+            if !observability.metrics.path.starts_with('/') {
+                return Err(ConfigError::Validation(
+                    "`observability.metrics.path` must start with `/`".to_string(),
+                ));
+            }
+            if observability.metrics.path == "/healthz" {
+                return Err(ConfigError::Validation(
+                    "`observability.metrics.path` must not conflict with `/healthz`".to_string(),
+                ));
+            }
+            if observability.metrics.enabled && observability.metrics.token.trim().is_empty() {
+                return Err(ConfigError::Validation(
+                    "`observability.metrics.token` must not be empty when metrics are enabled"
+                        .to_string(),
+                ));
+            }
+
+            if !(0.0..=1.0).contains(&observability.tracing.sample_ratio) {
+                return Err(ConfigError::Validation(
+                    "`observability.tracing.sample_ratio` must be within [0.0, 1.0]".to_string(),
+                ));
+            }
+
+            if let Some(otlp) = &observability.tracing.otlp {
+                if otlp.endpoint.trim().is_empty() {
+                    return Err(ConfigError::Validation(
+                        "`observability.tracing.otlp.endpoint` must not be empty".to_string(),
+                    ));
+                }
+                if reqwest::Url::parse(otlp.endpoint.trim()).is_err() {
+                    return Err(ConfigError::Validation(
+                        "`observability.tracing.otlp.endpoint` must be a valid URL".to_string(),
+                    ));
+                }
+                if otlp.timeout_ms == 0 {
+                    return Err(ConfigError::Validation(
+                        "`observability.tracing.otlp.timeout_ms` must be > 0".to_string(),
+                    ));
+                }
+            }
+        }
+
         Ok(())
     }
 }
@@ -426,6 +625,42 @@ fn default_request_timeout_ms() -> u64 {
     60_000
 }
 
+fn default_observability_log_level() -> String {
+    "info".to_string()
+}
+
+fn default_log_format() -> LogFormat {
+    LogFormat::Json
+}
+
+fn default_log_file_dir() -> String {
+    "logs".to_string()
+}
+
+fn default_log_file_prefix() -> String {
+    "ai-gw-lite".to_string()
+}
+
+fn default_log_rotation() -> LogRotation {
+    LogRotation::Daily
+}
+
+fn default_log_file_max_files() -> usize {
+    7
+}
+
+fn default_metrics_path() -> String {
+    "/metrics".to_string()
+}
+
+fn default_trace_sample_ratio() -> f64 {
+    0.05
+}
+
+fn default_otlp_timeout_ms() -> u64 {
+    3_000
+}
+
 fn default_self_signed_cert_path() -> String {
     "certs/gateway-selfsigned.crt".to_string()
 }
@@ -456,7 +691,7 @@ fn route_has_upstream_key_injection(route: &RouteConfig) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppConfig, ProxyProtocol};
+    use super::{AppConfig, LogFormat, LogRotation, ProxyProtocol};
 
     #[test]
     fn parse_minimal_config() {
@@ -638,6 +873,186 @@ concurrency:
         assert_eq!(concurrency.downstream_max_inflight, Some(40));
         assert_eq!(concurrency.upstream_per_key_max_inflight, Some(8));
         assert_eq!(config.routes[0].upstream.upstream_key_max_inflight, Some(3));
+    }
+
+    #[test]
+    fn parse_config_with_observability() {
+        let yaml = r#"
+listen: "127.0.0.1:8080"
+gateway_auth:
+  tokens:
+    - "gw_token"
+routes:
+  - id: "openai"
+    prefix: "/openai"
+    upstream:
+      base_url: "https://api.openai.com"
+observability:
+  logging:
+    level: "debug"
+    format: "text"
+    to_stdout: true
+    file:
+      enabled: true
+      dir: "./logs"
+      prefix: "gateway"
+      rotation: "hourly"
+      max_files: 12
+  metrics:
+    enabled: true
+    path: "/metrics"
+    token: "metrics_token"
+  tracing:
+    enabled: true
+    sample_ratio: 0.1
+    otlp:
+      endpoint: "http://127.0.0.1:4317"
+      timeout_ms: 5000
+"#;
+
+        let config = AppConfig::from_yaml_str(yaml).expect("config should parse");
+        let observability = config
+            .observability
+            .as_ref()
+            .expect("observability should exist");
+        assert_eq!(observability.logging.level, "debug");
+        assert_eq!(observability.logging.format, LogFormat::Text);
+        assert!(observability.logging.to_stdout);
+        let log_file = observability
+            .logging
+            .file
+            .as_ref()
+            .expect("file should exist");
+        assert!(log_file.enabled);
+        assert_eq!(log_file.dir, "./logs");
+        assert_eq!(log_file.prefix, "gateway");
+        assert_eq!(log_file.rotation, LogRotation::Hourly);
+        assert_eq!(log_file.max_files, 12);
+        assert!(observability.metrics.enabled);
+        assert_eq!(observability.metrics.path, "/metrics");
+        assert_eq!(observability.metrics.token, "metrics_token");
+        assert!(observability.tracing.enabled);
+        assert_eq!(observability.tracing.sample_ratio, 0.1);
+        let otlp = observability
+            .tracing
+            .otlp
+            .as_ref()
+            .expect("otlp should exist");
+        assert_eq!(otlp.endpoint, "http://127.0.0.1:4317");
+        assert_eq!(otlp.timeout_ms, 5_000);
+    }
+
+    #[test]
+    fn reject_enabled_metrics_without_token() {
+        let yaml = r#"
+listen: "127.0.0.1:8080"
+gateway_auth:
+  tokens:
+    - "gw_token"
+routes:
+  - id: "openai"
+    prefix: "/openai"
+    upstream:
+      base_url: "https://api.openai.com"
+observability:
+  metrics:
+    enabled: true
+    path: "/metrics"
+    token: ""
+"#;
+
+        let error = AppConfig::from_yaml_str(yaml).expect_err("config should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("`observability.metrics.token` must not be empty")
+        );
+    }
+
+    #[test]
+    fn reject_invalid_trace_sample_ratio() {
+        let yaml = r#"
+listen: "127.0.0.1:8080"
+gateway_auth:
+  tokens:
+    - "gw_token"
+routes:
+  - id: "openai"
+    prefix: "/openai"
+    upstream:
+      base_url: "https://api.openai.com"
+observability:
+  tracing:
+    enabled: true
+    sample_ratio: 1.2
+"#;
+
+        let error = AppConfig::from_yaml_str(yaml).expect_err("config should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("`observability.tracing.sample_ratio` must be within [0.0, 1.0]")
+        );
+    }
+
+    #[test]
+    fn reject_logging_without_any_sink() {
+        let yaml = r#"
+listen: "127.0.0.1:8080"
+gateway_auth:
+  tokens:
+    - "gw_token"
+routes:
+  - id: "openai"
+    prefix: "/openai"
+    upstream:
+      base_url: "https://api.openai.com"
+observability:
+  logging:
+    level: "info"
+    format: "json"
+    to_stdout: false
+"#;
+
+        let error = AppConfig::from_yaml_str(yaml).expect_err("config should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("must enable at least one sink (`to_stdout` or `file.enabled`)")
+        );
+    }
+
+    #[test]
+    fn reject_log_file_with_invalid_limits() {
+        let yaml = r#"
+listen: "127.0.0.1:8080"
+gateway_auth:
+  tokens:
+    - "gw_token"
+routes:
+  - id: "openai"
+    prefix: "/openai"
+    upstream:
+      base_url: "https://api.openai.com"
+observability:
+  logging:
+    level: "info"
+    format: "json"
+    to_stdout: false
+    file:
+      enabled: true
+      dir: "./logs"
+      prefix: "gateway"
+      rotation: "daily"
+      max_files: 0
+"#;
+
+        let error = AppConfig::from_yaml_str(yaml).expect_err("config should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("`observability.logging.file.max_files` must be > 0")
+        );
     }
 
     #[test]

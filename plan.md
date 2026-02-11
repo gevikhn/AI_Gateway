@@ -58,6 +58,8 @@ Phase 2 范围（按需启用）:
 | M13 | Phase 2：限流与并发控制 | DONE | `src/config.rs`, `src/server.rs`, `src/ratelimit.rs`, `src/concurrency.rs`, `tests/*`, `README.md`, `docs/System Design.md`, `config/dev.yaml`, `plan.md` | 具备下游限流；具备下游并发保护；具备上游按 key 并发保护并通过测试 |
 | M14 | Phase 2：上游 key 来源收敛为 YAML 注入值 | DONE | `src/config.rs`, `src/concurrency.rs`, `src/server.rs`, `tests/*`, `README.md`, `docs/System Design.md`, `plan.md` | 上游并发 key 仅从 `inject_headers.value` 提取，且测试覆盖 |
 | M15 | Phase 2：移除 `concurrency.upstream_key_headers` 配置项 | DONE | `src/config.rs`, `src/concurrency.rs`, `tests/*`, `README.md`, `docs/System Design.md`, `config/dev.yaml`, `plan.md` | 配置项被移除，行为保持稳定并通过测试 |
+| M16 | 可观测性增强（结构化日志 + metrics + 低采样 tracing） | DONE | `src/main.rs`, `src/server.rs`, `src/config.rs`, `src/observability.rs`, `src/lib.rs`, `tests/*`, `README.md`, `docs/System Design.md`, `config/dev.yaml`, `Cargo.toml`, `plan.md` | 默认兼容；`/metrics` 鉴权生效；请求级日志与指标可用；低采样 tracing 可选导出 |
+| M17 | 日志持久化（文件分片 + 滚动） | DONE | `src/config.rs`, `src/observability.rs`, `config/dev.yaml`, `README.md`, `docs/System Design.md`, `Cargo.toml`, `plan.md` | 日志可落盘；支持按周期分片滚动；支持保留文件数量控制 |
 
 ## 4. 详细实施步骤（执行顺序）
 
@@ -132,6 +134,135 @@ Phase 2 范围（按需启用）:
 ## 6. 执行记录（Work Log）
 
 > 按时间倒序追加，每条记录必须包含：任务 ID、变更摘要、验证命令、结果。
+
+### 2026-02-11
+- 任务: M17
+- 变更（After Change）:
+  - `src/config.rs` 扩展 `observability.logging` 配置：
+    - 新增 `to_stdout` 控制台输出开关
+    - 新增 `logging.file` 子配置：`enabled`、`dir`、`prefix`、`rotation`、`max_files`
+    - 新增 `LogRotation` 枚举：`minutely/hourly/daily/never`
+    - 补充校验规则：至少一个日志 sink 生效、`max_files>0`、目录与前缀非空
+  - `src/observability.rs` 接入 `tracing-appender`：
+    - 启用文件日志写入并持有 `WorkerGuard`
+    - 支持按 `rotation` 周期滚动分片
+    - 启动时按 `max_files` 清理旧日志分片
+    - 保留已有 tracing/metrics/request-id 能力
+  - `tests/gateway_e2e.rs` 更新 `LoggingConfig` 构造字段，稳定化非 SSE 超时用例参数（`20ms -> 80ms`，避免环境抖动）
+  - `src/config.rs` 与 `src/observability.rs` 新增/更新单测覆盖新配置与滚动映射
+  - 文档与示例同步：
+    - `config/dev.yaml` 增加文件日志示例（默认启用）
+    - `README.md` 新增 `logging.file` 字段说明与滚动行为说明
+    - `docs/System Design.md` 更新 observability 配置示例与 logging 行为
+  - `Cargo.toml` 新增 `tracing-appender` 依赖（`Cargo.lock` 同步更新）
+- 实际改动文件:
+  - `src/config.rs`
+  - `src/observability.rs`
+  - `tests/gateway_e2e.rs`
+  - `config/dev.yaml`
+  - `README.md`
+  - `docs/System Design.md`
+  - `Cargo.toml`
+  - `Cargo.lock`
+  - `plan.md`
+- 验证:
+  - `cargo fmt --all`
+  - `cargo test`
+  - `cargo clippy --all-targets --all-features -- -D warnings`
+- 结果: DONE
+- 剩余事项:
+  - 当前滚动策略基于时间分片；若后续需要“按文件大小滚动”，可在新任务中引入 size-based rotate 后端。
+
+### 2026-02-11
+- 任务: M17
+- 变更（Before Change）:
+  - 计划在 `observability.logging` 中新增文件持久化配置（目录、前缀、滚动周期、保留数量）
+  - 计划在 tracing 初始化中接入 `tracing-appender`，支持控制台与文件双输出
+  - 计划新增日志文件保留策略（超出保留数量时清理旧分片）
+  - 计划补充配置校验、文档与示例
+- 拟改动文件:
+  - `src/config.rs`
+  - `src/observability.rs`
+  - `Cargo.toml`
+  - `config/dev.yaml`
+  - `README.md`
+  - `docs/System Design.md`
+  - `plan.md`
+- 验证:
+  - 完成后执行 `cargo fmt --all`、`cargo test`、`cargo clippy --all-targets --all-features -- -D warnings`
+- 结果: IN_PROGRESS
+
+### 2026-02-11
+- 任务: M16
+- 变更（After Change）:
+  - 新增可观测性配置模型：
+    - `src/config.rs` 增加 `observability` 顶层可选字段与子配置
+    - 新增 `logging/metrics/tracing/otlp` 配置类型与校验规则
+  - 新增 `src/observability.rs`：
+    - tracing subscriber 初始化（支持 JSON/TEXT）
+    - 低采样 tracing + OTLP 可选导出
+    - Prometheus 指标注册与编码
+    - request-id 提取/生成与 header 写回工具
+    - 敏感 header 判断工具
+  - `src/main.rs` 启动时初始化 observability（配置错误时启动失败）
+  - `src/server.rs` 接入可观测性：
+    - 新增 `/metrics` 显式路由（独立 metrics token 鉴权）
+    - 所有代理响应/健康检查/metrics 响应注入 `x-request-id`
+    - 请求级日志与指标记录（含 outcome/status/duration/bytes）
+    - 上游耗时指标与 inflight/SSE inflight 指标
+  - 更新测试：
+    - `tests/gateway_e2e.rs` 新增 metrics 鉴权与指标输出用例
+    - `tests/gateway_e2e.rs` 新增 request-id 透传/自动生成用例
+    - `src/config.rs` 新增 observability 配置解析与校验用例
+    - `src/server.rs` 响应头测试补充 `x-request-id` 校验
+  - 更新文档与示例：
+    - `README.md` 新增 metrics 使用与 Prometheus 抓取示例
+    - `docs/System Design.md` 补充可观测性配置与测试要求
+    - `config/dev.yaml` 增加 observability 示例配置
+- 实际改动文件:
+  - `Cargo.toml`
+  - `src/config.rs`
+  - `src/observability.rs`
+  - `src/main.rs`
+  - `src/server.rs`
+  - `src/lib.rs`
+  - `src/concurrency.rs`
+  - `tests/gateway_e2e.rs`
+  - `tests/inbound_tls_e2e.rs`
+  - `README.md`
+  - `docs/System Design.md`
+  - `config/dev.yaml`
+  - `plan.md`
+- 验证:
+  - `cargo fmt --all`
+  - `cargo test`
+  - `cargo clippy --all-targets --all-features -- -D warnings`
+- 结果: DONE
+- 剩余事项:
+  - 暂无；可在后续任务中按需补充生产级告警规则与可视化面板。
+
+### 2026-02-11
+- 任务: M16
+- 变更（Before Change）:
+  - 计划新增 `observability` 配置段，覆盖 logging/metrics/tracing
+  - 计划新增 `src/observability.rs` 实现 tracing 初始化、Prometheus registry、请求 ID 与脱敏辅助
+  - 计划在 `src/server.rs` 接入请求级埋点、`/metrics` 端点与 `x-request-id` 回写
+  - 计划补充配置校验、e2e/单测与文档示例
+- 拟改动文件:
+  - `src/main.rs`
+  - `src/server.rs`
+  - `src/config.rs`
+  - `src/observability.rs`
+  - `src/lib.rs`
+  - `tests/gateway_e2e.rs`
+  - `README.md`
+  - `docs/System Design.md`
+  - `config/dev.yaml`
+  - `Cargo.toml`
+  - `plan.md`
+- 验证:
+  - 完成后执行 `cargo fmt --all`、`cargo test`、`cargo clippy --all-targets --all-features -- -D warnings`
+- 结果: IN_PROGRESS
 
 ### 2026-02-11
 - 任务: M15

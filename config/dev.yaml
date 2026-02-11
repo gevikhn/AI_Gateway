@@ -50,6 +50,29 @@ cors:
   allow_methods: []
   expose_headers: []
 
+observability:
+  logging:
+    level: "info"
+    format: "json"
+    to_stdout: true
+    file:
+      enabled: true
+      dir: "./logs"
+      prefix: "ai-gw-lite"
+      rotation: "daily"
+      max_files: 7
+  metrics:
+    enabled: true
+    path: "/metrics"
+    token: "metrics_dev_token"
+  tracing:
+    enabled: true
+    sample_ratio: 0.05
+    # 可选：启用 OTLP 导出（例如 OpenTelemetry Collector）
+    otlp:
+      endpoint: "http://127.0.0.1:4317"
+      timeout_ms: 3000
+
 # Phase 2：下游固定窗口限流（按 token + route 维度）
 # rate_limit:
 #   per_minute: 120

@@ -3,6 +3,7 @@ use crate::concurrency::ConcurrencyController;
 use crate::config::{
     AppConfig, CorsConfig, ProxyProtocol, RouteConfig, UpstreamConfig, UpstreamProxyConfig,
 };
+use crate::observability;
 use crate::proxy;
 use crate::ratelimit::{RateLimitDecision, RateLimiter};
 use crate::tls;
@@ -18,8 +19,10 @@ use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::OwnedSemaphorePermit;
+use tracing::{error, info, warn};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -27,6 +30,7 @@ pub struct AppState {
     pub upstream_clients: Arc<HashMap<String, reqwest::Client>>,
     pub rate_limiter: Option<Arc<RateLimiter>>,
     pub concurrency: Option<Arc<ConcurrencyController>>,
+    pub observability: Arc<observability::ObservabilityRuntime>,
 }
 
 pub fn build_app(config: Arc<AppConfig>) -> Result<Router, String> {
@@ -36,15 +40,20 @@ pub fn build_app(config: Arc<AppConfig>) -> Result<Router, String> {
         .as_ref()
         .map(|rate_limit| Arc::new(RateLimiter::new(rate_limit.per_minute)));
     let concurrency = ConcurrencyController::new(&config).map(Arc::new);
-    Ok(Router::new()
-        .route("/healthz", get(healthz_handler))
-        .fallback(any(proxy_handler))
-        .with_state(AppState {
-            config,
-            upstream_clients,
-            rate_limiter,
-            concurrency,
-        }))
+    let observability = Arc::new(observability::ObservabilityRuntime::from_config(
+        config.observability.as_ref(),
+    ));
+    let mut router = Router::new().route("/healthz", get(healthz_handler));
+    if let Some(metrics_path) = observability.metrics_path() {
+        router = router.route(metrics_path, get(metrics_handler));
+    }
+    Ok(router.fallback(any(proxy_handler)).with_state(AppState {
+        config,
+        upstream_clients,
+        rate_limiter,
+        concurrency,
+        observability,
+    }))
 }
 
 pub async fn run_server(config: Arc<AppConfig>) -> Result<(), String> {
@@ -89,41 +98,108 @@ fn install_rustls_crypto_provider() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }
 
-async fn healthz_handler() -> impl IntoResponse {
-    (
-        StatusCode::OK,
-        [(CONTENT_TYPE, "application/json")],
-        r#"{"status":"ok"}"#,
-    )
+async fn healthz_handler(headers: HeaderMap) -> impl IntoResponse {
+    let request_id = observability::extract_or_generate_request_id(&headers);
+    let mut response = Response::new(Body::from(r#"{"status":"ok"}"#));
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    observability::insert_request_id_header(response.headers_mut(), &request_id);
+    response
+}
+
+async fn metrics_handler(State(state): State<AppState>, headers: HeaderMap) -> Response<Body> {
+    let request_id = observability::extract_or_generate_request_id(&headers);
+    let mut response = if !state.observability.is_metrics_request_authorized(&headers) {
+        json_error(StatusCode::UNAUTHORIZED, "unauthorized")
+    } else if let Some(body) = state.observability.encode_metrics() {
+        let mut response = Response::new(Body::from(body));
+        *response.status_mut() = StatusCode::OK;
+        response.headers_mut().insert(
+            CONTENT_TYPE,
+            http::HeaderValue::from_static("text/plain; version=0.0.4"),
+        );
+        response
+    } else {
+        json_error(StatusCode::NOT_FOUND, "route_not_found")
+    };
+    observability::insert_request_id_header(response.headers_mut(), &request_id);
+    response
 }
 
 async fn proxy_handler(State(state): State<AppState>, request: Request<Body>) -> Response<Body> {
+    let request_started_at = tokio::time::Instant::now();
     let method = request.method().clone();
     let path = request.uri().path().to_string();
     let query = request.uri().query().map(ToString::to_string);
     let request_origin = extract_origin(request.headers());
+    let request_id = observability::extract_or_generate_request_id(request.headers());
     let cors_config = state.config.cors.as_ref().filter(|cors| cors.enabled);
+    let metrics = state.observability.metrics.clone();
+    let request_span = tracing::info_span!(
+        "gateway_request",
+        request_id = request_id.as_str(),
+        method = method.as_str(),
+        path = path.as_str(),
+        route_id = tracing::field::Empty
+    );
+    let _span_entered = request_span.enter();
 
     let Some(route) = proxy::match_route(&path, &state.config.routes) else {
-        return finalize_response_with_cors(
+        tracing::Span::current().record("route_id", "__unmatched__");
+        return finalize_observed_proxy_response(
             json_error(StatusCode::NOT_FOUND, "route_not_found"),
             cors_config,
             request_origin.as_deref(),
+            request_observation(
+                metrics.as_ref(),
+                "__unmatched__",
+                &method,
+                &path,
+                &request_id,
+                request_started_at,
+            ),
+            "route_not_found",
         );
     };
+    tracing::Span::current().record("route_id", route.id.as_str());
 
     if let Some(cors) = cors_config
         && is_cors_preflight(&method, request.headers())
     {
-        return build_preflight_response(cors, request_origin.as_deref(), request.headers());
+        return finalize_observed_proxy_response(
+            build_preflight_response(cors, request_origin.as_deref(), request.headers()),
+            cors_config,
+            request_origin.as_deref(),
+            request_observation(
+                metrics.as_ref(),
+                route.id.as_str(),
+                &method,
+                &path,
+                &request_id,
+                request_started_at,
+            ),
+            "preflight",
+        );
     }
 
     let Some(token) = auth::extract_authorized_token(request.headers(), &state.config.gateway_auth)
     else {
-        return finalize_response_with_cors(
+        return finalize_observed_proxy_response(
             json_error(StatusCode::UNAUTHORIZED, "unauthorized"),
             cors_config,
             request_origin.as_deref(),
+            request_observation(
+                metrics.as_ref(),
+                route.id.as_str(),
+                &method,
+                &path,
+                &request_id,
+                request_started_at,
+            ),
+            "unauthorized",
         );
     };
 
@@ -137,10 +213,19 @@ async fn proxy_handler(State(state): State<AppState>, request: Request<Body>) ->
                     "retry-after",
                     &retry_after_secs.to_string(),
                 );
-                return finalize_response_with_cors(
+                return finalize_observed_proxy_response(
                     response,
                     cors_config,
                     request_origin.as_deref(),
+                    request_observation(
+                        metrics.as_ref(),
+                        route.id.as_str(),
+                        &method,
+                        &path,
+                        &request_id,
+                        request_started_at,
+                    ),
+                    "rate_limited",
                 );
             }
         }
@@ -150,13 +235,22 @@ async fn proxy_handler(State(state): State<AppState>, request: Request<Body>) ->
         match concurrency.acquire_downstream() {
             Ok(permit) => permit,
             Err(_) => {
-                return finalize_response_with_cors(
+                return finalize_observed_proxy_response(
                     json_error(
                         StatusCode::SERVICE_UNAVAILABLE,
                         "downstream_concurrency_exceeded",
                     ),
                     cors_config,
                     request_origin.as_deref(),
+                    request_observation(
+                        metrics.as_ref(),
+                        route.id.as_str(),
+                        &method,
+                        &path,
+                        &request_id,
+                        request_started_at,
+                    ),
+                    "concurrency",
                 );
             }
         }
@@ -166,10 +260,19 @@ async fn proxy_handler(State(state): State<AppState>, request: Request<Body>) ->
 
     let Some(upstream_url) = proxy::build_upstream_url_for_route(route, &path, query.as_deref())
     else {
-        return finalize_response_with_cors(
+        return finalize_observed_proxy_response(
             json_error(StatusCode::BAD_REQUEST, "invalid_upstream_path"),
             cors_config,
             request_origin.as_deref(),
+            request_observation(
+                metrics.as_ref(),
+                route.id.as_str(),
+                &method,
+                &path,
+                &request_id,
+                request_started_at,
+            ),
+            "gateway_error",
         );
     };
 
@@ -177,19 +280,37 @@ async fn proxy_handler(State(state): State<AppState>, request: Request<Body>) ->
     {
         Ok(headers) => headers,
         Err(_) => {
-            return finalize_response_with_cors(
+            return finalize_observed_proxy_response(
                 json_error(StatusCode::BAD_GATEWAY, "upstream_header_error"),
                 cors_config,
                 request_origin.as_deref(),
+                request_observation(
+                    metrics.as_ref(),
+                    route.id.as_str(),
+                    &method,
+                    &path,
+                    &request_id,
+                    request_started_at,
+                ),
+                "gateway_error",
             );
         }
     };
 
     let Some(upstream_client) = state.upstream_clients.get(&route.id) else {
-        return finalize_response_with_cors(
+        return finalize_observed_proxy_response(
             json_error(StatusCode::BAD_GATEWAY, "upstream_client_not_found"),
             cors_config,
             request_origin.as_deref(),
+            request_observation(
+                metrics.as_ref(),
+                route.id.as_str(),
+                &method,
+                &path,
+                &request_id,
+                request_started_at,
+            ),
+            "gateway_error",
         );
     };
 
@@ -197,13 +318,22 @@ async fn proxy_handler(State(state): State<AppState>, request: Request<Body>) ->
         match concurrency.acquire_upstream(route).await {
             Ok(permit) => permit,
             Err(_) => {
-                return finalize_response_with_cors(
+                return finalize_observed_proxy_response(
                     json_error(
                         StatusCode::SERVICE_UNAVAILABLE,
                         "upstream_concurrency_exceeded",
                     ),
                     cors_config,
                     request_origin.as_deref(),
+                    request_observation(
+                        metrics.as_ref(),
+                        route.id.as_str(),
+                        &method,
+                        &path,
+                        &request_id,
+                        request_started_at,
+                    ),
+                    "concurrency",
                 );
             }
         }
@@ -211,24 +341,169 @@ async fn proxy_handler(State(state): State<AppState>, request: Request<Body>) ->
         None
     };
 
-    let response_guards = ResponseGuards {
-        downstream_permit,
-        upstream_permit,
-    };
+    if let Some(metrics) = &metrics {
+        metrics.inc_inflight(route.id.as_str());
+    }
 
-    let response = match forward_to_upstream(
+    match forward_to_upstream(
         upstream_client,
         route,
         request,
         upstream_url,
         upstream_headers,
+        route.id.as_str(),
+        metrics.as_deref(),
     )
     .await
     {
-        Ok(response) => attach_response_guards(response, response_guards),
-        Err(error) => error_response(error),
-    };
-    finalize_response_with_cors(response, cors_config, request_origin.as_deref())
+        Ok(ForwardSuccess { response, is_sse }) => {
+            if let Some(metrics) = &metrics
+                && is_sse
+            {
+                metrics.inc_sse_inflight(route.id.as_str());
+            }
+
+            let bytes_sent = Arc::new(AtomicU64::new(0));
+            let completion_guard = ResponseCompletionGuard {
+                metrics: metrics.clone(),
+                route_id: route.id.clone(),
+                method: method.clone(),
+                path: path.clone(),
+                outcome: "success",
+                status: response.status(),
+                request_started_at,
+                request_id: request_id.clone(),
+                bytes_sent: bytes_sent.clone(),
+                track_inflight: metrics.is_some(),
+                track_sse: is_sse,
+            };
+            let response_guards = ResponseGuards {
+                downstream_permit,
+                upstream_permit,
+                completion_guard: Some(completion_guard),
+                bytes_sent: Some(bytes_sent),
+            };
+            let mut response = attach_response_guards(response, response_guards);
+            observability::insert_request_id_header(response.headers_mut(), &request_id);
+            finalize_response_with_cors(response, cors_config, request_origin.as_deref())
+        }
+        Err(error) => {
+            if let Some(metrics) = &metrics {
+                metrics.dec_inflight(route.id.as_str());
+            }
+            finalize_observed_proxy_response(
+                error_response(error),
+                cors_config,
+                request_origin.as_deref(),
+                request_observation(
+                    metrics.as_ref(),
+                    route.id.as_str(),
+                    &method,
+                    &path,
+                    &request_id,
+                    request_started_at,
+                ),
+                "upstream_error",
+            )
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RequestObservation<'a> {
+    metrics: Option<&'a Arc<observability::GatewayMetrics>>,
+    route_id: &'a str,
+    method: &'a Method,
+    path: &'a str,
+    request_id: &'a str,
+    request_started_at: tokio::time::Instant,
+}
+
+fn request_observation<'a>(
+    metrics: Option<&'a Arc<observability::GatewayMetrics>>,
+    route_id: &'a str,
+    method: &'a Method,
+    path: &'a str,
+    request_id: &'a str,
+    request_started_at: tokio::time::Instant,
+) -> RequestObservation<'a> {
+    RequestObservation {
+        metrics,
+        route_id,
+        method,
+        path,
+        request_id,
+        request_started_at,
+    }
+}
+
+fn finalize_observed_proxy_response(
+    mut response: Response<Body>,
+    cors_config: Option<&CorsConfig>,
+    request_origin: Option<&str>,
+    observation: RequestObservation<'_>,
+    outcome: &'static str,
+) -> Response<Body> {
+    observe_and_log_request_completion(observation, outcome, response.status(), 0);
+    observability::insert_request_id_header(response.headers_mut(), observation.request_id);
+    finalize_response_with_cors(response, cors_config, request_origin)
+}
+
+fn observe_and_log_request_completion(
+    observation: RequestObservation<'_>,
+    outcome: &str,
+    status: StatusCode,
+    bytes_sent: u64,
+) {
+    let duration = observation.request_started_at.elapsed();
+    if let Some(metrics) = observation.metrics {
+        metrics.observe_request(
+            observation.route_id,
+            observation.method,
+            outcome,
+            status,
+            duration,
+        );
+    }
+
+    let duration_ms = duration.as_millis() as u64;
+    if status.is_server_error() {
+        error!(
+            request_id = observation.request_id,
+            method = observation.method.as_str(),
+            route_id = observation.route_id,
+            path = observation.path,
+            outcome = outcome,
+            status = status.as_u16(),
+            duration_ms = duration_ms,
+            bytes_sent = bytes_sent,
+            "request completed"
+        );
+    } else if status.is_client_error() {
+        warn!(
+            request_id = observation.request_id,
+            method = observation.method.as_str(),
+            route_id = observation.route_id,
+            path = observation.path,
+            outcome = outcome,
+            status = status.as_u16(),
+            duration_ms = duration_ms,
+            bytes_sent = bytes_sent,
+            "request completed"
+        );
+    } else {
+        info!(
+            request_id = observation.request_id,
+            method = observation.method.as_str(),
+            route_id = observation.route_id,
+            path = observation.path,
+            outcome = outcome,
+            status = status.as_u16(),
+            duration_ms = duration_ms,
+            bytes_sent = bytes_sent,
+            "request completed"
+        );
+    }
 }
 
 async fn forward_to_upstream(
@@ -237,7 +512,11 @@ async fn forward_to_upstream(
     request: Request<Body>,
     upstream_url: String,
     upstream_headers: http::HeaderMap,
-) -> Result<Response<Body>, UpstreamError> {
+    route_id: &str,
+    metrics: Option<&observability::GatewayMetrics>,
+) -> Result<ForwardSuccess, UpstreamError> {
+    let upstream_host = upstream_host_label(&upstream_url);
+    let upstream_started_at = tokio::time::Instant::now();
     let mut upstream_request = upstream_client.request(request.method().clone(), upstream_url);
 
     for (name, value) in &upstream_headers {
@@ -253,25 +532,122 @@ async fn forward_to_upstream(
     let request_timeout = Duration::from_millis(route.upstream.request_timeout_ms);
     let deadline = tokio::time::Instant::now() + request_timeout;
     let upstream_response = match tokio::time::timeout_at(deadline, upstream_request.send()).await {
-        Ok(Ok(response)) => response,
-        Ok(Err(err)) => return Err(UpstreamError::Request(err)),
-        Err(_) => return Err(UpstreamError::Timeout),
+        Ok(Ok(response)) => {
+            if let Some(metrics) = metrics {
+                metrics.observe_upstream_duration(
+                    route_id,
+                    upstream_host.as_str(),
+                    "ok",
+                    upstream_started_at.elapsed(),
+                );
+            }
+            response
+        }
+        Ok(Err(err)) => {
+            if let Some(metrics) = metrics {
+                let result = if err.is_connect() {
+                    "connect_error"
+                } else if err.is_timeout() {
+                    "timeout"
+                } else {
+                    "request_error"
+                };
+                metrics.observe_upstream_duration(
+                    route_id,
+                    upstream_host.as_str(),
+                    result,
+                    upstream_started_at.elapsed(),
+                );
+            }
+            return Err(UpstreamError::Request(err));
+        }
+        Err(_) => {
+            if let Some(metrics) = metrics {
+                metrics.observe_upstream_duration(
+                    route_id,
+                    upstream_host.as_str(),
+                    "timeout",
+                    upstream_started_at.elapsed(),
+                );
+            }
+            return Err(UpstreamError::Timeout);
+        }
     };
 
     let is_sse = is_sse_response(upstream_response.headers());
-    Ok(response_from_upstream(upstream_response, is_sse, deadline))
+    Ok(ForwardSuccess {
+        response: response_from_upstream(upstream_response, is_sse, deadline),
+        is_sse,
+    })
+}
+
+fn upstream_host_label(upstream_url: &str) -> String {
+    reqwest::Url::parse(upstream_url)
+        .ok()
+        .and_then(|url| url.host_str().map(ToString::to_string))
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 type ProxyBodyStream = Pin<Box<dyn Stream<Item = Result<Bytes, io::Error>> + Send>>;
 
+struct ForwardSuccess {
+    response: Response<Body>,
+    is_sse: bool,
+}
+
+struct ResponseCompletionGuard {
+    metrics: Option<Arc<observability::GatewayMetrics>>,
+    route_id: String,
+    method: Method,
+    path: String,
+    outcome: &'static str,
+    status: StatusCode,
+    request_started_at: tokio::time::Instant,
+    request_id: String,
+    bytes_sent: Arc<AtomicU64>,
+    track_inflight: bool,
+    track_sse: bool,
+}
+
+impl Drop for ResponseCompletionGuard {
+    fn drop(&mut self) {
+        let bytes_sent = self.bytes_sent.load(Ordering::Relaxed);
+        if let Some(metrics) = &self.metrics {
+            if self.track_inflight {
+                metrics.dec_inflight(self.route_id.as_str());
+            }
+            if self.track_sse {
+                metrics.dec_sse_inflight(self.route_id.as_str());
+            }
+        }
+        observe_and_log_request_completion(
+            RequestObservation {
+                metrics: self.metrics.as_ref(),
+                route_id: self.route_id.as_str(),
+                method: &self.method,
+                path: self.path.as_str(),
+                request_id: self.request_id.as_str(),
+                request_started_at: self.request_started_at,
+            },
+            self.outcome,
+            self.status,
+            bytes_sent,
+        );
+    }
+}
+
 struct ResponseGuards {
     downstream_permit: Option<OwnedSemaphorePermit>,
     upstream_permit: Option<OwnedSemaphorePermit>,
+    completion_guard: Option<ResponseCompletionGuard>,
+    bytes_sent: Option<Arc<AtomicU64>>,
 }
 
 impl ResponseGuards {
     fn is_empty(&self) -> bool {
-        self.downstream_permit.is_none() && self.upstream_permit.is_none()
+        self.downstream_permit.is_none()
+            && self.upstream_permit.is_none()
+            && self.completion_guard.is_none()
     }
 }
 
@@ -309,6 +685,9 @@ fn attach_response_guards(response: Response<Body>, guards: ResponseGuards) -> R
         .into_data_stream()
         .map_err(|err| io::Error::other(err.to_string()))
         .map(move |item| {
+            if let (Some(bytes_sent), Ok(chunk)) = (&guards.bytes_sent, &item) {
+                bytes_sent.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+            }
             let _ = &guards;
             item
         });
@@ -637,6 +1016,14 @@ mod tests {
 
         let response = app.oneshot(request).await.expect("request should succeed");
         assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response
+                .headers()
+                .get("x-request-id")
+                .and_then(|value| value.to_str().ok())
+                .is_some(),
+            "healthz response should contain x-request-id"
+        );
     }
 
     #[tokio::test]
@@ -651,6 +1038,14 @@ mod tests {
 
         let response = app.oneshot(request).await.expect("request should succeed");
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(
+            response
+                .headers()
+                .get("x-request-id")
+                .and_then(|value| value.to_str().ok())
+                .is_some(),
+            "not found response should contain x-request-id"
+        );
 
         let body = to_bytes(response.into_body(), usize::MAX)
             .await
@@ -669,6 +1064,14 @@ mod tests {
 
         let response = app.oneshot(request).await.expect("request should succeed");
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            response
+                .headers()
+                .get("x-request-id")
+                .and_then(|value| value.to_str().ok())
+                .is_some(),
+            "unauthorized response should contain x-request-id"
+        );
     }
 
     #[test]
@@ -744,6 +1147,7 @@ mod tests {
             cors: None,
             rate_limit: None,
             concurrency: None,
+            observability: None,
         }
     }
 }

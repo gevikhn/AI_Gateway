@@ -298,6 +298,7 @@ mod tests {
                 downstream_max_inflight: downstream_limit,
                 upstream_per_key_max_inflight: upstream_limit,
             }),
+            observability: None,
         }
     }
 }

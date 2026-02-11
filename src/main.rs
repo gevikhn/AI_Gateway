@@ -1,4 +1,5 @@
 use ai_gw_lite::config::AppConfig;
+use ai_gw_lite::observability;
 use ai_gw_lite::server;
 use std::sync::Arc;
 
@@ -20,6 +21,7 @@ async fn run() -> Result<(), String> {
     let config_path = parse_config_path(&args)?;
     let config = AppConfig::load_from_file(&config_path)
         .map_err(|err| format!("failed to load config `{config_path}`: {err}"))?;
+    observability::init_tracing(config.observability.as_ref())?;
 
     server::run_server(Arc::new(config)).await
 }

@@ -85,6 +85,28 @@ curl -k https://127.0.0.1:8080/healthz
 {"status":"ok"}
 ```
 
+### 2.6 可观测性（Metrics）
+
+若在配置中启用了 `observability.metrics.enabled=true`，可通过独立 token 访问 `/metrics`：
+
+```bash
+curl http://127.0.0.1:8080/metrics \
+  -H "Authorization: Bearer <GW_METRICS_TOKEN>"
+```
+
+Prometheus 抓取示例：
+
+```yaml
+scrape_configs:
+  - job_name: "ai-gateway"
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["127.0.0.1:8080"]
+    authorization:
+      type: Bearer
+      credentials: "<GW_METRICS_TOKEN>"
+```
+
 ## 3. `config.yaml` 详细说明
 
 ## 3.1 完整示例
@@ -168,6 +190,28 @@ rate_limit:
 concurrency:
   downstream_max_inflight: 100
   upstream_per_key_max_inflight: 8
+
+observability:
+  logging:
+    level: "info"
+    format: "json" # json | text
+    to_stdout: true
+    file:
+      enabled: true
+      dir: "./logs"
+      prefix: "ai-gw-lite"
+      rotation: "daily" # minutely | hourly | daily | never
+      max_files: 7
+  metrics:
+    enabled: true
+    path: "/metrics"
+    token: "${GW_METRICS_TOKEN}"
+  tracing:
+    enabled: true
+    sample_ratio: 0.05
+    otlp:
+      endpoint: "http://127.0.0.1:4317"
+      timeout_ms: 3000
 ```
 
 ### 3.2 顶层字段
@@ -181,6 +225,7 @@ concurrency:
 | `cors` | `object` | 否 | `null` | 浏览器跨域配置（支持 preflight 与常规响应头注入）。 |
 | `rate_limit` | `object` | 否 | `null` | 下游限流配置（固定窗口，分钟级）。 |
 | `concurrency` | `object` | 否 | `null` | 并发保护配置（下游全局 + 上游按 route + key）。 |
+| `observability` | `object` | 否 | `null` | 可观测性配置（结构化日志、metrics、tracing）。 |
 
 ### 3.3 `inbound_tls` 字段（可选）
 
@@ -312,7 +357,50 @@ inject_headers:
 - 识别的 key header 固定为：`authorization`、`x-api-key`（按该顺序匹配）。
 - `routes[].upstream.upstream_key_max_inflight` 可覆盖全局上游并发上限。
 
-### 3.10 环境变量插值规则 `${ENV_NAME}`
+### 3.10 `observability` 字段（可选）
+
+#### `logging` 子项
+
+| Key | 类型 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `level` | `string` | `"info"` | 日志级别过滤器（如 `info`、`debug`）。 |
+| `format` | `string` | `"json"` | 日志格式：`json` 或 `text`。 |
+| `to_stdout` | `bool` | `true` | 是否继续输出到控制台。 |
+
+#### `logging.file` 子项（可选）
+
+| Key | 类型 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `enabled` | `bool` | `true` | 是否启用文件日志。 |
+| `dir` | `string` | `"logs"` | 日志目录（不存在会自动创建）。 |
+| `prefix` | `string` | `"ai-gw-lite"` | 文件名前缀。 |
+| `rotation` | `string` | `"daily"` | 分片滚动策略：`minutely` / `hourly` / `daily` / `never`。 |
+| `max_files` | `usize` | `7` | 最多保留的分片文件数量（`> 0`）。 |
+
+#### `metrics` 子项
+
+| Key | 类型 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `enabled` | `bool` | `false` | 是否启用 metrics 端点。 |
+| `path` | `string` | `"/metrics"` | metrics 端点路径，必须以 `/` 开头，且不能是 `/healthz`。 |
+| `token` | `string` | `""` | metrics 访问 token；`enabled=true` 时必须非空。 |
+
+#### `tracing` 子项
+
+| Key | 类型 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `enabled` | `bool` | `false` | 是否启用 tracing。 |
+| `sample_ratio` | `f64` | `0.05` | 采样率，范围 `[0.0, 1.0]`。 |
+| `otlp.endpoint` | `string` | `null` | OTLP 导出地址（可选）。 |
+| `otlp.timeout_ms` | `u64` | `3000` | OTLP 导出超时毫秒（`> 0`）。 |
+
+行为说明：
+- `/metrics` 仅使用独立 metrics token 鉴权，不复用 `GW_TOKEN`。
+- 代理请求响应会自动附带 `x-request-id`（可透传客户端提供值，或自动生成）。
+- 指标标签仅使用低基数字段（`route_id`、`method`、`outcome` 等），不包含 path/query/token。
+- `logging.file.enabled=true` 时日志会持久化到文件，并按 `rotation` 自动滚动分片；启动时会按 `max_files` 清理旧分片。
+
+### 3.11 环境变量插值规则 `${ENV_NAME}`
 
 - 配置文件中出现 `${ENV_NAME}` 会在加载时替换为系统环境变量值。
 - 若环境变量不存在，启动失败。
@@ -322,6 +410,7 @@ inject_headers:
 
 ```bash
 export GW_TOKEN="your_gw_token"
+export GW_METRICS_TOKEN="your_metrics_token"
 export OPENAI_API_KEY="sk-..."
 ```
 
@@ -329,6 +418,7 @@ export OPENAI_API_KEY="sk-..."
 
 ```powershell
 $env:GW_TOKEN="your_gw_token"
+$env:GW_METRICS_TOKEN="your_metrics_token"
 $env:OPENAI_API_KEY="sk-..."
 ```
 
@@ -440,6 +530,7 @@ $env:OPENAI_API_KEY="sk-xxx"
 - 优先通过 `${ENV_VAR}` 注入机密。
 - 默认保持 `forward_xff: false`。
 - 日志中不要输出授权头或密钥内容。
+- `GW_METRICS_TOKEN` 与业务 `GW_TOKEN` 应分离配置、定期轮换。
 
 ## 9. 已知限制
 

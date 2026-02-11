@@ -48,6 +48,7 @@ async fn https_listener_auto_generates_self_signed_cert() {
         cors: None,
         rate_limit: None,
         concurrency: None,
+        observability: None,
     };
 
     let server_handle = tokio::spawn(async move { run_server(Arc::new(config)).await });
