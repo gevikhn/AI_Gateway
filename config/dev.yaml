@@ -65,6 +65,8 @@ observability:
     enabled: true
     path: "/metrics"
     token: "metrics_dev_token"
+    # 内置轻量观测页面: /metrics/ui
+    # 观测 JSON 摘要接口: /metrics/summary (Bearer metrics_dev_token)
   tracing:
     enabled: true
     sample_ratio: 0.05

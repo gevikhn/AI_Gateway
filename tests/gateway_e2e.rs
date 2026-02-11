@@ -3,6 +3,7 @@ use ai_gw_lite::config::{
     LoggingConfig, MetricsConfig, ObservabilityConfig, ProxyProtocol, RateLimitConfig, RouteConfig,
     TokenSourceConfig, TracingConfig, UpstreamConfig, UpstreamProxyConfig,
 };
+use ai_gw_lite::observability;
 use ai_gw_lite::server::build_app;
 use axum::Router;
 use axum::body::{Body, Bytes};
@@ -695,6 +696,156 @@ async fn metrics_endpoint_exposes_prometheus_metrics_with_valid_token() {
         .expect("metrics body should be readable");
     assert!(body.contains("gateway_requests_total"));
     assert!(body.contains("gateway_inflight_requests"));
+
+    gateway_handle.abort();
+}
+
+#[tokio::test]
+async fn metrics_summary_endpoint_requires_metrics_token() {
+    let mut config = gateway_config(unused_local_addr().to_string(), 2_000);
+    config.observability = Some(ObservabilityConfig {
+        logging: LoggingConfig {
+            level: "info".to_string(),
+            format: LogFormat::Json,
+            to_stdout: true,
+            file: None,
+        },
+        metrics: MetricsConfig {
+            enabled: true,
+            path: "/metrics".to_string(),
+            token: "metrics_token".to_string(),
+        },
+        tracing: TracingConfig {
+            enabled: false,
+            sample_ratio: 0.05,
+            otlp: None,
+        },
+    });
+    let app = build_app(Arc::new(config)).expect("gateway app should build");
+    let (gateway_addr, gateway_handle) = spawn_router(app).await;
+
+    let unauthorized = reqwest::Client::new()
+        .get(format!("http://{gateway_addr}/metrics/summary"))
+        .send()
+        .await
+        .expect("request should succeed");
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    gateway_handle.abort();
+}
+
+#[tokio::test]
+async fn metrics_summary_endpoint_reports_route_and_token_windows() {
+    let capture = UpstreamCapture::default();
+    let upstream = Router::new()
+        .route("/v1/echo", post(upstream_echo))
+        .with_state(capture);
+    let (upstream_addr, upstream_handle) = spawn_router(upstream).await;
+
+    let mut config = gateway_config(upstream_addr.to_string(), 2_000);
+    config.observability = Some(ObservabilityConfig {
+        logging: LoggingConfig {
+            level: "info".to_string(),
+            format: LogFormat::Json,
+            to_stdout: true,
+            file: None,
+        },
+        metrics: MetricsConfig {
+            enabled: true,
+            path: "/metrics".to_string(),
+            token: "metrics_token".to_string(),
+        },
+        tracing: TracingConfig {
+            enabled: false,
+            sample_ratio: 0.05,
+            otlp: None,
+        },
+    });
+
+    let app = build_app(Arc::new(config)).expect("gateway app should build");
+    let (gateway_addr, gateway_handle) = spawn_router(app).await;
+    let client = reqwest::Client::new();
+
+    for _ in 0..2 {
+        let response = client
+            .post(format!("http://{gateway_addr}/openai/v1/echo"))
+            .header("authorization", "Bearer gw_token")
+            .body("hello")
+            .send()
+            .await
+            .expect("proxy request should succeed");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    let summary = client
+        .get(format!("http://{gateway_addr}/metrics/summary"))
+        .header("authorization", "Bearer metrics_token")
+        .send()
+        .await
+        .expect("summary request should succeed");
+    assert_eq!(summary.status(), StatusCode::OK);
+    assert!(
+        summary
+            .headers()
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok())
+            .is_some(),
+        "summary response should include request id"
+    );
+    let body = summary
+        .text()
+        .await
+        .expect("summary body should be readable");
+    assert!(body.contains("\"route_id\":\"openai\""));
+    assert!(body.contains("\"requests_1h\":2"));
+    assert!(body.contains("\"requests_24h\":2"));
+    let token_label = observability::token_label("gw_token");
+    assert!(body.contains(format!("\"token\":\"{token_label}\"").as_str()));
+
+    gateway_handle.abort();
+    upstream_handle.abort();
+}
+
+#[tokio::test]
+async fn metrics_ui_endpoint_serves_html_dashboard() {
+    let mut config = gateway_config(unused_local_addr().to_string(), 2_000);
+    config.observability = Some(ObservabilityConfig {
+        logging: LoggingConfig {
+            level: "info".to_string(),
+            format: LogFormat::Json,
+            to_stdout: true,
+            file: None,
+        },
+        metrics: MetricsConfig {
+            enabled: true,
+            path: "/metrics".to_string(),
+            token: "metrics_token".to_string(),
+        },
+        tracing: TracingConfig {
+            enabled: false,
+            sample_ratio: 0.05,
+            otlp: None,
+        },
+    });
+    let app = build_app(Arc::new(config)).expect("gateway app should build");
+    let (gateway_addr, gateway_handle) = spawn_router(app).await;
+
+    let response = reqwest::Client::new()
+        .get(format!("http://{gateway_addr}/metrics/ui"))
+        .send()
+        .await
+        .expect("request should succeed");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("text/html; charset=utf-8")
+    );
+    let body = response.text().await.expect("body should be readable");
+    assert!(body.contains("Gateway Observability"));
+    assert!(body.contains("/metrics/summary"));
 
     gateway_handle.abort();
 }

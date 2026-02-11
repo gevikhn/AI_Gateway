@@ -30,7 +30,7 @@
 - 启动时加载配置（静态配置）
 - 下游固定窗口限流（按 token + route）
 - 并发保护（下游全局 + 上游按 route + key）
-- 可观测性：结构化日志、`/metrics`、低采样 tracing（OTLP 可选）
+- 可观测性：结构化日志、`/metrics`、`/metrics/ui`、`/metrics/summary`、低采样 tracing（OTLP 可选）
 
 仍暂缓到后续阶段：
 
@@ -295,6 +295,13 @@ observability:
   - `enabled=true` 时启用 metrics 端点
   - `path` 默认 `/metrics`，必须以 `/` 开头且不能与 `/healthz` 冲突
   - `token` 为独立 metrics 鉴权 token（不复用 `GW_TOKEN`）
+  - 额外提供轻量观测接口（基于 `path` 派生）：
+    - 页面：`{path}/ui`（HTML + JS）
+    - 数据：`{path}/summary`（JSON，需 metrics token）
+  - `summary` 输出最近 `1h/24h` 的：
+    - route 请求数
+    - route 当前并发与并发峰值
+    - 按 `GW_TOKEN` 聚合的请求数（token 以脱敏标签呈现）
 - `observability.tracing`
   - `enabled` 控制 tracing 开关
   - `sample_ratio` 范围 `[0.0, 1.0]`（默认 `0.05`）
@@ -482,6 +489,8 @@ observability:
    - 上游相同 key 并发超限返回 503，不同 key 可并行
 12. 可观测性行为：
    - `/metrics` 未授权返回 401，授权后返回 Prometheus 指标文本
+   - `/metrics/summary` 未授权返回 401，授权后返回窗口统计 JSON
+   - `/metrics/ui` 可访问并周期拉取 `summary` 展示 route/token 统计
 13. request-id 行为：
    - 客户端提供 `x-request-id` 时网关回传同值；未提供时网关自动生成
 
@@ -506,6 +515,7 @@ Codex 实现应交付：
 - 可执行二进制：`ai-gw-lite`
 - 支持参数：
   - `--config /path/to/config.yaml`
+  - `--install`（仅 Linux）：自动创建 systemd service，配置文件固定为 `/etc/ai_gw_lite/conf.yaml`
 - 第一阶段支持：
   - 多 route（prefix 匹配）
   - 路由段边界匹配 + 最长前缀优先
@@ -545,6 +555,9 @@ Codex 实现应交付：
 - 并发保护：
   - 下游全局并发上限
   - 上游按 key 并发上限（支持按路由覆盖）
+- 可观测性：
+  - Prometheus `/metrics`
+  - 轻量观测页 `/metrics/ui` 与窗口统计 `/metrics/summary`（1h/24h route + token）
 - 单元测试 + e2e 测试覆盖核心 DoD
 
 说明：

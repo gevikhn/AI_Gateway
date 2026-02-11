@@ -60,6 +60,8 @@ Phase 2 范围（按需启用）:
 | M15 | Phase 2：移除 `concurrency.upstream_key_headers` 配置项 | DONE | `src/config.rs`, `src/concurrency.rs`, `tests/*`, `README.md`, `docs/System Design.md`, `config/dev.yaml`, `plan.md` | 配置项被移除，行为保持稳定并通过测试 |
 | M16 | 可观测性增强（结构化日志 + metrics + 低采样 tracing） | DONE | `src/main.rs`, `src/server.rs`, `src/config.rs`, `src/observability.rs`, `src/lib.rs`, `tests/*`, `README.md`, `docs/System Design.md`, `config/dev.yaml`, `Cargo.toml`, `plan.md` | 默认兼容；`/metrics` 鉴权生效；请求级日志与指标可用；低采样 tracing 可选导出 |
 | M17 | 日志持久化（文件分片 + 滚动） | DONE | `src/config.rs`, `src/observability.rs`, `config/dev.yaml`, `README.md`, `docs/System Design.md`, `Cargo.toml`, `plan.md` | 日志可落盘；支持按周期分片滚动；支持保留文件数量控制 |
+| M18 | 轻量观测界面（HTML + JS）与窗口统计 | DONE | `src/server.rs`, `src/observability.rs`, `tests/gateway_e2e.rs`, `README.md`, `docs/System Design.md`, `config/dev.yaml`, `plan.md` | 提供浏览器可访问观测页面与 JSON 接口；支持 route 维度 1h/24h 请求数、并发与 GW_TOKEN 维度请求数 |
+| M19 | Linux `--install` 一键安装（systemd + `/etc/ai_gw_lite/conf.yaml`） | DONE | `src/main.rs`, `src/install.rs`, `src/lib.rs`, `README.md`, `docs/System Design.md`, `plan.md` | Linux 下执行 `--install` 可自动创建配置目录/配置文件与 service 文件，且 `ExecStart` 使用 `/etc/ai_gw_lite/conf.yaml` |
 
 ## 4. 详细实施步骤（执行顺序）
 
@@ -134,6 +136,112 @@ Phase 2 范围（按需启用）:
 ## 6. 执行记录（Work Log）
 
 > 按时间倒序追加，每条记录必须包含：任务 ID、变更摘要、验证命令、结果。
+
+### 2026-02-11
+- 任务: M19
+- 变更（After Change）:
+  - `src/main.rs` 扩展 CLI 参数解析：
+    - 新增 `--install` 命令
+    - 保持 `--config <path>` 启动行为不变
+    - `--install` 分支通过 `spawn_blocking` 执行安装流程，避免在异步上下文直接阻塞
+    - 增加参数解析单测（`--config`、`--install`、混合参数拒绝）
+  - 新增 `src/install.rs`：
+    - Linux 下自动创建 `/etc/ai_gw_lite`
+    - 自动创建默认配置 `/etc/ai_gw_lite/conf.yaml`（若存在则保留）
+    - 自动写入 `/etc/systemd/system/ai-gw-lite.service`
+    - service `ExecStart` 固定为 `--config /etc/ai_gw_lite/conf.yaml`
+    - 自动执行 `systemctl daemon-reload` 与 `systemctl enable ai-gw-lite`
+    - 非 Linux 平台返回明确错误
+  - `src/lib.rs` 导出安装模块
+  - 文档同步：
+    - `README.md` 增加 `--install` 使用说明与 Linux 部署更新
+    - `docs/System Design.md` 参数列表增加 `--install` 说明
+- 实际改动文件:
+  - `src/main.rs`
+  - `src/install.rs`
+  - `src/lib.rs`
+  - `README.md`
+  - `docs/System Design.md`
+  - `plan.md`
+- 验证:
+  - `cargo fmt --all`
+  - `cargo test`
+  - `cargo clippy --all-targets --all-features -- -D warnings`
+- 结果: DONE
+- 剩余事项:
+  - `--install` 需要 root 权限与 systemd 环境；在容器或无 systemd 的 Linux 发行版中会返回命令失败。
+
+### 2026-02-11
+- 任务: M19
+- 变更（Before Change）:
+  - 计划新增 Linux 平台 `--install` 参数，实现一键安装流程
+  - 安装流程将自动创建 `/etc/ai_gw_lite` 与默认配置文件 `/etc/ai_gw_lite/conf.yaml`
+  - 自动生成 `/etc/systemd/system/ai-gw-lite.service`，并将 `ExecStart` 固定为 `--config /etc/ai_gw_lite/conf.yaml`
+  - 在 Linux 上执行 `systemctl daemon-reload` 与 `systemctl enable ai-gw-lite`（不自动启动）
+  - 非 Linux 平台返回明确错误信息
+- 拟改动文件:
+  - `src/main.rs`
+  - `src/install.rs`
+  - `src/lib.rs`
+  - `README.md`
+  - `tests/smoke.rs`
+  - `plan.md`
+- 验证:
+  - 完成后执行 `cargo fmt --all`、`cargo test`、`cargo clippy --all-targets --all-features -- -D warnings`
+- 结果: IN_PROGRESS
+
+### 2026-02-11
+- 任务: M18
+- 变更（After Change）:
+  - `src/observability.rs` 新增轻量窗口统计状态（分钟桶）：
+    - route 维度：最近 `1h/24h` 请求数、当前并发、并发峰值
+    - token 维度：按 `GW_TOKEN` 脱敏标签聚合最近 `1h/24h` 请求数
+    - 新增 summary 快照导出能力，供 HTTP 接口直接返回 JSON
+  - `src/server.rs` 新增可观测接口：
+    - `GET {metrics.path}/ui`：内置 HTML + JS 观测页
+    - `GET {metrics.path}/summary`：窗口统计 JSON（复用 metrics token 鉴权）
+    - 代理请求完成时补充 token 维度统计（不记录明文 token，仅记录脱敏标签）
+  - `tests/gateway_e2e.rs` 新增 e2e：
+    - `summary` 鉴权校验
+    - route/token 窗口统计输出校验
+    - `ui` 页面可访问与内容校验
+  - 文档同步：
+    - `README.md` 增加 `/metrics/ui`、`/metrics/summary` 使用说明
+    - `docs/System Design.md` 增加轻量观测接口与测试要求
+    - `config/dev.yaml` 增加接口说明注释
+- 实际改动文件:
+  - `src/observability.rs`
+  - `src/server.rs`
+  - `tests/gateway_e2e.rs`
+  - `README.md`
+  - `docs/System Design.md`
+  - `config/dev.yaml`
+  - `plan.md`
+- 验证:
+  - `cargo fmt --all`
+  - `cargo test`
+  - `cargo clippy --all-targets --all-features -- -D warnings`
+- 结果: DONE
+- 剩余事项:
+  - 当前窗口统计为进程内内存数据；若后续需要跨实例聚合，可新增外部存储或 Prometheus 远端聚合方案。
+
+### 2026-02-11
+- 任务: M18
+- 变更（Before Change）:
+  - 计划新增轻量观测页面（HTML + JS），用于浏览器查看网关运行统计
+  - 计划新增观测 JSON 接口，输出最近 1h/24h 的 route 请求数、并发信息与按 GW_TOKEN 聚合请求数
+  - 计划复用现有 metrics token 鉴权保护观测数据接口（页面本身仅提供前端）
+  - 计划补充 e2e 测试与文档说明，弱化对 OTLP 的部署依赖
+- 拟改动文件:
+  - `src/observability.rs`
+  - `src/server.rs`
+  - `tests/gateway_e2e.rs`
+  - `README.md`
+  - `docs/System Design.md`
+  - `plan.md`
+- 验证:
+  - 完成后执行 `cargo fmt --all`、`cargo test`、`cargo clippy --all-targets --all-features -- -D warnings`
+- 结果: IN_PROGRESS
 
 ### 2026-02-11
 - 任务: M17

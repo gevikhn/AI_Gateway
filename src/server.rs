@@ -11,7 +11,7 @@ use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::{HeaderMap, Method, Request, Response, StatusCode};
 use axum::routing::{any, get};
-use axum::{Router, response::IntoResponse};
+use axum::{Json, Router, response::IntoResponse};
 use futures_util::{Stream, StreamExt, TryStreamExt};
 use http::header::CONTENT_TYPE;
 use std::collections::HashMap;
@@ -46,6 +46,12 @@ pub fn build_app(config: Arc<AppConfig>) -> Result<Router, String> {
     let mut router = Router::new().route("/healthz", get(healthz_handler));
     if let Some(metrics_path) = observability.metrics_path() {
         router = router.route(metrics_path, get(metrics_handler));
+    }
+    if let Some(metrics_ui_path) = observability.metrics_ui_path() {
+        router = router.route(metrics_ui_path, get(metrics_ui_handler));
+    }
+    if let Some(metrics_summary_path) = observability.metrics_summary_path() {
+        router = router.route(metrics_summary_path, get(metrics_summary_handler));
     }
     Ok(router.fallback(any(proxy_handler)).with_state(AppState {
         config,
@@ -129,6 +135,246 @@ async fn metrics_handler(State(state): State<AppState>, headers: HeaderMap) -> R
     response
 }
 
+async fn metrics_ui_handler(State(state): State<AppState>, headers: HeaderMap) -> Response<Body> {
+    let request_id = observability::extract_or_generate_request_id(&headers);
+    let summary_path = state
+        .observability
+        .metrics_summary_path()
+        .unwrap_or("/metrics/summary");
+    let mut response = Response::new(Body::from(metrics_dashboard_html(summary_path)));
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        http::HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    observability::insert_request_id_header(response.headers_mut(), &request_id);
+    response
+}
+
+async fn metrics_summary_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let request_id = observability::extract_or_generate_request_id(&headers);
+    let mut response = if !state.observability.is_metrics_request_authorized(&headers) {
+        json_error(StatusCode::UNAUTHORIZED, "unauthorized")
+    } else if let Some(summary) = state.observability.snapshot_summary() {
+        Json(summary).into_response()
+    } else {
+        json_error(StatusCode::NOT_FOUND, "route_not_found")
+    };
+    observability::insert_request_id_header(response.headers_mut(), &request_id);
+    response
+}
+
+fn metrics_dashboard_html(summary_path: &str) -> String {
+    format!(
+        r#"<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AI Gateway Observability</title>
+  <style>
+    :root {{
+      --bg: #f5f7fb;
+      --card: #ffffff;
+      --text: #0f172a;
+      --muted: #475569;
+      --line: #dbe2ea;
+      --accent: #0f766e;
+      --danger: #b91c1c;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      background: radial-gradient(circle at top right, #e2f6f3, var(--bg) 55%);
+      color: var(--text);
+    }}
+    main {{
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 18px;
+    }}
+    h1 {{ margin: 0 0 8px 0; font-size: 28px; }}
+    .muted {{ color: var(--muted); }}
+    .toolbar {{
+      margin-top: 14px;
+      display: grid;
+      grid-template-columns: 1fr auto auto;
+      gap: 10px;
+      align-items: center;
+    }}
+    input {{
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 10px 12px;
+      font-size: 14px;
+    }}
+    button {{
+      border: 0;
+      border-radius: 10px;
+      background: var(--accent);
+      color: #fff;
+      padding: 10px 14px;
+      font-weight: 600;
+      cursor: pointer;
+    }}
+    .status {{ margin-top: 8px; min-height: 20px; }}
+    .error {{ color: var(--danger); }}
+    .cards {{
+      margin-top: 14px;
+      display: grid;
+      gap: 12px;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    }}
+    .card {{
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 14px;
+    }}
+    .card .label {{ color: var(--muted); font-size: 13px; }}
+    .card .value {{ margin-top: 6px; font-size: 26px; font-weight: 700; }}
+    .panel {{
+      margin-top: 14px;
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 14px;
+      overflow: auto;
+    }}
+    table {{
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }}
+    th, td {{
+      text-align: left;
+      border-bottom: 1px solid var(--line);
+      padding: 8px 6px;
+      white-space: nowrap;
+    }}
+    th {{ color: var(--muted); font-weight: 600; }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Gateway Observability</h1>
+    <div class="muted">窗口统计：最近 1 小时 / 24 小时；按 route 和 GW_TOKEN 聚合。</div>
+    <div class="toolbar">
+      <input id="token" placeholder="输入 metrics token（不会上传到其他服务）" />
+      <button id="save">保存并刷新</button>
+      <button id="refresh">立即刷新</button>
+    </div>
+    <div id="status" class="status muted">等待拉取数据</div>
+    <section class="cards">
+      <article class="card"><div class="label">总请求（1h）</div><div id="total1h" class="value">-</div></article>
+      <article class="card"><div class="label">总请求（24h）</div><div id="total24h" class="value">-</div></article>
+      <article class="card"><div class="label">Route 数</div><div id="routeCount" class="value">-</div></article>
+      <article class="card"><div class="label">Token 数</div><div id="tokenCount" class="value">-</div></article>
+    </section>
+    <section class="panel">
+      <h3>Route 维度</h3>
+      <table id="routeTable">
+        <thead><tr><th>Route</th><th>Req 1h</th><th>Req 24h</th><th>Inflight Now</th><th>Inflight Peak 1h</th><th>Inflight Peak 24h</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </section>
+    <section class="panel">
+      <h3>GW_TOKEN 维度</h3>
+      <table id="tokenTable">
+        <thead><tr><th>Token</th><th>Req 1h</th><th>Req 24h</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </section>
+  </main>
+  <script>
+    const SUMMARY_PATH = {summary_path:?};
+    const TOKEN_KEY = "ai_gw_metrics_token";
+    const tokenInput = document.getElementById("token");
+    const statusEl = document.getElementById("status");
+    const total1hEl = document.getElementById("total1h");
+    const total24hEl = document.getElementById("total24h");
+    const routeCountEl = document.getElementById("routeCount");
+    const tokenCountEl = document.getElementById("tokenCount");
+
+    tokenInput.value = localStorage.getItem(TOKEN_KEY) || "";
+    document.getElementById("save").addEventListener("click", () => {{
+      localStorage.setItem(TOKEN_KEY, tokenInput.value.trim());
+      loadData();
+    }});
+    document.getElementById("refresh").addEventListener("click", () => loadData());
+
+    function setStatus(text, isError = false) {{
+      statusEl.textContent = text;
+      statusEl.className = isError ? "status error" : "status muted";
+    }}
+
+    function renderRows(tableId, rows, columns) {{
+      const tbody = document.querySelector(`#${{tableId}} tbody`);
+      tbody.innerHTML = "";
+      if (!rows.length) {{
+        const tr = document.createElement("tr");
+        const td = document.createElement("td");
+        td.colSpan = columns.length;
+        td.textContent = "暂无数据";
+        tr.appendChild(td);
+        tbody.appendChild(tr);
+        return;
+      }}
+      for (const row of rows) {{
+        const tr = document.createElement("tr");
+        for (const key of columns) {{
+          const td = document.createElement("td");
+          td.textContent = String(row[key] ?? "");
+          tr.appendChild(td);
+        }}
+        tbody.appendChild(tr);
+      }}
+    }}
+
+    async function loadData() {{
+      const token = tokenInput.value.trim() || localStorage.getItem(TOKEN_KEY) || "";
+      if (!token) {{
+        setStatus("请先填写 metrics token", true);
+        return;
+      }}
+      try {{
+        const res = await fetch(SUMMARY_PATH, {{
+          headers: {{ Authorization: `Bearer ${{token}}` }},
+          cache: "no-store"
+        }});
+        if (!res.ok) {{
+          setStatus(`拉取失败: HTTP ${{res.status}}`, true);
+          return;
+        }}
+        const data = await res.json();
+        setStatus(`最近刷新: ${{new Date(data.generated_at_unix_ms).toLocaleString()}}`);
+        total1hEl.textContent = String(data.total_requests_1h ?? 0);
+        total24hEl.textContent = String(data.total_requests_24h ?? 0);
+        routeCountEl.textContent = String((data.routes || []).length);
+        tokenCountEl.textContent = String((data.tokens || []).length);
+        renderRows("routeTable", data.routes || [], [
+          "route_id", "requests_1h", "requests_24h", "inflight_current", "inflight_peak_1h", "inflight_peak_24h"
+        ]);
+        renderRows("tokenTable", data.tokens || [], ["token", "requests_1h", "requests_24h"]);
+      }} catch (err) {{
+        setStatus(`拉取失败: ${{err}}`, true);
+      }}
+    }}
+
+    setInterval(loadData, 5000);
+    loadData();
+  </script>
+</body>
+</html>
+"#
+    )
+}
+
 async fn proxy_handler(State(state): State<AppState>, request: Request<Body>) -> Response<Body> {
     let request_started_at = tokio::time::Instant::now();
     let method = request.method().clone();
@@ -202,6 +448,7 @@ async fn proxy_handler(State(state): State<AppState>, request: Request<Body>) ->
             "unauthorized",
         );
     };
+    let token_label = observability::token_label(&token);
 
     if let Some(rate_limiter) = &state.rate_limiter {
         match rate_limiter.check(&token, &route.id) {
@@ -217,11 +464,12 @@ async fn proxy_handler(State(state): State<AppState>, request: Request<Body>) ->
                     response,
                     cors_config,
                     request_origin.as_deref(),
-                    request_observation(
+                    request_observation_with_token(
                         metrics.as_ref(),
                         route.id.as_str(),
                         &method,
                         &path,
+                        Some(token_label.as_str()),
                         &request_id,
                         request_started_at,
                     ),
@@ -242,11 +490,12 @@ async fn proxy_handler(State(state): State<AppState>, request: Request<Body>) ->
                     ),
                     cors_config,
                     request_origin.as_deref(),
-                    request_observation(
+                    request_observation_with_token(
                         metrics.as_ref(),
                         route.id.as_str(),
                         &method,
                         &path,
+                        Some(token_label.as_str()),
                         &request_id,
                         request_started_at,
                     ),
@@ -264,11 +513,12 @@ async fn proxy_handler(State(state): State<AppState>, request: Request<Body>) ->
             json_error(StatusCode::BAD_REQUEST, "invalid_upstream_path"),
             cors_config,
             request_origin.as_deref(),
-            request_observation(
+            request_observation_with_token(
                 metrics.as_ref(),
                 route.id.as_str(),
                 &method,
                 &path,
+                Some(token_label.as_str()),
                 &request_id,
                 request_started_at,
             ),
@@ -284,11 +534,12 @@ async fn proxy_handler(State(state): State<AppState>, request: Request<Body>) ->
                 json_error(StatusCode::BAD_GATEWAY, "upstream_header_error"),
                 cors_config,
                 request_origin.as_deref(),
-                request_observation(
+                request_observation_with_token(
                     metrics.as_ref(),
                     route.id.as_str(),
                     &method,
                     &path,
+                    Some(token_label.as_str()),
                     &request_id,
                     request_started_at,
                 ),
@@ -302,11 +553,12 @@ async fn proxy_handler(State(state): State<AppState>, request: Request<Body>) ->
             json_error(StatusCode::BAD_GATEWAY, "upstream_client_not_found"),
             cors_config,
             request_origin.as_deref(),
-            request_observation(
+            request_observation_with_token(
                 metrics.as_ref(),
                 route.id.as_str(),
                 &method,
                 &path,
+                Some(token_label.as_str()),
                 &request_id,
                 request_started_at,
             ),
@@ -325,11 +577,12 @@ async fn proxy_handler(State(state): State<AppState>, request: Request<Body>) ->
                     ),
                     cors_config,
                     request_origin.as_deref(),
-                    request_observation(
+                    request_observation_with_token(
                         metrics.as_ref(),
                         route.id.as_str(),
                         &method,
                         &path,
+                        Some(token_label.as_str()),
                         &request_id,
                         request_started_at,
                     ),
@@ -367,6 +620,7 @@ async fn proxy_handler(State(state): State<AppState>, request: Request<Body>) ->
             let completion_guard = ResponseCompletionGuard {
                 metrics: metrics.clone(),
                 route_id: route.id.clone(),
+                token_label: Some(token_label.clone()),
                 method: method.clone(),
                 path: path.clone(),
                 outcome: "success",
@@ -395,11 +649,12 @@ async fn proxy_handler(State(state): State<AppState>, request: Request<Body>) ->
                 error_response(error),
                 cors_config,
                 request_origin.as_deref(),
-                request_observation(
+                request_observation_with_token(
                     metrics.as_ref(),
                     route.id.as_str(),
                     &method,
                     &path,
+                    Some(token_label.as_str()),
                     &request_id,
                     request_started_at,
                 ),
@@ -413,6 +668,7 @@ async fn proxy_handler(State(state): State<AppState>, request: Request<Body>) ->
 struct RequestObservation<'a> {
     metrics: Option<&'a Arc<observability::GatewayMetrics>>,
     route_id: &'a str,
+    token_label: Option<&'a str>,
     method: &'a Method,
     path: &'a str,
     request_id: &'a str,
@@ -427,9 +683,30 @@ fn request_observation<'a>(
     request_id: &'a str,
     request_started_at: tokio::time::Instant,
 ) -> RequestObservation<'a> {
+    request_observation_with_token(
+        metrics,
+        route_id,
+        method,
+        path,
+        None,
+        request_id,
+        request_started_at,
+    )
+}
+
+fn request_observation_with_token<'a>(
+    metrics: Option<&'a Arc<observability::GatewayMetrics>>,
+    route_id: &'a str,
+    method: &'a Method,
+    path: &'a str,
+    token_label: Option<&'a str>,
+    request_id: &'a str,
+    request_started_at: tokio::time::Instant,
+) -> RequestObservation<'a> {
     RequestObservation {
         metrics,
         route_id,
+        token_label,
         method,
         path,
         request_id,
@@ -459,6 +736,7 @@ fn observe_and_log_request_completion(
     if let Some(metrics) = observation.metrics {
         metrics.observe_request(
             observation.route_id,
+            observation.token_label,
             observation.method,
             outcome,
             status,
@@ -598,6 +876,7 @@ struct ForwardSuccess {
 struct ResponseCompletionGuard {
     metrics: Option<Arc<observability::GatewayMetrics>>,
     route_id: String,
+    token_label: Option<String>,
     method: Method,
     path: String,
     outcome: &'static str,
@@ -624,6 +903,7 @@ impl Drop for ResponseCompletionGuard {
             RequestObservation {
                 metrics: self.metrics.as_ref(),
                 route_id: self.route_id.as_str(),
+                token_label: self.token_label.as_deref(),
                 method: &self.method,
                 path: self.path.as_str(),
                 request_id: self.request_id.as_str(),
