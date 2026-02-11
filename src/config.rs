@@ -11,7 +11,13 @@ pub struct AppConfig {
     pub gateway_auth: GatewayAuthConfig,
     pub routes: Vec<RouteConfig>,
     #[serde(default)]
+    pub inbound_tls: Option<InboundTlsConfig>,
+    #[serde(default)]
     pub cors: Option<CorsConfig>,
+    #[serde(default)]
+    pub rate_limit: Option<RateLimitConfig>,
+    #[serde(default)]
+    pub concurrency: Option<ConcurrencyConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -52,6 +58,8 @@ pub struct UpstreamConfig {
     pub forward_xff: bool,
     #[serde(default)]
     pub proxy: Option<UpstreamProxyConfig>,
+    #[serde(default)]
+    pub upstream_key_max_inflight: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -79,6 +87,18 @@ pub enum ProxyProtocol {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct InboundTlsConfig {
+    #[serde(default)]
+    pub cert_path: Option<String>,
+    #[serde(default)]
+    pub key_path: Option<String>,
+    #[serde(default = "default_self_signed_cert_path")]
+    pub self_signed_cert_path: String,
+    #[serde(default = "default_self_signed_key_path")]
+    pub self_signed_key_path: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct CorsConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -90,6 +110,20 @@ pub struct CorsConfig {
     pub allow_methods: Vec<String>,
     #[serde(default)]
     pub expose_headers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RateLimitConfig {
+    pub per_minute: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConcurrencyConfig {
+    #[serde(default)]
+    pub downstream_max_inflight: Option<usize>,
+    #[serde(default)]
+    pub upstream_per_key_max_inflight: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -145,6 +179,7 @@ impl AppConfig {
 
         let mut ids = HashSet::new();
         let mut prefixes = HashSet::new();
+        let mut has_route_upstream_key_concurrency = false;
 
         for route in &self.routes {
             if route.id.trim().is_empty() {
@@ -202,6 +237,16 @@ impl AppConfig {
                 )));
             }
 
+            if let Some(limit) = route.upstream.upstream_key_max_inflight {
+                has_route_upstream_key_concurrency = true;
+                if limit == 0 {
+                    return Err(ConfigError::Validation(format!(
+                        "route `{}` upstream.upstream_key_max_inflight must be > 0 when provided",
+                        route.id
+                    )));
+                }
+            }
+
             if let Some(proxy) = &route.upstream.proxy {
                 if proxy.address.trim().is_empty() {
                     return Err(ConfigError::Validation(format!(
@@ -235,6 +280,85 @@ impl AppConfig {
                         "route `{}` has empty inject_headers.name",
                         route.id
                     )));
+                }
+            }
+        }
+
+        let mut has_global_upstream_key_concurrency = false;
+        if let Some(rate_limit) = &self.rate_limit
+            && rate_limit.per_minute == 0
+        {
+            return Err(ConfigError::Validation(
+                "`rate_limit.per_minute` must be > 0".to_string(),
+            ));
+        }
+
+        if let Some(concurrency) = &self.concurrency {
+            if let Some(limit) = concurrency.downstream_max_inflight
+                && limit == 0
+            {
+                return Err(ConfigError::Validation(
+                    "`concurrency.downstream_max_inflight` must be > 0 when provided".to_string(),
+                ));
+            }
+
+            if let Some(limit) = concurrency.upstream_per_key_max_inflight {
+                has_global_upstream_key_concurrency = true;
+                if limit == 0 {
+                    return Err(ConfigError::Validation(
+                        "`concurrency.upstream_per_key_max_inflight` must be > 0 when provided"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+
+        if has_global_upstream_key_concurrency || has_route_upstream_key_concurrency {
+            for route in &self.routes {
+                let route_uses_upstream_key_concurrency = has_global_upstream_key_concurrency
+                    || route.upstream.upstream_key_max_inflight.is_some();
+                if !route_uses_upstream_key_concurrency {
+                    continue;
+                }
+
+                if !route_has_upstream_key_injection(route) {
+                    return Err(ConfigError::Validation(format!(
+                        "route `{}` must configure `upstream.inject_headers` with one of {:?} when upstream key concurrency is enabled",
+                        route.id,
+                        upstream_key_header_names(),
+                    )));
+                }
+            }
+        }
+
+        if let Some(tls) = &self.inbound_tls {
+            validate_optional_path(
+                tls.cert_path.as_deref(),
+                "`inbound_tls.cert_path` must not be empty when provided",
+            )?;
+            validate_optional_path(
+                tls.key_path.as_deref(),
+                "`inbound_tls.key_path` must not be empty when provided",
+            )?;
+
+            if tls.self_signed_cert_path.trim().is_empty() {
+                return Err(ConfigError::Validation(
+                    "`inbound_tls.self_signed_cert_path` must not be empty".to_string(),
+                ));
+            }
+            if tls.self_signed_key_path.trim().is_empty() {
+                return Err(ConfigError::Validation(
+                    "`inbound_tls.self_signed_key_path` must not be empty".to_string(),
+                ));
+            }
+
+            match (&tls.cert_path, &tls.key_path) {
+                (Some(_), Some(_)) | (None, None) => {}
+                _ => {
+                    return Err(ConfigError::Validation(
+                        "`inbound_tls.cert_path` and `inbound_tls.key_path` must be set together"
+                            .to_string(),
+                    ));
                 }
             }
         }
@@ -302,6 +426,34 @@ fn default_request_timeout_ms() -> u64 {
     60_000
 }
 
+fn default_self_signed_cert_path() -> String {
+    "certs/gateway-selfsigned.crt".to_string()
+}
+
+fn default_self_signed_key_path() -> String {
+    "certs/gateway-selfsigned.key".to_string()
+}
+
+fn upstream_key_header_names() -> &'static [&'static str] {
+    &["authorization", "x-api-key"]
+}
+
+fn validate_optional_path(path: Option<&str>, message: &str) -> Result<(), ConfigError> {
+    if matches!(path, Some(value) if value.trim().is_empty()) {
+        return Err(ConfigError::Validation(message.to_string()));
+    }
+    Ok(())
+}
+
+fn route_has_upstream_key_injection(route: &RouteConfig) -> bool {
+    route.upstream.inject_headers.iter().any(|header| {
+        !header.value.trim().is_empty()
+            && upstream_key_header_names()
+                .iter()
+                .any(|name| header.name.trim().eq_ignore_ascii_case(name.trim()))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{AppConfig, ProxyProtocol};
@@ -323,6 +475,8 @@ routes:
         let config = AppConfig::from_yaml_str(yaml).expect("config should parse");
         assert_eq!(config.routes.len(), 1);
         assert!(config.cors.is_none());
+        assert!(config.rate_limit.is_none());
+        assert!(config.concurrency.is_none());
     }
 
     #[test]
@@ -397,6 +551,166 @@ routes:
             error.to_string().contains(
                 "upstream.proxy.username and upstream.proxy.password must be set together"
             )
+        );
+    }
+
+    #[test]
+    fn parse_config_with_inbound_tls() {
+        let yaml = r#"
+listen: "127.0.0.1:8443"
+gateway_auth:
+  tokens:
+    - "gw_token"
+routes:
+  - id: "openai"
+    prefix: "/openai"
+    upstream:
+      base_url: "https://api.openai.com"
+inbound_tls:
+  cert_path: "./tls/server.crt"
+  key_path: "./tls/server.key"
+"#;
+
+        let config = AppConfig::from_yaml_str(yaml).expect("config should parse");
+        let tls = config
+            .inbound_tls
+            .as_ref()
+            .expect("inbound tls config should exist");
+        assert_eq!(tls.cert_path.as_deref(), Some("./tls/server.crt"));
+        assert_eq!(tls.key_path.as_deref(), Some("./tls/server.key"));
+        assert_eq!(tls.self_signed_cert_path, "certs/gateway-selfsigned.crt");
+        assert_eq!(tls.self_signed_key_path, "certs/gateway-selfsigned.key");
+    }
+
+    #[test]
+    fn reject_inbound_tls_partial_cert_key() {
+        let yaml = r#"
+listen: "127.0.0.1:8443"
+gateway_auth:
+  tokens:
+    - "gw_token"
+routes:
+  - id: "openai"
+    prefix: "/openai"
+    upstream:
+      base_url: "https://api.openai.com"
+inbound_tls:
+  cert_path: "./tls/server.crt"
+"#;
+
+        let error = AppConfig::from_yaml_str(yaml).expect_err("config should fail");
+        assert!(
+            error.to_string().contains(
+                "`inbound_tls.cert_path` and `inbound_tls.key_path` must be set together"
+            )
+        );
+    }
+
+    #[test]
+    fn parse_config_with_rate_limit_and_concurrency() {
+        let yaml = r#"
+listen: "127.0.0.1:8080"
+gateway_auth:
+  tokens:
+    - "gw_token"
+routes:
+  - id: "openai"
+    prefix: "/openai"
+    upstream:
+      base_url: "https://api.openai.com"
+      upstream_key_max_inflight: 3
+      inject_headers:
+        - name: "authorization"
+          value: "Bearer upstream-key"
+rate_limit:
+  per_minute: 120
+concurrency:
+  downstream_max_inflight: 40
+  upstream_per_key_max_inflight: 8
+"#;
+
+        let config = AppConfig::from_yaml_str(yaml).expect("config should parse");
+        assert_eq!(
+            config.rate_limit.as_ref().expect("rate limit").per_minute,
+            120
+        );
+        let concurrency = config.concurrency.as_ref().expect("concurrency");
+        assert_eq!(concurrency.downstream_max_inflight, Some(40));
+        assert_eq!(concurrency.upstream_per_key_max_inflight, Some(8));
+        assert_eq!(config.routes[0].upstream.upstream_key_max_inflight, Some(3));
+    }
+
+    #[test]
+    fn reject_zero_rate_limit() {
+        let yaml = r#"
+listen: "127.0.0.1:8080"
+gateway_auth:
+  tokens:
+    - "gw_token"
+routes:
+  - id: "openai"
+    prefix: "/openai"
+    upstream:
+      base_url: "https://api.openai.com"
+rate_limit:
+  per_minute: 0
+"#;
+
+        let error = AppConfig::from_yaml_str(yaml).expect_err("config should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("`rate_limit.per_minute` must be > 0")
+        );
+    }
+
+    #[test]
+    fn reject_removed_upstream_key_headers_field() {
+        let yaml = r#"
+listen: "127.0.0.1:8080"
+gateway_auth:
+  tokens:
+    - "gw_token"
+routes:
+  - id: "openai"
+    prefix: "/openai"
+    upstream:
+      base_url: "https://api.openai.com"
+concurrency:
+  upstream_per_key_max_inflight: 8
+  upstream_key_headers:
+    - "bad header"
+"#;
+
+        let error = AppConfig::from_yaml_str(yaml).expect_err("config should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("unknown field `upstream_key_headers`")
+        );
+    }
+
+    #[test]
+    fn reject_upstream_concurrency_without_injected_key_value() {
+        let yaml = r#"
+listen: "127.0.0.1:8080"
+gateway_auth:
+  tokens:
+    - "gw_token"
+routes:
+  - id: "openai"
+    prefix: "/openai"
+    upstream:
+      base_url: "https://api.openai.com"
+concurrency:
+  upstream_per_key_max_inflight: 8
+"#;
+
+        let error = AppConfig::from_yaml_str(yaml).expect_err("config should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("must configure `upstream.inject_headers` with one of")
         );
     }
 }

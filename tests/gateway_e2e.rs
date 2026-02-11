@@ -1,6 +1,6 @@
 use ai_gw_lite::config::{
-    AppConfig, GatewayAuthConfig, HeaderInjection, ProxyProtocol, RouteConfig, TokenSourceConfig,
-    UpstreamConfig, UpstreamProxyConfig,
+    AppConfig, ConcurrencyConfig, CorsConfig, GatewayAuthConfig, HeaderInjection, ProxyProtocol,
+    RateLimitConfig, RouteConfig, TokenSourceConfig, UpstreamConfig, UpstreamProxyConfig,
 };
 use ai_gw_lite::server::build_app;
 use axum::Router;
@@ -106,7 +106,7 @@ async fn sse_is_not_cut_by_request_timeout() {
     let upstream = Router::new().route("/v1/sse-slow", get(upstream_sse_slow));
     let (upstream_addr, upstream_handle) = spawn_router(upstream).await;
 
-    let config = gateway_config(upstream_addr.to_string(), 20);
+    let config = gateway_config(upstream_addr.to_string(), 80);
     let app = build_app(Arc::new(config)).expect("gateway app should build");
     let (gateway_addr, gateway_handle) = spawn_router(app).await;
 
@@ -145,7 +145,7 @@ async fn timeout_is_mapped_to_504() {
     let upstream = Router::new().route("/v1/slow", get(upstream_slow));
     let (upstream_addr, upstream_handle) = spawn_router(upstream).await;
 
-    let config = gateway_config(upstream_addr.to_string(), 20);
+    let config = gateway_config(upstream_addr.to_string(), 80);
     let app = build_app(Arc::new(config)).expect("gateway app should build");
     let (gateway_addr, gateway_handle) = spawn_router(app).await;
 
@@ -166,6 +166,164 @@ async fn timeout_is_mapped_to_504() {
         r#"{"error":"upstream_timeout"}"#
     );
 
+    gateway_handle.abort();
+    upstream_handle.abort();
+}
+
+#[tokio::test]
+async fn rate_limit_rejects_excess_downstream_requests() {
+    let upstream = Router::new()
+        .route("/v1/echo", post(upstream_echo))
+        .with_state(UpstreamCapture::default());
+    let (upstream_addr, upstream_handle) = spawn_router(upstream).await;
+
+    let mut config = gateway_config(upstream_addr.to_string(), 2_000);
+    config.rate_limit = Some(RateLimitConfig { per_minute: 1 });
+    let app = build_app(Arc::new(config)).expect("gateway app should build");
+    let (gateway_addr, gateway_handle) = spawn_router(app).await;
+
+    let client = reqwest::Client::new();
+    let first = client
+        .post(format!("http://{gateway_addr}/openai/v1/echo"))
+        .header("authorization", "Bearer gw_token")
+        .body("hello")
+        .send()
+        .await
+        .expect("request should succeed");
+    assert_eq!(first.status(), StatusCode::OK);
+
+    let second = client
+        .post(format!("http://{gateway_addr}/openai/v1/echo"))
+        .header("authorization", "Bearer gw_token")
+        .body("hello")
+        .send()
+        .await
+        .expect("request should succeed");
+    assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(
+        second.headers().contains_key("retry-after"),
+        "rate limited response should include Retry-After"
+    );
+    assert_eq!(
+        second
+            .text()
+            .await
+            .expect("body should be readable")
+            .as_str(),
+        r#"{"error":"rate_limited"}"#
+    );
+
+    gateway_handle.abort();
+    upstream_handle.abort();
+}
+
+#[tokio::test]
+async fn downstream_concurrency_limit_rejects_when_inflight_is_full() {
+    let upstream = Router::new().route("/v1/stall-body", get(upstream_stall_body));
+    let (upstream_addr, upstream_handle) = spawn_router(upstream).await;
+
+    let mut config = gateway_config(upstream_addr.to_string(), 2_000);
+    config.concurrency = Some(ConcurrencyConfig {
+        downstream_max_inflight: Some(1),
+        upstream_per_key_max_inflight: None,
+    });
+    let app = build_app(Arc::new(config)).expect("gateway app should build");
+    let (gateway_addr, gateway_handle) = spawn_router(app).await;
+
+    let client = reqwest::Client::new();
+    let first_response = client
+        .get(format!("http://{gateway_addr}/openai/v1/stall-body"))
+        .header("authorization", "Bearer gw_token")
+        .send()
+        .await
+        .expect("first request should succeed");
+    assert_eq!(first_response.status(), StatusCode::OK);
+
+    let second_response = client
+        .get(format!("http://{gateway_addr}/openai/v1/stall-body"))
+        .header("authorization", "Bearer gw_token")
+        .send()
+        .await
+        .expect("second request should succeed");
+    assert_eq!(second_response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        second_response
+            .text()
+            .await
+            .expect("body should be readable")
+            .as_str(),
+        r#"{"error":"downstream_concurrency_exceeded"}"#
+    );
+
+    drop(first_response);
+    gateway_handle.abort();
+    upstream_handle.abort();
+}
+
+#[tokio::test]
+async fn upstream_concurrency_limit_is_scoped_by_upstream_key() {
+    let upstream = Router::new().route("/v1/stall-body", get(upstream_stall_body));
+    let (upstream_addr, upstream_handle) = spawn_router(upstream).await;
+
+    let mut config = gateway_config(upstream_addr.to_string(), 2_000);
+    config.routes[0].id = "openai-a".to_string();
+    config.routes[0].prefix = "/openai-a".to_string();
+    config.routes[0].upstream.inject_headers = vec![HeaderInjection {
+        name: "x-api-key".to_string(),
+        value: "key-a".to_string(),
+    }];
+
+    let mut route_b = config.routes[0].clone();
+    route_b.id = "openai-b".to_string();
+    route_b.prefix = "/openai-b".to_string();
+    route_b.upstream.inject_headers = vec![HeaderInjection {
+        name: "x-api-key".to_string(),
+        value: "key-b".to_string(),
+    }];
+    config.routes.push(route_b);
+
+    config.concurrency = Some(ConcurrencyConfig {
+        downstream_max_inflight: None,
+        upstream_per_key_max_inflight: Some(1),
+    });
+    let app = build_app(Arc::new(config)).expect("gateway app should build");
+    let (gateway_addr, gateway_handle) = spawn_router(app).await;
+
+    let client = reqwest::Client::new();
+    let first_response = client
+        .get(format!("http://{gateway_addr}/openai-a/v1/stall-body"))
+        .header("authorization", "Bearer gw_token")
+        .send()
+        .await
+        .expect("first request should succeed");
+    assert_eq!(first_response.status(), StatusCode::OK);
+
+    let same_key_response = client
+        .get(format!("http://{gateway_addr}/openai-a/v1/stall-body"))
+        .header("authorization", "Bearer gw_token")
+        .send()
+        .await
+        .expect("same-key request should succeed");
+    assert_eq!(same_key_response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        same_key_response
+            .text()
+            .await
+            .expect("body should be readable")
+            .as_str(),
+        r#"{"error":"upstream_concurrency_exceeded"}"#
+    );
+
+    let different_key_response = client
+        .get(format!("http://{gateway_addr}/openai-b/v1/stall-body"))
+        .header("authorization", "Bearer gw_token")
+        .send()
+        .await
+        .expect("different-key request should succeed");
+    assert_eq!(different_key_response.status(), StatusCode::OK);
+
+    drop(first_response);
+    drop(different_key_response);
     gateway_handle.abort();
     upstream_handle.abort();
 }
@@ -215,6 +373,111 @@ async fn stalled_non_sse_body_is_bounded_by_request_timeout() {
     assert!(
         read_result.expect("body future should complete").is_err(),
         "stalled non-sse body should be interrupted by gateway timeout control"
+    );
+
+    gateway_handle.abort();
+    upstream_handle.abort();
+}
+
+#[tokio::test]
+async fn cors_preflight_returns_allow_headers_without_auth() {
+    let unused = unused_local_addr();
+    let mut config = gateway_config(unused.to_string(), 2_000);
+    config.cors = Some(CorsConfig {
+        enabled: true,
+        allow_origins: vec!["https://fy.ciallo.fans".to_string()],
+        allow_headers: vec!["authorization".to_string()],
+        allow_methods: vec!["POST".to_string()],
+        expose_headers: vec![],
+    });
+
+    let app = build_app(Arc::new(config)).expect("gateway app should build");
+    let (gateway_addr, gateway_handle) = spawn_router(app).await;
+
+    let response = reqwest::Client::new()
+        .request(
+            reqwest::Method::OPTIONS,
+            format!("http://{gateway_addr}/openai/v1/chat/completions"),
+        )
+        .header("origin", "https://fy.ciallo.fans")
+        .header("access-control-request-method", "POST")
+        .header(
+            "access-control-request-headers",
+            "authorization,content-type",
+        )
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        response
+            .headers()
+            .get("access-control-allow-origin")
+            .and_then(|value| value.to_str().ok()),
+        Some("https://fy.ciallo.fans")
+    );
+    let allow_methods = response
+        .headers()
+        .get("access-control-allow-methods")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    assert!(allow_methods.contains("POST"));
+    let allow_headers = response
+        .headers()
+        .get("access-control-allow-headers")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    assert!(allow_headers.contains("authorization"));
+    assert!(allow_headers.contains("content-type"));
+
+    gateway_handle.abort();
+}
+
+#[tokio::test]
+async fn cors_allows_origin_without_scheme_config() {
+    let capture = UpstreamCapture::default();
+    let upstream = Router::new()
+        .route("/v1/echo", post(upstream_echo))
+        .with_state(capture.clone());
+    let (upstream_addr, upstream_handle) = spawn_router(upstream).await;
+
+    let mut config = gateway_config(upstream_addr.to_string(), 2_000);
+    config.cors = Some(CorsConfig {
+        enabled: true,
+        allow_origins: vec!["fy.ciallo.fans".to_string()],
+        allow_headers: vec![],
+        allow_methods: vec![],
+        expose_headers: vec!["x-request-id".to_string()],
+    });
+    let app = build_app(Arc::new(config)).expect("gateway app should build");
+    let (gateway_addr, gateway_handle) = spawn_router(app).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{gateway_addr}/openai/v1/echo"))
+        .header("authorization", "Bearer gw_token")
+        .header("origin", "https://fy.ciallo.fans")
+        .body("hello")
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("access-control-allow-origin")
+            .and_then(|value| value.to_str().ok()),
+        Some("https://fy.ciallo.fans")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("access-control-expose-headers")
+            .and_then(|value| value.to_str().ok()),
+        Some("x-request-id")
     );
 
     gateway_handle.abort();
@@ -328,9 +591,13 @@ fn gateway_config(upstream_addr: String, request_timeout_ms: u64) -> AppConfig {
                 ],
                 forward_xff: false,
                 proxy: None,
+                upstream_key_max_inflight: None,
             },
         }],
+        inbound_tls: None,
         cors: None,
+        rate_limit: None,
+        concurrency: None,
     }
 }
 

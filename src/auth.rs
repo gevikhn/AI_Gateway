@@ -29,11 +29,20 @@ pub fn extract_token(headers: &HeaderMap, token_sources: &[TokenSourceConfig]) -
 }
 
 pub fn is_authorized(headers: &HeaderMap, gateway_auth: &GatewayAuthConfig) -> bool {
-    let Some(token) = extract_token(headers, &gateway_auth.token_sources) else {
-        return false;
-    };
+    extract_authorized_token(headers, gateway_auth).is_some()
+}
 
-    gateway_auth.tokens.iter().any(|allowed| allowed == &token)
+pub fn extract_authorized_token(
+    headers: &HeaderMap,
+    gateway_auth: &GatewayAuthConfig,
+) -> Option<String> {
+    let token = extract_token(headers, &gateway_auth.token_sources)?;
+
+    if gateway_auth.tokens.iter().any(|allowed| allowed == &token) {
+        Some(token)
+    } else {
+        None
+    }
 }
 
 fn parse_bearer_token(value: &str) -> Option<&str> {
@@ -53,7 +62,7 @@ fn parse_bearer_token(value: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_token, is_authorized};
+    use super::{extract_authorized_token, extract_token, is_authorized};
     use crate::config::{GatewayAuthConfig, TokenSourceConfig};
     use http::header::AUTHORIZATION;
     use http::{HeaderMap, HeaderValue};
@@ -96,5 +105,9 @@ mod tests {
         };
 
         assert!(is_authorized(&headers, &auth));
+        assert_eq!(
+            extract_authorized_token(&headers, &auth).as_deref(),
+            Some("gw_token")
+        );
     }
 }

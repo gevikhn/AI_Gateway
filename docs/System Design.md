@@ -9,6 +9,7 @@
 - **按配置注入/替换上游鉴权 Header**（支持任意 Header 形式，如 `x-api-key: ...`）
 - **请求/响应流式透传**（包含 SSE，避免大包内存聚合）
 - **尽量隐藏用户 IP 给上游**（不透传 XFF/Forwarded，所有请求从网关出网）
+- **支持入站 HTTPS**（可加载证书/私钥，或自动生成自签名证书）
 
 非目标（刻意不做）：
 
@@ -20,17 +21,18 @@
 
 ### 0.1 实现阶段约束（当前）
 
-第一阶段（本次实现）只做“基础路由转发”：
+当前已实现（Phase 1 + Phase 2 部分能力）：
 
 - 多 route 前缀匹配与 URL 重写
 - 入站 token 鉴权
 - 上游 header 注入/覆盖 + 敏感头移除
 - 请求/响应流式透传（含 SSE）
 - 启动时加载配置（静态配置）
+- 下游固定窗口限流（按 token + route）
+- 并发保护（下游全局 + 上游按 route + key）
 
-暂缓到后续阶段：
+仍暂缓到后续阶段：
 
-- 限流与并发控制
 - 配置热加载
 - 复杂重试策略
 
@@ -94,6 +96,16 @@
 ```yaml
 listen: "127.0.0.1:8080"
 
+# 可选：开启 user -> gateway HTTPS
+inbound_tls:
+  # 若 cert_path/key_path 同时提供，则直接加载
+  # cert_path: "./certs/server.crt"
+  # key_path: "./certs/server.key"
+  # 若不提供 cert/key，则使用自签名证书路径：
+  # 文件存在则加载，不存在则自动生成并落盘
+  self_signed_cert_path: "./certs/gateway-selfsigned.crt"
+  self_signed_key_path: "./certs/gateway-selfsigned.key"
+
 # 网关入站鉴权（客户端用）
 gateway_auth:
   # 支持多个 token（个人用通常 1 个即可）
@@ -114,6 +126,8 @@ routes:
       strip_prefix: true
       connect_timeout_ms: 10000
       request_timeout_ms: 60000
+      # 可选：覆盖全局上游按 key 并发上限（每个 key）
+      upstream_key_max_inflight: 8
       # 可选：gateway -> upstream 出站代理
       proxy:
         protocol: "http" # http / https / socks
@@ -164,9 +178,16 @@ cors:
   allow_headers: ["authorization", "content-type", "x-gw-token"]
   allow_methods: ["GET", "POST", "OPTIONS"]
   expose_headers: []
+
+rate_limit:
+  per_minute: 120
+
+concurrency:
+  downstream_max_inflight: 100
+  upstream_per_key_max_inflight: 8
 ```
 
-> 第一阶段不实现 `rate_limit`、`concurrency`、`reload`，配置中可暂不出现这些字段。
+> 当前已实现 `rate_limit` 与 `concurrency`；`reload` 与重试能力仍为后续阶段。
 
 ### 3.2 值插值规则（必须）
 
@@ -187,6 +208,58 @@ cors:
 
 - 代理能力按路由生效（每条 route 可独立配置）
 - 不配置 `proxy` 时保持直连行为
+
+### 3.4 入站 TLS 配置（可选）
+
+`inbound_tls` 用于配置 `user -> gateway` 的 HTTPS 监听能力。
+
+- `cert_path` / `key_path`：可选，若提供必须成对出现
+- `self_signed_cert_path` / `self_signed_key_path`：自签名证书与私钥落盘路径（有默认值）
+
+实现要求：
+
+- 不配置 `inbound_tls` 时保持 HTTP 监听
+- 配置 `inbound_tls` 且提供 `cert_path`/`key_path` 时，加载指定证书
+- 配置 `inbound_tls` 且未提供 `cert_path`/`key_path` 时：
+  - 若 `self_signed_*` 文件已存在，直接加载
+  - 若不存在，自动生成自签名证书并加载
+
+### 3.5 CORS 配置（可选）
+
+`cors.enabled=true` 时，网关会处理浏览器 preflight（`OPTIONS`）并在常规响应上注入 CORS 响应头。
+
+实现要求：
+
+- preflight 通过时返回 `204`，并携带：
+  - `Access-Control-Allow-Origin`
+  - `Access-Control-Allow-Methods`
+  - `Access-Control-Allow-Headers`
+- 常规响应（含错误响应）在 origin 命中时携带：
+  - `Access-Control-Allow-Origin`
+  - 可选 `Access-Control-Expose-Headers`
+- `allow_origins` 推荐填写完整 origin（如 `https://fy.ciallo.fans`）
+- 兼容无协议写法（如 `fy.ciallo.fans`）用于匹配请求 origin 的 host
+
+### 3.6 限流与并发配置（Phase 2 已实现部分）
+
+`rate_limit`（下游限流）：
+
+- `per_minute`：每分钟请求上限（`> 0`）
+- 维度：`token + route`
+- 超限返回：`429 {"error":"rate_limited"}`
+- 响应头：`Retry-After`
+
+`concurrency`（并发保护）：
+
+- `downstream_max_inflight`：下游全局并发上限（`> 0`）
+- `upstream_per_key_max_inflight`：上游按 route + key 并发上限（`> 0`）
+- `routes[].upstream.upstream_key_max_inflight`：按路由覆盖上游并发上限
+- 上游 key 识别 header 固定为：`authorization`、`x-api-key`
+
+并发超限返回：
+
+- 下游：`503 {"error":"downstream_concurrency_exceeded"}`
+- 上游：`503 {"error":"upstream_concurrency_exceeded"}`
 
 ------
 
@@ -274,29 +347,32 @@ cors:
 
 ------
 
-## 6. 第二阶段：限流与并发控制（暂缓）
+## 6. 第二阶段：限流与并发控制（已实现）
 
-> 第一阶段不实现本节能力，以下内容作为后续扩展设计保留。
-
-### 6.1 固定窗口限流（推荐最简）
+### 6.1 固定窗口限流
 
 - key = `{token}:{route_id}:{minute_bucket}`
-- 计数器保存在内存 `HashMap`，每分钟轮转清理
-- 超过 `per_minute` 返回 `429 Too Many Requests`
+- 计数器保存在内存 `HashMap`，按分钟窗口轮转清理
+- 超过 `per_minute` 返回 `429 {"error":"rate_limited"}`
 - 返回头：
-  - `Retry-After: <seconds_to_next_minute>`（可选）
+  - `Retry-After: <seconds_to_next_minute>`
 
-### 6.2 并发限制（强烈建议）
+### 6.2 并发限制
 
-- 全局一个 `Semaphore(max_inflight)`
-- 每个请求开始 acquire，结束 release
-- 超限返回 `503 Service Unavailable` 或 `429`（任选其一，建议 503）
+- 下游：全局 `Semaphore(downstream_max_inflight)`
+- 上游：按“route + 上游 key”分组的 `Semaphore(upstream_per_key_max_inflight)`
+  - key 仅从 `upstream.inject_headers[].value` 提取，header 识别顺序固定为 `authorization`、`x-api-key`
+  - 可由 `routes[].upstream.upstream_key_max_inflight` 覆盖默认上限
+- 每个请求开始时 acquire，在响应体生命周期结束时 release（包含 SSE 长流）
+- 超限返回 `503 Service Unavailable`：
+  - 下游：`{"error":"downstream_concurrency_exceeded"}`
+  - 上游：`{"error":"upstream_concurrency_exceeded"}`
 
 ------
 
 ## 7. 第二阶段：动态路由/配置热加载（暂缓）
 
-> 第一阶段不实现本节能力，以下内容作为后续扩展设计保留。
+> 当前版本仍不实现本节能力，以下内容作为后续扩展设计保留。
 
 你要求“实时动态绑定转发路径”，个人工具推荐两种简单方式：
 
@@ -326,13 +402,14 @@ cors:
 - `proxy.rs`：路由匹配、URL 重写、header 处理辅助函数
 - `server.rs`：HTTP 入口、请求处理流程、上游转发与错误映射
 - `main.rs`：启动参数解析、配置加载、服务启动
-- `ratelimit.rs`（第二阶段）：固定窗口计数器
+- `ratelimit.rs`：固定窗口限流计数器
+- `concurrency.rs`：下游/上游并发保护
 - `reload.rs`（第二阶段）：热加载（notify + ArcSwap）
 
 运行时共享状态（Arc）：
 
-- 第一阶段：当前配置 `Arc<AppConfig>`
-- 第二阶段：可切换为 `ArcSwap<AppConfig>` 并加入限流器、并发 semaphore
+- 当前：`Arc<AppConfig>` + `RateLimiter` + `ConcurrencyController`
+- 后续可演进：`ArcSwap<AppConfig>`（用于热加载）
 
 ------
 
@@ -358,6 +435,11 @@ cors:
 9. 超时行为：
    - 上游连接超时返回可识别错误（建议 504）
    - SSE/长流不会被 `request_timeout_ms` 误切断
+10. 限流行为（Phase 2）：
+   - 同 token + route 在同一分钟内超过阈值后返回 429，含 `Retry-After`
+11. 并发行为（Phase 2）：
+   - 下游并发超限返回 503
+   - 上游相同 key 并发超限返回 503，不同 key 可并行
 
 ------
 
@@ -390,23 +472,35 @@ Codex 实现应交付：
   - 请求/响应流式透传（含 SSE）
   - 基础超时控制（connect/request 分离）
 
-第二阶段（暂缓）：
+第二阶段已支持：
 
-- 限流 + 并发控制
+- 限流（下游，固定窗口）
+- 并发控制（下游全局 + 上游按 key）
+
+第二阶段暂缓项：
+
 - 配置热加载（notify）
+- 自动重试策略
 
 ------
 
-## 12. 当前实现状态（2026-02-10）
+## 12. 当前实现状态（2026-02-11）
 
-第一阶段已完成项（代码已落地）：
+已完成项（代码已落地）：
 
 - `axum + reqwest` 主链路已接入（服务启动、fallback 代理、上游流式转发）
 - 路由段边界匹配 + 最长前缀优先
 - 入站鉴权（Bearer / 自定义 header 来源）
 - 请求与响应两侧 hop-by-hop 头清洗
 - 上游 header 注入覆盖与敏感头移除
+- 上游代理（http/https/socks）与代理认证支持
+- 入站 HTTPS：支持加载 cert/key，或自动生成并复用自签名证书
+- CORS：支持 preflight 与常规响应头注入
 - SSE 透传与基础超时映射
+- 下游限流：固定窗口（`token + route + minute`），超限返回 429 + `Retry-After`
+- 并发保护：
+  - 下游全局并发上限
+  - 上游按 key 并发上限（支持按路由覆盖）
 - 单元测试 + e2e 测试覆盖核心 DoD
 
 说明：

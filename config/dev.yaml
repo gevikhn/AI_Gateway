@@ -1,5 +1,13 @@
 listen: "127.0.0.1:8080"
 
+# 可选：开启入站 HTTPS
+# inbound_tls:
+#   cert_path: "./certs/server.crt"
+#   key_path: "./certs/server.key"
+#   # 若 cert/key 不配置，自动复用或生成自签名证书
+#   self_signed_cert_path: "./certs/gateway-selfsigned.crt"
+#   self_signed_key_path: "./certs/gateway-selfsigned.key"
+
 gateway_auth:
   tokens:
     - "gw_dev_token"
@@ -22,6 +30,8 @@ routes:
       #   address: "127.0.0.1:7890"
       #   username: "proxy_user"
       #   password: "proxy_pass"
+      # 可选：覆盖全局上游按 key 并发上限（每个 key）
+      # upstream_key_max_inflight: 8
       inject_headers:
         - name: "authorization"
           value: "Bearer sk-dev-placeholder"
@@ -39,3 +49,14 @@ cors:
   allow_headers: []
   allow_methods: []
   expose_headers: []
+
+# Phase 2：下游固定窗口限流（按 token + route 维度）
+# rate_limit:
+#   per_minute: 120
+
+# Phase 2：并发保护
+# concurrency:
+#   # 下游全局并发上限（gateway 入站）
+#   downstream_max_inflight: 100
+#   # 上游按 key 并发上限（可被 routes[].upstream.upstream_key_max_inflight 覆盖）
+#   upstream_per_key_max_inflight: 8

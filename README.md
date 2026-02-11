@@ -4,17 +4,20 @@
 
 ## 1. 功能概览
 
-当前已实现（Phase 1）：
+当前已实现（Phase 1 + Phase 2 部分能力）：
 - 多路由前缀转发（最长前缀优先 + 路径段边界）
 - 入站 `GW_TOKEN` 鉴权（Bearer 或自定义 Header）
+- 入站 HTTP/HTTPS（TLS 可选）
 - 上游 `inject_headers` 注入/覆盖
 - 敏感头与 hop-by-hop 头移除
 - 请求/响应流式透传（SSE 不做聚合改写）
 - 超时控制（`connect_timeout_ms` / `request_timeout_ms`）
+- 下游固定窗口限流（按 token + route，分钟窗口）
+- 并发保护：
+  - 下游全局并发上限
+  - 上游按 route + key 并发上限（支持按路由覆盖）
 
 暂未实现（Phase 2）：
-- 限流
-- 并发保护
 - 配置热加载
 - 自动重试策略
 
@@ -70,6 +73,12 @@ Windows:
 curl http://127.0.0.1:8080/healthz
 ```
 
+若开启 `inbound_tls`，使用：
+
+```bash
+curl -k https://127.0.0.1:8080/healthz
+```
+
 预期返回：
 
 ```json
@@ -82,6 +91,15 @@ curl http://127.0.0.1:8080/healthz
 
 ```yaml
 listen: "127.0.0.1:8080"
+
+# 可选：开启入站 HTTPS
+# inbound_tls:
+#   cert_path: "./certs/server.crt"
+#   key_path: "./certs/server.key"
+#   # 若不提供 cert/key，会自动使用下列自签名路径：
+#   # 若文件存在则直接加载，不存在则自动生成
+#   self_signed_cert_path: "./certs/gateway-selfsigned.crt"
+#   self_signed_key_path: "./certs/gateway-selfsigned.key"
 
 gateway_auth:
   tokens:
@@ -99,6 +117,8 @@ routes:
       strip_prefix: true
       connect_timeout_ms: 10000
       request_timeout_ms: 60000
+      # 可选：覆盖全局上游按 key 并发上限（每个 key）
+      upstream_key_max_inflight: 8
       # 可选：按路由配置出站代理
       proxy:
         protocol: "http" # http | https | socks
@@ -141,6 +161,13 @@ cors:
   allow_headers: []
   allow_methods: []
   expose_headers: []
+
+rate_limit:
+  per_minute: 120
+
+concurrency:
+  downstream_max_inflight: 100
+  upstream_per_key_max_inflight: 8
 ```
 
 ### 3.2 顶层字段
@@ -148,11 +175,28 @@ cors:
 | Key | 类型 | 必填 | 默认值 | 说明 |
 | --- | --- | --- | --- | --- |
 | `listen` | `string` | 是 | 无 | 网关监听地址，格式 `host:port`，如 `127.0.0.1:8080`。 |
+| `inbound_tls` | `object` | 否 | `null` | 入站 HTTPS 配置；配置后网关使用 HTTPS 监听。 |
 | `gateway_auth` | `object` | 是 | 无 | 入站鉴权配置。 |
 | `routes` | `array` | 是 | 无 | 路由转发规则，至少 1 条。 |
-| `cors` | `object` | 否 | `null` | 目前仅解析，不会实际注入 CORS 响应头（预留字段）。 |
+| `cors` | `object` | 否 | `null` | 浏览器跨域配置（支持 preflight 与常规响应头注入）。 |
+| `rate_limit` | `object` | 否 | `null` | 下游限流配置（固定窗口，分钟级）。 |
+| `concurrency` | `object` | 否 | `null` | 并发保护配置（下游全局 + 上游按 route + key）。 |
 
-### 3.3 `gateway_auth` 字段
+### 3.3 `inbound_tls` 字段（可选）
+
+| Key | 类型 | 必填 | 默认值 | 说明 |
+| --- | --- | --- | --- | --- |
+| `cert_path` | `string` | 否 | `null` | 证书文件路径（PEM）。 |
+| `key_path` | `string` | 否 | `null` | 私钥文件路径（PEM）。 |
+| `self_signed_cert_path` | `string` | 否 | `certs/gateway-selfsigned.crt` | 自签名证书文件路径。 |
+| `self_signed_key_path` | `string` | 否 | `certs/gateway-selfsigned.key` | 自签名私钥文件路径。 |
+
+规则：
+- `cert_path` 与 `key_path` 要么同时配置，要么都不配置。
+- 若同时配置，网关直接加载指定证书和私钥。
+- 若都不配置，网关优先加载 `self_signed_*` 路径的现有文件；不存在时自动生成自签名证书并落盘。
+
+### 3.4 `gateway_auth` 字段
 
 | Key | 类型 | 必填 | 默认值 | 可选值/限制 | 说明 |
 | --- | --- | --- | --- | --- | --- |
@@ -167,7 +211,7 @@ cors:
 2. `{"type": "header", "name": "x-gw-token"}`  
 从指定 Header 提取（`name` 必填）。
 
-### 3.4 `routes` 字段
+### 3.5 `routes` 字段
 
 每个 `route` 包含：
 
@@ -183,7 +227,7 @@ cors:
   - `/openai` 匹配 `/openai` 和 `/openai/...`
   - `/openai` 不匹配 `/openai2/...`
 
-### 3.5 `upstream` 字段
+### 3.6 `upstream` 字段
 
 | Key | 类型 | 必填 | 默认值 | 可选值/限制 | 说明 |
 | --- | --- | --- | --- | --- | --- |
@@ -195,6 +239,7 @@ cors:
 | `remove_headers` | `array<string>` | 否 | `[]` | 大小写不敏感 | 转发前移除的请求头。 |
 | `forward_xff` | `bool` | 否 | `false` | `true/false` | 是否保留/传递 `x-forwarded-for` 等来源 IP 头。 |
 | `proxy` | `object` | 否 | `null` | 协议为 `http/https/socks` | 按路由配置 gateway 到上游的出站代理。 |
+| `upstream_key_max_inflight` | `usize` | 否 | `null` | `> 0` | 覆盖全局上游按 route + key 并发上限（每个 key）。 |
 
 #### `inject_headers` 子项
 
@@ -224,19 +269,50 @@ inject_headers:
 - `username` 与 `password` 必须同时出现或同时省略。
 - 建议通过 `${ENV_VAR}` 注入代理凭据，避免明文。
 
-### 3.6 `cors` 字段（当前版本说明）
+### 3.7 `cors` 字段
 
-当前版本会解析 `cors` 字段，但不会在响应中自动处理 CORS 逻辑。字段含义如下：
+`cors.enabled=true` 时，网关会：
+- 处理 `OPTIONS` preflight 请求并返回 CORS 响应头
+- 在普通响应（包括错误响应）中注入 `Access-Control-Allow-Origin`
 
 | Key | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `enabled` | `bool` | `false` | 预留。 |
-| `allow_origins` | `array<string>` | `[]` | 预留。 |
-| `allow_headers` | `array<string>` | `[]` | 预留。 |
-| `allow_methods` | `array<string>` | `[]` | 预留。 |
-| `expose_headers` | `array<string>` | `[]` | 预留。 |
+| `enabled` | `bool` | `false` | 是否启用 CORS。 |
+| `allow_origins` | `array<string>` | `[]` | 允许的来源列表，建议填写完整 origin（如 `https://fy.ciallo.fans`）。 |
+| `allow_headers` | `array<string>` | `[]` | preflight 允许的请求头。 |
+| `allow_methods` | `array<string>` | `[]` | preflight 允许的请求方法。 |
+| `expose_headers` | `array<string>` | `[]` | 暴露给浏览器 JS 的响应头。 |
 
-### 3.7 环境变量插值规则 `${ENV_NAME}`
+说明：
+- `allow_origins` 支持 `*`。
+- 为兼容存量配置，`allow_origins` 也接受不带协议的 host（如 `fy.ciallo.fans`），请求时会回写真实 `Origin`。
+
+### 3.8 `rate_limit` 字段（可选）
+
+| Key | 类型 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `per_minute` | `u64` | 无 | 每分钟允许的请求数（`> 0`）。 |
+
+行为：
+- 作用于下游请求（client -> gateway）。
+- 维度为 `token + route`。
+- 超限返回 `429 {"error":"rate_limited"}`，并带 `Retry-After`。
+
+### 3.9 `concurrency` 字段（可选）
+
+| Key | 类型 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `downstream_max_inflight` | `usize` | `null` | 下游全局并发上限（`> 0`）。 |
+| `upstream_per_key_max_inflight` | `usize` | `null` | 上游按 route + key 并发上限（`> 0`）。 |
+
+行为：
+- `downstream_max_inflight` 超限返回 `503 {"error":"downstream_concurrency_exceeded"}`。
+- `upstream_per_key_max_inflight` 超限返回 `503 {"error":"upstream_concurrency_exceeded"}`。
+- 上游 key 只来源于 YAML：`routes[].upstream.inject_headers[].value`（不读取客户端请求头）。
+- 识别的 key header 固定为：`authorization`、`x-api-key`（按该顺序匹配）。
+- `routes[].upstream.upstream_key_max_inflight` 可覆盖全局上游并发上限。
+
+### 3.10 环境变量插值规则 `${ENV_NAME}`
 
 - 配置文件中出现 `${ENV_NAME}` 会在加载时替换为系统环境变量值。
 - 若环境变量不存在，启动失败。
@@ -267,6 +343,8 @@ $env:OPENAI_API_KEY="sk-..."
 | --- | --- | --- |
 | `401` | `{"error":"unauthorized"}` | token 缺失或不在白名单。 |
 | `404` | `{"error":"route_not_found"}` | 未命中任何路由。 |
+| `429` | `{"error":"rate_limited"}` | 下游请求触发限流。 |
+| `503` | `{"error":"downstream_concurrency_exceeded"}` / `{"error":"upstream_concurrency_exceeded"}` | 触发并发保护。 |
 | `502` | `{"error":"upstream_connect_error"}` 等 | 上游连接失败或请求失败。 |
 | `504` | `{"error":"upstream_timeout"}` | 请求超时。 |
 
@@ -365,9 +443,8 @@ $env:OPENAI_API_KEY="sk-xxx"
 
 ## 9. 已知限制
 
-- 当前未实现限流、并发保护、热加载、自动重试。
-- `cors` 字段当前仅解析，不会自动生效。
+- 当前未实现配置热加载与自动重试。
 
 ---
 
-如果你准备扩展到 Phase 2，建议先在 `plan.md` 新增里程碑，再按仓库约束推进实现。
+后续扩展建议优先考虑：配置热加载与重试策略的可控开关。

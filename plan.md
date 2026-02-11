@@ -1,8 +1,8 @@
-# AI Gateway Lite 实施计划（Phase 1）
+# AI Gateway Lite 实施计划（Phase 1 / Phase 2）
 
 ## 1. 目标与范围
 
-本计划用于落地 `docs/System Design.md` 的 Phase 1 能力（基础路由转发），并作为项目执行的唯一任务追踪文档。
+本计划用于落地 `docs/System Design.md` 的 Phase 1/2 能力，并作为项目执行的唯一任务追踪文档。
 
 Phase 1 范围:
 - 多路由前缀匹配（最长前缀优先 + 路径段边界）
@@ -12,15 +12,17 @@ Phase 1 范围:
 - 请求/响应流式透传（含 SSE）
 - 基础超时控制（`connect_timeout_ms` / `request_timeout_ms`）
 
-不在本阶段:
-- 限流
-- 并发保护
+Phase 2 范围（按需启用）:
+- 限流（针对下游请求）
+- 并发保护（下游与上游，且上游按 key 维度）
+
+不在当前实现范围:
 - 配置热加载
 - 自动重试
 
 ## 2. 当前状态快照
 
-- 日期: 2026-02-10
+- 日期: 2026-02-11
 - 已完成:
   - Rust 工程初始化（`Cargo.toml`、`src/`、`tests/`、`config/dev.yaml`）
   - 配置解析、鉴权、路由与 header 处理基础函数骨架
@@ -29,7 +31,7 @@ Phase 1 范围:
   - 基于 mock upstream 的 e2e 测试（header/SSE/timeout）已接入
   - Phase 1 DoD 测试矩阵补齐（含响应侧 hop-by-hop 与连接错误映射）
 - 当前缺口:
-  - 第一阶段核心目标已闭环；后续可按需求进入第二阶段能力开发
+  - 第二阶段剩余能力：配置热加载、自动重试
 
 ## 3. 里程碑与任务分解
 
@@ -51,6 +53,11 @@ Phase 1 范围:
 | M8 | 代码规范约束增强（Rust best practices） | DONE | `AGENTS.md`, `plan.md` | 增加 2000 行限制与 Rust 社区最佳实践约束 |
 | M9 | 人类使用手册（README） | DONE | `README.md`, `plan.md` | 提供配置、编译、运行、部署、排障说明 |
 | M10 | 上游代理能力（http/https/socks + 认证） | DONE | `src/config.rs`, `src/server.rs`, `tests/*`, `README.md`, `config/dev.yaml`, `docs/System Design.md`, `Cargo.toml`, `plan.md` | 可按路由配置出站代理并通过测试验证 |
+| M11 | 入站 HTTPS（证书加载 + 自签名自动生成） | DONE | `src/config.rs`, `src/server.rs`, `src/tls.rs`, `src/lib.rs`, `tests/*`, `README.md`, `config/dev.yaml`, `docs/System Design.md`, `Cargo.toml`, `plan.md` | 支持 TLS 配置，未提供证书时自动生成并复用 |
+| M12 | CORS 实际生效（预检 + 响应头） | DONE | `src/server.rs`, `tests/*`, `README.md`, `docs/System Design.md`, `plan.md` | 浏览器跨域请求与 preflight 可按配置通过 |
+| M13 | Phase 2：限流与并发控制 | DONE | `src/config.rs`, `src/server.rs`, `src/ratelimit.rs`, `src/concurrency.rs`, `tests/*`, `README.md`, `docs/System Design.md`, `config/dev.yaml`, `plan.md` | 具备下游限流；具备下游并发保护；具备上游按 key 并发保护并通过测试 |
+| M14 | Phase 2：上游 key 来源收敛为 YAML 注入值 | DONE | `src/config.rs`, `src/concurrency.rs`, `src/server.rs`, `tests/*`, `README.md`, `docs/System Design.md`, `plan.md` | 上游并发 key 仅从 `inject_headers.value` 提取，且测试覆盖 |
+| M15 | Phase 2：移除 `concurrency.upstream_key_headers` 配置项 | DONE | `src/config.rs`, `src/concurrency.rs`, `tests/*`, `README.md`, `docs/System Design.md`, `config/dev.yaml`, `plan.md` | 配置项被移除，行为保持稳定并通过测试 |
 
 ## 4. 详细实施步骤（执行顺序）
 
@@ -125,6 +132,260 @@ Phase 1 范围:
 ## 6. 执行记录（Work Log）
 
 > 按时间倒序追加，每条记录必须包含：任务 ID、变更摘要、验证命令、结果。
+
+### 2026-02-11
+- 任务: M15
+- 变更（After Change）:
+  - `src/config.rs` 移除 `ConcurrencyConfig.upstream_key_headers` 字段
+  - `src/config.rs` 增加 `ConcurrencyConfig` 的 `deny_unknown_fields`，旧配置项将直接报错（避免静默忽略）
+  - 上游 key 识别规则改为内置固定值：`authorization`、`x-api-key`
+  - `src/concurrency.rs` 去除对可配置 header 列表的依赖，改为固定识别并仅从 `inject_headers.value` 提取
+  - 更新测试：
+    - 移除旧字段相关断言
+    - 新增“旧字段应报 unknown field”校验用例
+  - 同步更新 `README.md`、`docs/System Design.md`、`config/dev.yaml`，删除 `upstream_key_headers` 配置说明与示例
+- 实际改动文件:
+  - `src/config.rs`
+  - `src/concurrency.rs`
+  - `src/server.rs`
+  - `tests/gateway_e2e.rs`
+  - `README.md`
+  - `docs/System Design.md`
+  - `config/dev.yaml`
+  - `plan.md`
+- 验证:
+  - `cargo fmt --all`
+  - `cargo test`
+  - `cargo clippy --all-targets --all-features -- -D warnings`
+- 结果: DONE
+- 剩余事项:
+  - 无新增剩余事项；沿用当前 Phase 2 未实现项（热加载、自动重试）
+
+### 2026-02-11
+- 任务: M15
+- 变更（Before Change）:
+  - 计划移除 `concurrency.upstream_key_headers` 配置项
+  - 上游并发 key 识别改为内置固定规则（`authorization`、`x-api-key`）
+  - 同步调整配置校验、并发提取逻辑、测试与文档
+- 拟改动文件:
+  - `src/config.rs`
+  - `src/concurrency.rs`
+  - `tests/gateway_e2e.rs`
+  - `README.md`
+  - `docs/System Design.md`
+  - `config/dev.yaml`
+  - `plan.md`
+- 验证:
+  - 完成后执行 `cargo fmt --all`、`cargo test`、`cargo clippy --all-targets --all-features -- -D warnings`
+- 结果: IN_PROGRESS
+
+### 2026-02-11
+- 任务: M14
+- 变更（After Change）:
+  - `src/concurrency.rs` 调整上游并发 key 提取逻辑：
+    - 不再读取客户端请求头
+    - 仅从 `routes[].upstream.inject_headers` 中按 `concurrency.upstream_key_headers` 顺序匹配并提取 key
+  - `src/server.rs` 并发控制调用改为仅传入 route（不传请求头）
+  - `src/config.rs` 增加约束：
+    - 启用上游并发限制（全局或路由级）时，route 必须在 `upstream.inject_headers` 中配置可识别 key header 且 value 非空
+  - 更新测试：
+    - `src/concurrency.rs` 单测改为基于 YAML 注入值验证按 key 分组
+    - `tests/gateway_e2e.rs` 改为两条 route（不同注入 key）验证相同 key 限制、不同 key 并行
+    - `src/config.rs` 新增缺少注入 key 的校验失败用例
+  - 更新文档与示例注释，明确“上游 key 仅来源于 YAML 注入值”
+- 实际改动文件:
+  - `src/config.rs`
+  - `src/concurrency.rs`
+  - `src/server.rs`
+  - `tests/gateway_e2e.rs`
+  - `README.md`
+  - `docs/System Design.md`
+  - `config/dev.yaml`
+  - `plan.md`
+- 验证:
+  - `cargo fmt --all`
+  - `cargo test`
+  - `cargo clippy --all-targets --all-features -- -D warnings`
+- 结果: DONE
+- 剩余事项:
+  - 无新增剩余事项；沿用当前 Phase 2 未实现项（热加载、自动重试）
+
+### 2026-02-11
+- 任务: M14
+- 变更（Before Change）:
+  - 计划将“上游并发 key 提取来源”收敛为 YAML 配置注入值
+  - 禁止从客户端请求头提取上游 key
+  - 增加配置校验：启用上游并发限制时，路由必须在 `inject_headers` 提供可识别的 key header
+  - 同步更新测试与文档说明
+- 拟改动文件:
+  - `src/config.rs`
+  - `src/concurrency.rs`
+  - `src/server.rs`
+  - `tests/gateway_e2e.rs`
+  - `README.md`
+  - `docs/System Design.md`
+  - `plan.md`
+- 验证:
+  - 完成后执行 `cargo fmt --all`、`cargo test`、`cargo clippy --all-targets --all-features -- -D warnings`
+- 结果: IN_PROGRESS
+
+### 2026-02-11
+- 任务: M13
+- 变更（After Change）:
+  - 新增 `src/ratelimit.rs`：固定窗口限流器（按 `token + route + minute`），超限返回 `429 {"error":"rate_limited"}` 且带 `Retry-After`
+  - 新增 `src/concurrency.rs`：并发控制器
+    - 下游全局并发上限（`downstream_max_inflight`）
+    - 上游按 key 并发上限（`upstream_per_key_max_inflight`，可被 `routes[].upstream.upstream_key_max_inflight` 覆盖）
+    - key 提取来源可配置（`upstream_key_headers`）
+  - `src/server.rs` 接入限流与并发控制链路，并确保 permit 生命周期覆盖响应流（含 SSE）
+  - `src/config.rs` 扩展并校验新配置：`rate_limit`、`concurrency`、`upstream_key_max_inflight`
+  - `tests/gateway_e2e.rs` 补充 Phase 2 集成测试：
+    - 下游限流返回 429
+    - 下游并发超限返回 503
+    - 上游相同 key 并发超限返回 503，不同 key 可并行
+  - 同步更新 `README.md`、`docs/System Design.md`、`config/dev.yaml` 的配置与行为说明
+- 实际改动文件:
+  - `src/auth.rs`
+  - `src/config.rs`
+  - `src/concurrency.rs`
+  - `src/lib.rs`
+  - `src/proxy.rs`
+  - `src/ratelimit.rs`
+  - `src/server.rs`
+  - `tests/gateway_e2e.rs`
+  - `tests/inbound_tls_e2e.rs`
+  - `README.md`
+  - `docs/System Design.md`
+  - `config/dev.yaml`
+  - `plan.md`
+- 验证:
+  - `cargo fmt --all`
+  - `cargo test`
+  - `cargo clippy --all-targets --all-features -- -D warnings`
+- 结果: DONE
+- 剩余事项:
+  - Phase 2 尚未实现配置热加载与自动重试
+
+### 2026-02-11
+- 任务: M13
+- 变更（Before Change）:
+  - 计划进入 Phase 2，落地限流与并发控制能力
+  - 计划实现下游固定窗口限流（每分钟），超限返回 `429 {"error":"rate_limited"}`
+  - 计划实现并发保护：
+    - 下游并发上限（全局）
+    - 上游并发上限（按 route + upstream key 维度）
+  - 计划补充配置解析/校验、运行时组件与集成测试，并更新文档与示例配置
+- 拟改动文件:
+  - `src/config.rs`
+  - `src/server.rs`
+  - `src/lib.rs`
+  - `src/ratelimit.rs`
+  - `src/concurrency.rs`
+  - `tests/gateway_e2e.rs`
+  - `README.md`
+  - `docs/System Design.md`
+  - `config/dev.yaml`
+  - `plan.md`
+- 验证:
+  - 完成后执行 `cargo fmt --all`、`cargo test`、`cargo clippy --all-targets --all-features -- -D warnings`
+- 结果: IN_PROGRESS
+
+### 2026-02-11
+- 任务: M12
+- 变更（After Change）:
+  - 在 `src/server.rs` 落地 CORS 运行时逻辑：
+    - 识别并处理 preflight (`OPTIONS + Origin + Access-Control-Request-Method`)
+    - preflight 成功返回 `204` 并设置 `Access-Control-Allow-Origin/Methods/Headers`
+    - 常规响应（含错误响应）按命中 origin 注入 `Access-Control-Allow-Origin`
+    - 支持 `Access-Control-Expose-Headers`
+  - 对 `allow_origins` 增加兼容匹配：支持完整 origin 与无协议 host 写法（如 `fy.ciallo.fans`）
+  - 新增 e2e 测试：
+    - preflight 无需鉴权即可通过并返回正确 CORS 头
+    - `allow_origins` 配置 host 写法时，响应可正确回写 `Origin`
+  - 更新 `README.md` 与 `docs/System Design.md`，将 CORS 从“仅解析”更新为“已生效”
+- 实际改动文件:
+  - `src/server.rs`
+  - `tests/gateway_e2e.rs`
+  - `README.md`
+  - `docs/System Design.md`
+  - `plan.md`
+- 验证:
+  - `cargo fmt --all`
+  - `cargo test`
+  - `cargo clippy --all-targets --all-features -- -D warnings`
+- 结果: DONE
+- 剩余事项:
+  - 当前 CORS 未实现 `allow_credentials` 与 `max_age`，如前端后续需要 Cookie 凭据可新增显式配置项
+
+### 2026-02-11
+- 任务: M12
+- 变更（Before Change）:
+  - 计划将现有仅“解析不生效”的 `cors` 配置改为运行时生效
+  - 计划实现 preflight (`OPTIONS`) 处理，并在常规响应上注入 CORS 相关响应头
+  - 计划补充集成测试覆盖跨域成功路径与预检路径，并同步更新文档说明
+- 拟改动文件:
+  - `src/server.rs`
+  - `tests/gateway_e2e.rs`
+  - `README.md`
+  - `docs/System Design.md`
+  - `plan.md`
+- 验证:
+  - 完成后执行 `cargo fmt --all`、`cargo test`、`cargo clippy --all-targets --all-features -- -D warnings`
+- 结果: IN_PROGRESS
+
+### 2026-02-11
+- 任务: M11
+- 变更（After Change）:
+  - 在顶层配置新增 `inbound_tls`，支持 `cert_path`/`key_path` 与 `self_signed_*` 路径配置
+  - 增加 TLS 配置校验：证书与私钥必须成对出现；路径不得为空
+  - 新增 `src/tls.rs`，实现证书路径解析逻辑：
+    - 若配置 cert/key：直接加载
+    - 若未配置 cert/key 且已存在自签名文件：直接加载
+    - 若未配置 cert/key 且文件不存在：自动生成并落盘
+  - `src/server.rs` 接入 HTTPS 启动路径（`axum-server + rustls`），并在 TLS 启动前安装 rustls crypto provider
+  - 新增入站 HTTPS e2e 测试，验证自动生成自签名证书并可通过 HTTPS 访问
+  - 同步更新 `README.md`、`docs/System Design.md`、`config/dev.yaml` 配置示例与说明
+  - 调整 `tests/gateway_e2e.rs` 两个超时用例预算，降低时间敏感抖动
+- 实际改动文件:
+  - `Cargo.toml`
+  - `src/config.rs`
+  - `src/server.rs`
+  - `src/tls.rs`
+  - `src/lib.rs`
+  - `tests/inbound_tls_e2e.rs`
+  - `tests/gateway_e2e.rs`
+  - `README.md`
+  - `docs/System Design.md`
+  - `config/dev.yaml`
+  - `plan.md`
+- 验证:
+  - `cargo fmt --all`
+  - `cargo test`
+  - `cargo clippy --all-targets --all-features -- -D warnings`
+- 结果: DONE
+- 剩余事项:
+  - 当前 HTTPS 为“开启后仅 HTTPS 监听”，如需 HTTP+HTTPS 同时监听可在后续任务扩展双监听模式
+
+### 2026-02-11
+- 任务: M11
+- 变更（Before Change）:
+  - 计划为 `user -> gateway` 入站链路增加 HTTPS 监听能力（保持 HTTP 默认兼容）
+  - 计划支持配置证书与私钥路径；若未配置则自动生成并复用本地自签名证书
+  - 计划补充 TLS 配置校验、证书生成/加载逻辑及测试，并同步文档与示例配置
+- 拟改动文件:
+  - `Cargo.toml`
+  - `src/config.rs`
+  - `src/server.rs`
+  - `src/tls.rs`
+  - `src/lib.rs`
+  - `tests/gateway_e2e.rs`
+  - `README.md`
+  - `docs/System Design.md`
+  - `config/dev.yaml`
+  - `plan.md`
+- 验证:
+  - 完成后执行 `cargo fmt --all`、`cargo test`、`cargo clippy --all-targets --all-features -- -D warnings`
+- 结果: IN_PROGRESS
 
 ### 2026-02-11
 - 任务: M10

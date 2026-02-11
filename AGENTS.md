@@ -1,6 +1,36 @@
-# Repository & Agent Guidelines / 仓库与代理协作规范
 
-本仓库当前为 docs-first。`docs/System Design.md` 是设计事实源（source of truth）；若本文件与其冲突，以 `docs/System Design.md` 为准。`plan.md` 是实施执行事实源（execution source of truth），用于追踪任务状态与验证结果。
+
+## Context Loading Policy (MUST FOLLOW) / 上下文加载策略（必须遵守）
+
+Goal: minimize context usage. Do NOT bulk-read files on thread start.
+
+### Reading Budget / 阅读预算
+- On a new thread, initial context loading must stay under ~2000 lines total across all files.
+- Prefer targeted excerpts (specific sections / functions) over full-file reads.
+
+### Strict Rules / 严格规则
+1) DO NOT run `Get-Content -Raw` on large files by default (README, docs/System Design.md, tests/*, Cargo.toml, config/*.yaml).
+2) Before reading any file, ALWAYS:
+   - run `rg` to locate relevant symbols/keywords, then
+   - open only the minimal needed ranges (e.g., 80-200 lines).
+3) Treat `docs/System Design.md` as source of truth, BUT:
+   - read only the relevant section(s) for the current task (not the whole document).
+4) For `plan.md`:
+   - read only the header + the current phase section + the task list (not the entire history).
+   - update status to IN_PROGRESS with minimal diff.
+5) Tests/README:
+   - only open if the change impacts public behavior or DoD items; otherwise postpone.
+6) After gathering minimal context, output a brief "Context Summary" and "Files to Touch" plan before coding.
+
+### Default Startup Checklist / 默认启动流程
+A. `rg` for task-related terms.
+B. Open only the relevant modules/functions.
+C. Only then begin implementation.
+
+
+## Repository & Agent Guidelines / 仓库与代理协作规范
+
+本仓库当前为 docs-first。`docs/System Design.md` 是设计事实源（source of truth）, 但仅在当前任务相关时按章节读取（MUST read only relevant sections, never full-file by default）；若本文件与其冲突，以 `docs/System Design.md` 为准。`plan.md` 是实施执行事实源（execution source of truth），用于追踪任务状态与验证结果。
 
 ## Current Delivery Scope / 当前交付范围
 

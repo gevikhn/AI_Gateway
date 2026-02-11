@@ -250,6 +250,7 @@ mod tests {
             remove_headers: vec!["authorization".to_string()],
             forward_xff: false,
             proxy: None,
+            upstream_key_max_inflight: None,
         };
 
         let outbound = prepare_upstream_headers(&inbound, &upstream).expect("headers are valid");
@@ -287,6 +288,7 @@ mod tests {
             remove_headers: Vec::new(),
             forward_xff: false,
             proxy: None,
+            upstream_key_max_inflight: None,
         }
     }
 }

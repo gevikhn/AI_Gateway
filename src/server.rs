@@ -1,13 +1,17 @@
 use crate::auth;
-use crate::config::{AppConfig, ProxyProtocol, RouteConfig, UpstreamConfig, UpstreamProxyConfig};
+use crate::concurrency::ConcurrencyController;
+use crate::config::{
+    AppConfig, CorsConfig, ProxyProtocol, RouteConfig, UpstreamConfig, UpstreamProxyConfig,
+};
 use crate::proxy;
+use crate::ratelimit::{RateLimitDecision, RateLimiter};
+use crate::tls;
 use axum::body::{Body, Bytes};
 use axum::extract::State;
-use axum::http::{Request, Response, StatusCode};
+use axum::http::{HeaderMap, Method, Request, Response, StatusCode};
 use axum::routing::{any, get};
 use axum::{Router, response::IntoResponse};
-use futures_util::Stream;
-use futures_util::TryStreamExt;
+use futures_util::{Stream, StreamExt, TryStreamExt};
 use http::header::CONTENT_TYPE;
 use std::collections::HashMap;
 use std::io;
@@ -15,21 +19,31 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::OwnedSemaphorePermit;
 
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<AppConfig>,
     pub upstream_clients: Arc<HashMap<String, reqwest::Client>>,
+    pub rate_limiter: Option<Arc<RateLimiter>>,
+    pub concurrency: Option<Arc<ConcurrencyController>>,
 }
 
 pub fn build_app(config: Arc<AppConfig>) -> Result<Router, String> {
     let upstream_clients = Arc::new(build_upstream_clients(&config)?);
+    let rate_limiter = config
+        .rate_limit
+        .as_ref()
+        .map(|rate_limit| Arc::new(RateLimiter::new(rate_limit.per_minute)));
+    let concurrency = ConcurrencyController::new(&config).map(Arc::new);
     Ok(Router::new()
         .route("/healthz", get(healthz_handler))
         .fallback(any(proxy_handler))
         .with_state(AppState {
             config,
             upstream_clients,
+            rate_limiter,
+            concurrency,
         }))
 }
 
@@ -38,15 +52,41 @@ pub async fn run_server(config: Arc<AppConfig>) -> Result<(), String> {
         .listen
         .parse()
         .map_err(|err| format!("invalid listen address `{}`: {err}", config.listen))?;
-    let listener = tokio::net::TcpListener::bind(listen_addr)
-        .await
-        .map_err(|err| format!("failed to bind `{listen_addr}`: {err}"))?;
+    let app = build_app(config.clone())?;
 
-    let app = build_app(config)?;
-
-    axum::serve(listener, app)
+    if let Some(tls_config) = &config.inbound_tls {
+        install_rustls_crypto_provider();
+        let (tls_paths, _) = tls::resolve_tls_paths(tls_config, listen_addr)?;
+        let rustls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(
+            &tls_paths.cert_path,
+            &tls_paths.key_path,
+        )
         .await
-        .map_err(|err| format!("server error: {err}"))
+        .map_err(|err| {
+            format!(
+                "failed to load inbound tls cert/key (`{}` / `{}`): {err}",
+                tls_paths.cert_path.display(),
+                tls_paths.key_path.display()
+            )
+        })?;
+
+        axum_server::bind_rustls(listen_addr, rustls_config)
+            .serve(app.into_make_service())
+            .await
+            .map_err(|err| format!("server error: {err}"))
+    } else {
+        let listener = tokio::net::TcpListener::bind(listen_addr)
+            .await
+            .map_err(|err| format!("failed to bind `{listen_addr}`: {err}"))?;
+
+        axum::serve(listener, app)
+            .await
+            .map_err(|err| format!("server error: {err}"))
+    }
+}
+
+fn install_rustls_crypto_provider() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }
 
 async fn healthz_handler() -> impl IntoResponse {
@@ -58,33 +98,125 @@ async fn healthz_handler() -> impl IntoResponse {
 }
 
 async fn proxy_handler(State(state): State<AppState>, request: Request<Body>) -> Response<Body> {
+    let method = request.method().clone();
     let path = request.uri().path().to_string();
     let query = request.uri().query().map(ToString::to_string);
+    let request_origin = extract_origin(request.headers());
+    let cors_config = state.config.cors.as_ref().filter(|cors| cors.enabled);
 
     let Some(route) = proxy::match_route(&path, &state.config.routes) else {
-        return json_error(StatusCode::NOT_FOUND, "route_not_found");
+        return finalize_response_with_cors(
+            json_error(StatusCode::NOT_FOUND, "route_not_found"),
+            cors_config,
+            request_origin.as_deref(),
+        );
     };
 
-    if !auth::is_authorized(request.headers(), &state.config.gateway_auth) {
-        return json_error(StatusCode::UNAUTHORIZED, "unauthorized");
+    if let Some(cors) = cors_config
+        && is_cors_preflight(&method, request.headers())
+    {
+        return build_preflight_response(cors, request_origin.as_deref(), request.headers());
     }
+
+    let Some(token) = auth::extract_authorized_token(request.headers(), &state.config.gateway_auth)
+    else {
+        return finalize_response_with_cors(
+            json_error(StatusCode::UNAUTHORIZED, "unauthorized"),
+            cors_config,
+            request_origin.as_deref(),
+        );
+    };
+
+    if let Some(rate_limiter) = &state.rate_limiter {
+        match rate_limiter.check(&token, &route.id) {
+            RateLimitDecision::Allowed => {}
+            RateLimitDecision::Rejected { retry_after_secs } => {
+                let mut response = json_error(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
+                set_header(
+                    response.headers_mut(),
+                    "retry-after",
+                    &retry_after_secs.to_string(),
+                );
+                return finalize_response_with_cors(
+                    response,
+                    cors_config,
+                    request_origin.as_deref(),
+                );
+            }
+        }
+    }
+
+    let downstream_permit = if let Some(concurrency) = &state.concurrency {
+        match concurrency.acquire_downstream() {
+            Ok(permit) => permit,
+            Err(_) => {
+                return finalize_response_with_cors(
+                    json_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "downstream_concurrency_exceeded",
+                    ),
+                    cors_config,
+                    request_origin.as_deref(),
+                );
+            }
+        }
+    } else {
+        None
+    };
 
     let Some(upstream_url) = proxy::build_upstream_url_for_route(route, &path, query.as_deref())
     else {
-        return json_error(StatusCode::BAD_REQUEST, "invalid_upstream_path");
+        return finalize_response_with_cors(
+            json_error(StatusCode::BAD_REQUEST, "invalid_upstream_path"),
+            cors_config,
+            request_origin.as_deref(),
+        );
     };
 
     let upstream_headers = match proxy::prepare_upstream_headers(request.headers(), &route.upstream)
     {
         Ok(headers) => headers,
-        Err(_) => return json_error(StatusCode::BAD_GATEWAY, "upstream_header_error"),
+        Err(_) => {
+            return finalize_response_with_cors(
+                json_error(StatusCode::BAD_GATEWAY, "upstream_header_error"),
+                cors_config,
+                request_origin.as_deref(),
+            );
+        }
     };
 
     let Some(upstream_client) = state.upstream_clients.get(&route.id) else {
-        return json_error(StatusCode::BAD_GATEWAY, "upstream_client_not_found");
+        return finalize_response_with_cors(
+            json_error(StatusCode::BAD_GATEWAY, "upstream_client_not_found"),
+            cors_config,
+            request_origin.as_deref(),
+        );
     };
 
-    match forward_to_upstream(
+    let upstream_permit = if let Some(concurrency) = &state.concurrency {
+        match concurrency.acquire_upstream(route).await {
+            Ok(permit) => permit,
+            Err(_) => {
+                return finalize_response_with_cors(
+                    json_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "upstream_concurrency_exceeded",
+                    ),
+                    cors_config,
+                    request_origin.as_deref(),
+                );
+            }
+        }
+    } else {
+        None
+    };
+
+    let response_guards = ResponseGuards {
+        downstream_permit,
+        upstream_permit,
+    };
+
+    let response = match forward_to_upstream(
         upstream_client,
         route,
         request,
@@ -93,9 +225,10 @@ async fn proxy_handler(State(state): State<AppState>, request: Request<Body>) ->
     )
     .await
     {
-        Ok(response) => response,
+        Ok(response) => attach_response_guards(response, response_guards),
         Err(error) => error_response(error),
-    }
+    };
+    finalize_response_with_cors(response, cors_config, request_origin.as_deref())
 }
 
 async fn forward_to_upstream(
@@ -131,6 +264,17 @@ async fn forward_to_upstream(
 
 type ProxyBodyStream = Pin<Box<dyn Stream<Item = Result<Bytes, io::Error>> + Send>>;
 
+struct ResponseGuards {
+    downstream_permit: Option<OwnedSemaphorePermit>,
+    upstream_permit: Option<OwnedSemaphorePermit>,
+}
+
+impl ResponseGuards {
+    fn is_empty(&self) -> bool {
+        self.downstream_permit.is_none() && self.upstream_permit.is_none()
+    }
+}
+
 fn response_from_upstream(
     upstream_response: reqwest::Response,
     is_sse: bool,
@@ -155,6 +299,22 @@ fn response_from_upstream(
     response
 }
 
+fn attach_response_guards(response: Response<Body>, guards: ResponseGuards) -> Response<Body> {
+    if guards.is_empty() {
+        return response;
+    }
+
+    let (parts, body) = response.into_parts();
+    let stream = body
+        .into_data_stream()
+        .map_err(|err| io::Error::other(err.to_string()))
+        .map(move |item| {
+            let _ = &guards;
+            item
+        });
+    Response::from_parts(parts, Body::from_stream(stream))
+}
+
 fn json_error(status: StatusCode, code: &'static str) -> Response<Body> {
     let mut response = Response::new(Body::from(format!(r#"{{"error":"{code}"}}"#)));
     *response.status_mut() = status;
@@ -177,6 +337,193 @@ fn error_response(error: UpstreamError) -> Response<Body> {
                 json_error(StatusCode::BAD_GATEWAY, "upstream_request_failed")
             }
         }
+    }
+}
+
+fn finalize_response_with_cors(
+    mut response: Response<Body>,
+    cors: Option<&CorsConfig>,
+    request_origin: Option<&str>,
+) -> Response<Body> {
+    if let Some(cors) = cors {
+        apply_cors_response_headers(&mut response, cors, request_origin);
+    }
+    response
+}
+
+fn build_preflight_response(
+    cors: &CorsConfig,
+    request_origin: Option<&str>,
+    request_headers: &HeaderMap,
+) -> Response<Body> {
+    let Some(allow_origin) = resolve_allow_origin(cors, request_origin) else {
+        return json_error(StatusCode::FORBIDDEN, "cors_origin_not_allowed");
+    };
+
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = StatusCode::NO_CONTENT;
+
+    set_header(
+        response.headers_mut(),
+        "access-control-allow-origin",
+        &allow_origin,
+    );
+    set_header(
+        response.headers_mut(),
+        "vary",
+        "Origin, Access-Control-Request-Method, Access-Control-Request-Headers",
+    );
+
+    let allow_methods = build_allow_methods(cors, request_headers);
+    if !allow_methods.is_empty() {
+        set_header(
+            response.headers_mut(),
+            "access-control-allow-methods",
+            &allow_methods,
+        );
+    }
+
+    let allow_headers = build_allow_headers(cors, request_headers);
+    if !allow_headers.is_empty() {
+        set_header(
+            response.headers_mut(),
+            "access-control-allow-headers",
+            &allow_headers,
+        );
+    }
+
+    response
+}
+
+fn apply_cors_response_headers(
+    response: &mut Response<Body>,
+    cors: &CorsConfig,
+    request_origin: Option<&str>,
+) {
+    if let Some(allow_origin) = resolve_allow_origin(cors, request_origin) {
+        set_header(
+            response.headers_mut(),
+            "access-control-allow-origin",
+            &allow_origin,
+        );
+        set_header(response.headers_mut(), "vary", "Origin");
+    }
+
+    if !cors.expose_headers.is_empty() {
+        let expose_headers = cors
+            .expose_headers
+            .iter()
+            .map(|header| header.trim())
+            .filter(|header| !header.is_empty())
+            .collect::<Vec<_>>()
+            .join(", ");
+        if !expose_headers.is_empty() {
+            set_header(
+                response.headers_mut(),
+                "access-control-expose-headers",
+                &expose_headers,
+            );
+        }
+    }
+}
+
+fn resolve_allow_origin(cors: &CorsConfig, request_origin: Option<&str>) -> Option<String> {
+    let request_origin = request_origin?.trim();
+    if request_origin.is_empty() {
+        return None;
+    }
+
+    for allowed in &cors.allow_origins {
+        let allowed = allowed.trim();
+        if allowed.is_empty() {
+            continue;
+        }
+        if allowed == "*" {
+            return Some("*".to_string());
+        }
+        if allowed.eq_ignore_ascii_case(request_origin) {
+            return Some(request_origin.to_string());
+        }
+        if !allowed.contains("://")
+            && let Some(origin_host) = extract_origin_host(request_origin)
+            && allowed.eq_ignore_ascii_case(&origin_host)
+        {
+            return Some(request_origin.to_string());
+        }
+    }
+
+    None
+}
+
+fn extract_origin(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("origin")
+        .and_then(|value| value.to_str().ok())
+        .map(ToString::to_string)
+}
+
+fn extract_origin_host(origin: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(origin).ok()?;
+    let host = parsed.host_str()?;
+    Some(match parsed.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    })
+}
+
+fn is_cors_preflight(method: &Method, headers: &HeaderMap) -> bool {
+    method == Method::OPTIONS
+        && headers.contains_key("origin")
+        && headers.contains_key("access-control-request-method")
+}
+
+fn build_allow_methods(cors: &CorsConfig, request_headers: &HeaderMap) -> String {
+    let mut methods = cors
+        .allow_methods
+        .iter()
+        .map(|method| method.trim().to_ascii_uppercase())
+        .filter(|method| !method.is_empty())
+        .collect::<Vec<_>>();
+
+    if let Some(request_method) = request_headers
+        .get("access-control-request-method")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.trim().to_ascii_uppercase())
+        .filter(|value| !value.is_empty())
+        && !methods.iter().any(|method| method == &request_method)
+    {
+        methods.push(request_method);
+    }
+
+    methods.join(", ")
+}
+
+fn build_allow_headers(cors: &CorsConfig, request_headers: &HeaderMap) -> String {
+    let mut headers = cors
+        .allow_headers
+        .iter()
+        .map(|header| header.trim().to_ascii_lowercase())
+        .filter(|header| !header.is_empty())
+        .collect::<Vec<_>>();
+
+    if let Some(requested_headers) = request_headers
+        .get("access-control-request-headers")
+        .and_then(|value| value.to_str().ok())
+    {
+        for header in requested_headers.split(',') {
+            let header = header.trim().to_ascii_lowercase();
+            if !header.is_empty() && !headers.iter().any(|existing| existing == &header) {
+                headers.push(header);
+            }
+        }
+    }
+
+    headers.join(", ")
+}
+
+fn set_header(headers: &mut HeaderMap, name: &'static str, value: &str) {
+    if let Ok(header_value) = http::HeaderValue::from_str(value) {
+        headers.insert(http::HeaderName::from_static(name), header_value);
     }
 }
 
@@ -344,6 +691,7 @@ mod tests {
                     username: None,
                     password: None,
                 }),
+                upstream_key_max_inflight: None,
             },
         });
 
@@ -389,9 +737,13 @@ mod tests {
                     remove_headers: Vec::new(),
                     forward_xff: false,
                     proxy: None,
+                    upstream_key_max_inflight: None,
                 },
             }],
+            inbound_tls: None,
             cors: None,
+            rate_limit: None,
+            concurrency: None,
         }
     }
 }
