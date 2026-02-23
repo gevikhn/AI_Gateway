@@ -31,10 +31,10 @@
 - 下游固定窗口限流（按 token + route）
 - 并发保护（下游全局 + 上游按 route + key）
 - 可观测性：结构化日志、`/metrics`、`/metrics/ui`、`/metrics/summary`、低采样 tracing（OTLP 可选）
+- **配置热加载 + Admin 管理页面**：REST API + ArcSwap 原子替换，运行时修改路由/鉴权/限流等配置立即生效，并可持久化写回 YAML 文件
 
 仍暂缓到后续阶段：
 
-- 配置热加载
 - 复杂重试策略
 
 ------
@@ -208,9 +208,14 @@ observability:
     otlp:
       endpoint: "http://127.0.0.1:4317"
       timeout_ms: 3000
+
+admin:
+  enabled: true
+  token: "${GW_ADMIN_TOKEN}"
+  path_prefix: "/admin"  # 默认 /admin
 ```
 
-> 当前已实现 `rate_limit` 与 `concurrency`；`reload` 与重试能力仍为后续阶段。
+> 当前已实现 `rate_limit`、`concurrency` 与 `admin`；重试能力仍为后续阶段。
 
 ### 3.2 值插值规则（必须）
 
@@ -416,22 +421,46 @@ observability:
 
 ------
 
-## 7. 第二阶段：动态路由/配置热加载（暂缓）
+## 7. 第二阶段：Admin 管理页面与配置热加载（已实现）
 
-> 当前版本仍不实现本节能力，以下内容作为后续扩展设计保留。
+配置热加载通过 **REST API + ArcSwap** 实现，无需文件监听器，运行时修改即时生效。
 
-你要求“实时动态绑定转发路径”，个人工具推荐两种简单方式：
+### 7.1 Admin 配置
 
-### 7.1 文件监听热加载（推荐）
+```yaml
+admin:
+  enabled: true
+  token: "${GW_ADMIN_TOKEN}"   # Bearer token 鉴权
+  path_prefix: "/admin"        # 默认值
+```
 
-- 使用 `notify` crate 监听配置文件变更
-- 重新 parse 配置，校验通过后用 `ArcSwap` 原子替换运行时配置
-- 校验失败：保留旧配置，打印错误日志
+### 7.2 Admin API 端点
 
-### 7.2 每次请求检查 mtime（更简单）
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| `GET` | `{prefix}/ui` | 内置 HTML 管理页面（浏览器访问） |
+| `GET` | `{prefix}/api/config` | 获取当前运行配置（JSON） |
+| `PUT` | `{prefix}/api/config` | 验证并热加载新配置（即时生效，不重启） |
+| `POST` | `{prefix}/api/config/save` | 将当前配置持久化写回 YAML 文件（原子 rename） |
 
-- 适合低 QPS
-- 如果 mtime 改变则 reload（仍然需要原子替换）
+所有 API 端点均需 `Authorization: Bearer <admin.token>` 鉴权。
+
+### 7.3 热加载范围
+
+| 可热加载（无需重启） | 需要重启 |
+|---|---|
+| `routes` | `listen` |
+| `gateway_auth` | `inbound_tls` |
+| `cors` | `observability`（tracing subscriber 为全局单例） |
+| `rate_limit` | |
+| `concurrency` | |
+
+### 7.4 热加载机制
+
+- 运行时状态打包为 `RuntimeState`（config + upstream_clients + rate_limiter + concurrency）
+- `AppState` 持有 `Arc<ArcSwap<RuntimeState>>`，代理请求每次 `load()` 得到原子快照
+- Admin `PUT /api/config` 接收新配置 → 校验 → 构建新 `RuntimeState` → `store()` 原子替换
+- 校验失败时保留旧配置并返回错误，不影响正在处理的请求
 
 ------
 
@@ -446,17 +475,34 @@ observability:
 - `config.rs`：YAML 解析、插值（env）、校验
 - `auth.rs`：入站 token 提取与校验
 - `proxy.rs`：路由匹配、URL 重写、header 处理辅助函数
-- `server.rs`：HTTP 入口、请求处理流程、上游转发与错误映射
+- `server.rs`：HTTP 入口、请求处理流程、上游转发与错误映射；`RuntimeState` + `AppState` 定义
+- `admin.rs`：Admin REST API handler、内置 HTML 管理页面、热加载触发逻辑
 - `observability.rs`：tracing 初始化、metrics 注册与 request-id 工具
 - `main.rs`：启动参数解析、配置加载、服务启动
 - `ratelimit.rs`：固定窗口限流计数器
 - `concurrency.rs`：下游/上游并发保护
-- `reload.rs`（第二阶段）：热加载（notify + ArcSwap）
+- `install.rs`（仅 Linux）：一键安装 systemd service
 
-运行时共享状态（Arc）：
+运行时共享状态：
 
-- 当前：`Arc<AppConfig>` + `RateLimiter` + `ConcurrencyController` + `ObservabilityRuntime`
-- 后续可演进：`ArcSwap<AppConfig>`（用于热加载）
+```rust
+// 可热加载的运行时组件（ArcSwap 原子替换）
+pub struct RuntimeState {
+    pub config: Arc<AppConfig>,
+    pub upstream_clients: HashMap<String, reqwest::Client>,
+    pub rate_limiter: Option<Arc<RateLimiter>>,
+    pub concurrency: Option<Arc<ConcurrencyController>>,
+}
+
+// 服务全局状态
+pub struct AppState {
+    pub runtime: Arc<ArcSwap<RuntimeState>>,     // 热加载
+    pub observability: Arc<ObservabilityRuntime>, // 不热加载（全局单例）
+    pub config_path: Option<PathBuf>,             // 持久化写回路径
+    pub admin_token: Option<String>,
+    pub admin_path_prefix: Option<String>,
+}
+```
 
 ------
 
@@ -493,6 +539,12 @@ observability:
    - `/metrics/ui` 可访问并周期拉取 `summary` 展示 route/token 统计
 13. request-id 行为：
    - 客户端提供 `x-request-id` 时网关回传同值；未提供时网关自动生成
+14. Admin API 鉴权：
+   - 无 token 或错误 token 访问 Admin API 返回 401
+   - 正确 token 时 `GET /admin/api/config` 返回当前配置 JSON
+15. Admin 热加载行为：
+   - `PUT /admin/api/config` 传入合法新配置后，新路由立即对后续请求生效
+   - `POST /admin/api/config/save` 后重启服务，保存的配置可正常加载
 
 ------
 
@@ -533,12 +585,11 @@ Codex 实现应交付：
 
 第二阶段暂缓项：
 
-- 配置热加载（notify）
 - 自动重试策略
 
 ------
 
-## 12. 当前实现状态（2026-02-11）
+## 12. 当前实现状态（2026-02-19）
 
 已完成项（代码已落地）：
 
@@ -558,8 +609,14 @@ Codex 实现应交付：
 - 可观测性：
   - Prometheus `/metrics`
   - 轻量观测页 `/metrics/ui` 与窗口统计 `/metrics/summary`（1h/24h route + token）
-- 单元测试 + e2e 测试覆盖核心 DoD
+- Linux 一键安装（`--install`）：自动创建 systemd service 与默认配置
+- **Admin 管理页面（`/admin/ui`）+ 配置热加载**：
+  - REST API 支持读取、应用、保存配置（Bearer token 鉴权）
+  - `PUT /admin/api/config` 热加载即时生效（ArcSwap 原子替换）
+  - `POST /admin/api/config/save` 持久化写回 YAML 文件（原子 rename）
+  - 内置 HTML 管理界面，支持 Routes / Auth / CORS / Rate Limit / Concurrency / Advanced 六个 Tab
+- 单元测试 + e2e 测试覆盖核心 DoD（42 个单元测试，全绿）
 
 说明：
 
-- 本节用于标注“当前代码实际状态”，若后续实现变化请同步更新。
+- 本节用于标注"当前代码实际状态"，若后续实现变化请同步更新。

@@ -49,9 +49,10 @@ async fn https_listener_auto_generates_self_signed_cert() {
         rate_limit: None,
         concurrency: None,
         observability: None,
+        admin: None,
     };
 
-    let server_handle = tokio::spawn(async move { run_server(Arc::new(config)).await });
+    let server_handle = tokio::spawn(async move { run_server(Arc::new(config), None).await });
 
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)

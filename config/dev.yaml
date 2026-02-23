@@ -75,6 +75,11 @@ observability:
       endpoint: "http://127.0.0.1:4317"
       timeout_ms: 3000
 
+admin:
+  enabled: true
+  token: "admin_dev_token"
+  path_prefix: "/admin"
+
 # Phase 2：下游固定窗口限流（按 token + route 维度）
 # rate_limit:
 #   per_minute: 120

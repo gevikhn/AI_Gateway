@@ -299,6 +299,7 @@ mod tests {
                 upstream_per_key_max_inflight: upstream_limit,
             }),
             observability: None,
+            admin: None,
         }
     }
 }

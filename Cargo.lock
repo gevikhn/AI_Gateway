@@ -15,6 +15,7 @@ dependencies = [
 name = "ai-gw-lite"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "axum 0.8.8",
  "axum-server",
  "futures-util",
@@ -28,6 +29,7 @@ dependencies = [
  "reqwest",
  "rustls",
  "serde",
+ "serde_json",
  "serde_yaml",
  "tokio",
  "tower 0.5.3",

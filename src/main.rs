@@ -41,7 +41,7 @@ async fn run() -> Result<(), String> {
                 .map_err(|err| format!("failed to load config `{config_path}`: {err}"))?;
             observability::init_tracing(config.observability.as_ref())?;
 
-            server::run_server(Arc::new(config)).await
+            server::run_server(Arc::new(config), Some(config_path)).await
         }
     }
 }

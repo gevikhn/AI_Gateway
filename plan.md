@@ -62,6 +62,7 @@ Phase 2 范围（按需启用）:
 | M17 | 日志持久化（文件分片 + 滚动） | DONE | `src/config.rs`, `src/observability.rs`, `config/dev.yaml`, `README.md`, `docs/System Design.md`, `Cargo.toml`, `plan.md` | 日志可落盘；支持按周期分片滚动；支持保留文件数量控制 |
 | M18 | 轻量观测界面（HTML + JS）与窗口统计 | DONE | `src/server.rs`, `src/observability.rs`, `tests/gateway_e2e.rs`, `README.md`, `docs/System Design.md`, `config/dev.yaml`, `plan.md` | 提供浏览器可访问观测页面与 JSON 接口；支持 route 维度 1h/24h 请求数、并发与 GW_TOKEN 维度请求数 |
 | M19 | Linux `--install` 一键安装（systemd + `/etc/ai_gw_lite/conf.yaml`） | DONE | `src/main.rs`, `src/install.rs`, `src/lib.rs`, `README.md`, `docs/System Design.md`, `plan.md` | Linux 下执行 `--install` 可自动创建配置目录/配置文件与 service 文件，且 `ExecStart` 使用 `/etc/ai_gw_lite/conf.yaml` |
+| M20 | Admin 管理页面（热加载配置 + REST API + 内置 UI） | DONE | `Cargo.toml`, `src/config.rs`, `src/server.rs`, `src/main.rs`, `src/lib.rs`, `src/admin.rs`, `src/concurrency.rs`, `tests/gateway_e2e.rs`, `tests/inbound_tls_e2e.rs`, `config/dev.yaml` | Admin API + UI 可用；运行时热加载路由等配置即时生效；`cargo test` 42/42 全绿 |
 
 ## 4. 详细实施步骤（执行顺序）
 
@@ -136,6 +137,113 @@ Phase 2 范围（按需启用）:
 ## 6. 执行记录（Work Log）
 
 > 按时间倒序追加，每条记录必须包含：任务 ID、变更摘要、验证命令、结果。
+
+### 2026-02-19
+- 任务: M20（文档补充）
+- 变更（After Change）:
+  - `docs/System Design.md` 同步更新，反映 Admin 管理页面能力：
+    - §0.1：将"配置热加载"从"暂缓"移至"已实现"；新增 Admin 管理条目
+    - §3.1：顶层 YAML 示例增加 `admin` 配置段
+    - §7：整节由"暂缓"改为描述已实现的 REST API + ArcSwap 热加载机制
+    - §8：模块列表增加 `admin.rs`；运行时共享状态更新为 `ArcSwap<RuntimeState>`
+    - §9：测试清单增加 Admin API 与热加载测试项（第 14、15 条）
+    - §11：交付清单"第二阶段暂缓项"移除"配置热加载"
+    - §12：当前实现状态更新至 2026-02-19，增加 Admin 管理页面条目
+- 实际改动文件:
+  - `docs/System Design.md`
+  - `plan.md`
+- 验证:
+  - `cargo fmt --all` → PASS（文档改动，Rust 代码无变化）
+  - `cargo test --lib` → 42/42 passed, PASS
+- 结果: DONE
+- 剩余事项:
+  - 无
+
+### 2026-02-19
+- 任务: M20（文档补充）
+- 变更（Before Change）:
+  - `docs/System Design.md` 尚未同步 Admin 管理页面能力（M20）
+  - 计划更新 §0.1/§3.1/§7/§8/§9/§11/§12，与代码实现对齐
+- 拟改动文件:
+  - `docs/System Design.md`
+  - `plan.md`
+- 验证:
+  - 完成后执行 `cargo fmt --all`、`cargo test --lib`
+- 结果: IN_PROGRESS
+
+### 2026-02-19
+- 任务: M20
+- 变更（After Change）:
+  - 新增 `src/admin.rs`（~500 行）：
+    - `register_admin_routes()` 注册 Admin 路由到 Axum Router
+    - `admin_ui_handler()` 返回内置 HTML 管理页面（`GET {prefix}/ui`）
+    - `admin_config_get_handler()` 返回当前运行配置 JSON（Bearer token 鉴权，`GET {prefix}/api/config`）
+    - `admin_config_apply_handler()` 验证 + 构建新 `RuntimeState` + `ArcSwap` 原子替换，热加载即时生效（`PUT {prefix}/api/config`）
+    - `admin_config_save_handler()` 序列化为 YAML + 原子写入（tmp rename）持久化到配置文件（`POST {prefix}/api/config/save`）
+    - 内置管理界面：Routes / Auth / CORS / Rate Limit / Concurrency / Advanced 六个 Tab，Apply 与 Save to File 操作
+  - `src/server.rs` 重构为热加载架构：
+    - 新增 `RuntimeState` 结构体，打包可热切换的运行时组件（config + upstream_clients + rate_limiter + concurrency）
+    - `AppState` 改用 `Arc<ArcSwap<RuntimeState>>`，`proxy_handler` 每请求原子快照读取
+    - 新增公开函数 `build_runtime_state()`，供 admin handler 构建并原子替换运行时
+    - `build_app()` 增加 `config_path: Option<PathBuf>` 参数；`run_server()` 增加 `config_path: Option<String>` 参数
+    - 按 `admin.path_prefix` 注册 admin 路由（`admin.enabled=true` 时生效）
+  - `src/config.rs`：
+    - 所有 18+ config struct/enum 添加 `Serialize` derive，支持 JSON API 与 YAML 序列化
+    - 新增 `AdminConfig` struct（`enabled`, `token`, `path_prefix`，默认 `/admin`）
+    - `AppConfig` 增加 `admin: Option<AdminConfig>` 字段
+    - 新增 admin 配置校验（enabled 时 token 非空、prefix 以 `/` 开头）
+  - `src/main.rs` 传递 `config_path` 给 `run_server()`
+  - `src/lib.rs` 导出 `pub mod admin`
+  - `Cargo.toml` 添加 `arc-swap = "1"` 与 `serde_json = "1"` 依赖
+  - 修复受影响测试：`src/concurrency.rs`、`tests/gateway_e2e.rs`、`tests/inbound_tls_e2e.rs` 添加 `admin: None` 并更新函数调用签名
+  - `config/dev.yaml` 添加 admin 配置段（`enabled: true`, `token: "admin_dev_token"`, `path_prefix: "/admin"`）
+- 实际改动文件:
+  - `Cargo.toml`
+  - `src/config.rs`
+  - `src/server.rs`
+  - `src/main.rs`
+  - `src/lib.rs`
+  - `src/admin.rs`（新建）
+  - `src/concurrency.rs`
+  - `tests/gateway_e2e.rs`
+  - `tests/inbound_tls_e2e.rs`
+  - `config/dev.yaml`
+  - `plan.md`
+- 验证:
+  - `cargo fmt --all` → 无格式变更，PASS
+  - `cargo clippy --all-targets --all-features -- -D warnings` → 0 warnings, 0 errors, PASS
+  - `cargo test --lib` → 42/42 passed, PASS
+- 结果: DONE
+- 剩余事项:
+  - 可热加载配置项：routes / gateway_auth / cors / rate_limit / concurrency；需重启项：listen / inbound_tls / observability（tracing subscriber 为全局单例）
+  - Admin UI 为纯 HTML/JS 内联实现，与现有 `/metrics/ui` 保持一致风格
+  - Advanced Tab 中需重启的配置项仅展示，不支持热加载（界面有提示）
+
+### 2026-02-19
+- 任务: M20
+- 变更（Before Change）:
+  - 计划新增 Admin 管理页面，支持：
+    - 运行时热加载路由与其他配置（无需重启，即时生效）
+    - REST API：`GET/PUT {prefix}/api/config`（读取/应用），`POST {prefix}/api/config/save`（持久化）
+    - 内置 HTML/JS 管理界面（`{prefix}/ui`），与现有 `/metrics/ui` 同模式
+  - 热加载机制采用 `arc-swap`，引入 `RuntimeState` 打包可热切换组件
+  - 所有 config struct 添加 `Serialize`，支持 JSON 序列化与 YAML 持久化
+  - 新增 `AdminConfig` 配置项（`enabled / token / path_prefix`）
+- 拟改动文件:
+  - `Cargo.toml`
+  - `src/config.rs`
+  - `src/server.rs`
+  - `src/main.rs`
+  - `src/lib.rs`
+  - `src/admin.rs`（新建）
+  - `src/concurrency.rs`
+  - `tests/gateway_e2e.rs`
+  - `tests/inbound_tls_e2e.rs`
+  - `config/dev.yaml`
+  - `plan.md`
+- 验证:
+  - 完成后执行 `cargo fmt --all`、`cargo test`、`cargo clippy --all-targets --all-features -- -D warnings`
+- 结果: IN_PROGRESS
 
 ### 2026-02-11
 - 任务: M19

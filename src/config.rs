@@ -1,11 +1,11 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::env;
 use std::fmt;
 use std::fs;
 use std::path::Path;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub listen: String,
     pub gateway_auth: GatewayAuthConfig,
@@ -20,30 +20,32 @@ pub struct AppConfig {
     pub concurrency: Option<ConcurrencyConfig>,
     #[serde(default)]
     pub observability: Option<ObservabilityConfig>,
+    #[serde(default)]
+    pub admin: Option<AdminConfig>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GatewayAuthConfig {
     pub tokens: Vec<String>,
     #[serde(default = "default_token_sources")]
     pub token_sources: Vec<TokenSourceConfig>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TokenSourceConfig {
     AuthorizationBearer,
     Header { name: String },
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouteConfig {
     pub id: String,
     pub prefix: String,
     pub upstream: UpstreamConfig,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpstreamConfig {
     pub base_url: String,
     #[serde(default = "default_true")]
@@ -64,13 +66,13 @@ pub struct UpstreamConfig {
     pub upstream_key_max_inflight: Option<usize>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HeaderInjection {
     pub name: String,
     pub value: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpstreamProxyConfig {
     pub protocol: ProxyProtocol,
     pub address: String,
@@ -80,7 +82,7 @@ pub struct UpstreamProxyConfig {
     pub password: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProxyProtocol {
     Http,
@@ -88,7 +90,7 @@ pub enum ProxyProtocol {
     Socks,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InboundTlsConfig {
     #[serde(default)]
     pub cert_path: Option<String>,
@@ -100,7 +102,7 @@ pub struct InboundTlsConfig {
     pub self_signed_key_path: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CorsConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -114,12 +116,12 @@ pub struct CorsConfig {
     pub expose_headers: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RateLimitConfig {
     pub per_minute: u64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConcurrencyConfig {
     #[serde(default)]
@@ -128,7 +130,7 @@ pub struct ConcurrencyConfig {
     pub upstream_per_key_max_inflight: Option<usize>,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct ObservabilityConfig {
     #[serde(default)]
@@ -139,7 +141,7 @@ pub struct ObservabilityConfig {
     pub tracing: TracingConfig,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LoggingConfig {
     #[serde(default = "default_observability_log_level")]
@@ -152,7 +154,7 @@ pub struct LoggingConfig {
     pub file: Option<LogFileConfig>,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum LogFormat {
     #[default]
@@ -160,7 +162,7 @@ pub enum LogFormat {
     Text,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LogFileConfig {
     #[serde(default = "default_true")]
@@ -175,7 +177,7 @@ pub struct LogFileConfig {
     pub max_files: usize,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum LogRotation {
     Minutely,
@@ -185,7 +187,7 @@ pub enum LogRotation {
     Never,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MetricsConfig {
     #[serde(default)]
@@ -196,7 +198,7 @@ pub struct MetricsConfig {
     pub token: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TracingConfig {
     #[serde(default)]
@@ -207,12 +209,22 @@ pub struct TracingConfig {
     pub otlp: Option<OtlpConfig>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OtlpConfig {
     pub endpoint: String,
     #[serde(default = "default_otlp_timeout_ms")]
     pub timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub token: String,
+    #[serde(default = "default_admin_path_prefix")]
+    pub path_prefix: String,
 }
 
 impl Default for LoggingConfig {
@@ -562,6 +574,19 @@ impl AppConfig {
             }
         }
 
+        if let Some(admin) = &self.admin {
+            if admin.enabled && admin.token.trim().is_empty() {
+                return Err(ConfigError::Validation(
+                    "`admin.token` must not be empty when admin is enabled".to_string(),
+                ));
+            }
+            if !admin.path_prefix.starts_with('/') {
+                return Err(ConfigError::Validation(
+                    "`admin.path_prefix` must start with `/`".to_string(),
+                ));
+            }
+        }
+
         Ok(())
     }
 }
@@ -659,6 +684,10 @@ fn default_trace_sample_ratio() -> f64 {
 
 fn default_otlp_timeout_ms() -> u64 {
     3_000
+}
+
+fn default_admin_path_prefix() -> String {
+    "/admin".to_string()
 }
 
 fn default_self_signed_cert_path() -> String {

@@ -7,6 +7,7 @@ use crate::observability;
 use crate::proxy;
 use crate::ratelimit::{RateLimitDecision, RateLimiter};
 use crate::tls;
+use arc_swap::ArcSwap;
 use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::{HeaderMap, Method, Request, Response, StatusCode};
@@ -17,6 +18,7 @@ use http::header::CONTENT_TYPE;
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -24,50 +26,86 @@ use std::time::Duration;
 use tokio::sync::OwnedSemaphorePermit;
 use tracing::{error, info, warn};
 
-#[derive(Clone)]
-pub struct AppState {
+/// Bundles all hot-reloadable runtime state.
+/// Swapped atomically via ArcSwap when admin applies new config.
+pub struct RuntimeState {
     pub config: Arc<AppConfig>,
-    pub upstream_clients: Arc<HashMap<String, reqwest::Client>>,
+    pub upstream_clients: HashMap<String, reqwest::Client>,
     pub rate_limiter: Option<Arc<RateLimiter>>,
     pub concurrency: Option<Arc<ConcurrencyController>>,
-    pub observability: Arc<observability::ObservabilityRuntime>,
 }
 
-pub fn build_app(config: Arc<AppConfig>) -> Result<Router, String> {
-    let upstream_clients = Arc::new(build_upstream_clients(&config)?);
+#[derive(Clone)]
+pub struct AppState {
+    pub runtime: Arc<ArcSwap<RuntimeState>>,
+    pub observability: Arc<observability::ObservabilityRuntime>,
+    pub config_path: Option<PathBuf>,
+    pub admin_token: Option<String>,
+    pub admin_path_prefix: Option<String>,
+}
+
+pub fn build_runtime_state(config: Arc<AppConfig>) -> Result<RuntimeState, String> {
+    let upstream_clients = build_upstream_clients(&config)?;
     let rate_limiter = config
         .rate_limit
         .as_ref()
         .map(|rate_limit| Arc::new(RateLimiter::new(rate_limit.per_minute)));
     let concurrency = ConcurrencyController::new(&config).map(Arc::new);
-    let observability = Arc::new(observability::ObservabilityRuntime::from_config(
-        config.observability.as_ref(),
-    ));
-    let mut router = Router::new().route("/healthz", get(healthz_handler));
-    if let Some(metrics_path) = observability.metrics_path() {
-        router = router.route(metrics_path, get(metrics_handler));
-    }
-    if let Some(metrics_ui_path) = observability.metrics_ui_path() {
-        router = router.route(metrics_ui_path, get(metrics_ui_handler));
-    }
-    if let Some(metrics_summary_path) = observability.metrics_summary_path() {
-        router = router.route(metrics_summary_path, get(metrics_summary_handler));
-    }
-    Ok(router.fallback(any(proxy_handler)).with_state(AppState {
+    Ok(RuntimeState {
         config,
         upstream_clients,
         rate_limiter,
         concurrency,
-        observability,
-    }))
+    })
 }
 
-pub async fn run_server(config: Arc<AppConfig>) -> Result<(), String> {
+pub fn build_app(config: Arc<AppConfig>, config_path: Option<PathBuf>) -> Result<Router, String> {
+    let runtime_state = build_runtime_state(config.clone())?;
+    let observability = Arc::new(observability::ObservabilityRuntime::from_config(
+        config.observability.as_ref(),
+    ));
+
+    let admin_token = config
+        .admin
+        .as_ref()
+        .filter(|a| a.enabled)
+        .map(|a| a.token.clone());
+    let admin_path_prefix = config
+        .admin
+        .as_ref()
+        .filter(|a| a.enabled)
+        .map(|a| a.path_prefix.clone());
+
+    let state = AppState {
+        runtime: Arc::new(ArcSwap::from_pointee(runtime_state)),
+        observability,
+        config_path,
+        admin_token,
+        admin_path_prefix: admin_path_prefix.clone(),
+    };
+
+    let mut router = Router::new().route("/healthz", get(healthz_handler));
+    if let Some(metrics_path) = state.observability.metrics_path() {
+        router = router.route(metrics_path, get(metrics_handler));
+    }
+    if let Some(metrics_ui_path) = state.observability.metrics_ui_path() {
+        router = router.route(metrics_ui_path, get(metrics_ui_handler));
+    }
+    if let Some(metrics_summary_path) = state.observability.metrics_summary_path() {
+        router = router.route(metrics_summary_path, get(metrics_summary_handler));
+    }
+    if let Some(prefix) = &admin_path_prefix {
+        router = crate::admin::register_admin_routes(router, prefix);
+    }
+    Ok(router.fallback(any(proxy_handler)).with_state(state))
+}
+
+pub async fn run_server(config: Arc<AppConfig>, config_path: Option<String>) -> Result<(), String> {
     let listen_addr: SocketAddr = config
         .listen
         .parse()
         .map_err(|err| format!("invalid listen address `{}`: {err}", config.listen))?;
-    let app = build_app(config.clone())?;
+    let app = build_app(config.clone(), config_path.map(PathBuf::from))?;
 
     if let Some(tls_config) = &config.inbound_tls {
         install_rustls_crypto_provider();
@@ -376,13 +414,14 @@ fn metrics_dashboard_html(summary_path: &str) -> String {
 }
 
 async fn proxy_handler(State(state): State<AppState>, request: Request<Body>) -> Response<Body> {
+    let runtime = state.runtime.load();
     let request_started_at = tokio::time::Instant::now();
     let method = request.method().clone();
     let path = request.uri().path().to_string();
     let query = request.uri().query().map(ToString::to_string);
     let request_origin = extract_origin(request.headers());
     let request_id = observability::extract_or_generate_request_id(request.headers());
-    let cors_config = state.config.cors.as_ref().filter(|cors| cors.enabled);
+    let cors_config = runtime.config.cors.as_ref().filter(|cors| cors.enabled);
     let metrics = state.observability.metrics.clone();
     let request_span = tracing::info_span!(
         "gateway_request",
@@ -393,7 +432,7 @@ async fn proxy_handler(State(state): State<AppState>, request: Request<Body>) ->
     );
     let _span_entered = request_span.enter();
 
-    let Some(route) = proxy::match_route(&path, &state.config.routes) else {
+    let Some(route) = proxy::match_route(&path, &runtime.config.routes) else {
         tracing::Span::current().record("route_id", "__unmatched__");
         return finalize_observed_proxy_response(
             json_error(StatusCode::NOT_FOUND, "route_not_found"),
@@ -431,7 +470,8 @@ async fn proxy_handler(State(state): State<AppState>, request: Request<Body>) ->
         );
     }
 
-    let Some(token) = auth::extract_authorized_token(request.headers(), &state.config.gateway_auth)
+    let Some(token) =
+        auth::extract_authorized_token(request.headers(), &runtime.config.gateway_auth)
     else {
         return finalize_observed_proxy_response(
             json_error(StatusCode::UNAUTHORIZED, "unauthorized"),
@@ -450,7 +490,7 @@ async fn proxy_handler(State(state): State<AppState>, request: Request<Body>) ->
     };
     let token_label = observability::token_label(&token);
 
-    if let Some(rate_limiter) = &state.rate_limiter {
+    if let Some(rate_limiter) = &runtime.rate_limiter {
         match rate_limiter.check(&token, &route.id) {
             RateLimitDecision::Allowed => {}
             RateLimitDecision::Rejected { retry_after_secs } => {
@@ -479,7 +519,7 @@ async fn proxy_handler(State(state): State<AppState>, request: Request<Body>) ->
         }
     }
 
-    let downstream_permit = if let Some(concurrency) = &state.concurrency {
+    let downstream_permit = if let Some(concurrency) = &runtime.concurrency {
         match concurrency.acquire_downstream() {
             Ok(permit) => permit,
             Err(_) => {
@@ -548,7 +588,7 @@ async fn proxy_handler(State(state): State<AppState>, request: Request<Body>) ->
         }
     };
 
-    let Some(upstream_client) = state.upstream_clients.get(&route.id) else {
+    let Some(upstream_client) = runtime.upstream_clients.get(&route.id) else {
         return finalize_observed_proxy_response(
             json_error(StatusCode::BAD_GATEWAY, "upstream_client_not_found"),
             cors_config,
@@ -566,7 +606,7 @@ async fn proxy_handler(State(state): State<AppState>, request: Request<Body>) ->
         );
     };
 
-    let upstream_permit = if let Some(concurrency) = &state.concurrency {
+    let upstream_permit = if let Some(concurrency) = &runtime.concurrency {
         match concurrency.acquire_upstream(route).await {
             Ok(permit) => permit,
             Err(_) => {
@@ -1287,7 +1327,7 @@ mod tests {
 
     #[tokio::test]
     async fn healthz_returns_ok() {
-        let app = build_app(Arc::new(test_config())).expect("app should build");
+        let app = build_app(Arc::new(test_config()), None).expect("app should build");
         let request = Request::builder()
             .method(Method::GET)
             .uri("/healthz")
@@ -1308,7 +1348,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_route_returns_404() {
-        let app = build_app(Arc::new(test_config())).expect("app should build");
+        let app = build_app(Arc::new(test_config()), None).expect("app should build");
         let request = Request::builder()
             .method(Method::GET)
             .uri("/unknown")
@@ -1335,7 +1375,7 @@ mod tests {
 
     #[tokio::test]
     async fn auth_failure_returns_401() {
-        let app = build_app(Arc::new(test_config())).expect("app should build");
+        let app = build_app(Arc::new(test_config()), None).expect("app should build");
         let request = Request::builder()
             .method(Method::GET)
             .uri("/openai/v1/models")
@@ -1428,6 +1468,7 @@ mod tests {
             rate_limit: None,
             concurrency: None,
             observability: None,
+            admin: None,
         }
     }
 }
