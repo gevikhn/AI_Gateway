@@ -1,3 +1,4 @@
+use http::HeaderValue;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::env;
@@ -64,6 +65,8 @@ pub struct UpstreamConfig {
     pub proxy: Option<UpstreamProxyConfig>,
     #[serde(default)]
     pub upstream_key_max_inflight: Option<usize>,
+    #[serde(default)]
+    pub user_agent: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -367,6 +370,21 @@ impl AppConfig {
                     "route `{}` upstream.request_timeout_ms must be > 0",
                     route.id
                 )));
+            }
+
+            if let Some(user_agent) = route.upstream.user_agent.as_deref() {
+                if user_agent.trim().is_empty() {
+                    return Err(ConfigError::Validation(format!(
+                        "route `{}` upstream.user_agent must not be empty when provided",
+                        route.id
+                    )));
+                }
+                if HeaderValue::from_str(user_agent).is_err() {
+                    return Err(ConfigError::Validation(format!(
+                        "route `{}` upstream.user_agent must be a valid header value",
+                        route.id
+                    )));
+                }
             }
 
             if let Some(limit) = route.upstream.upstream_key_max_inflight {
@@ -815,6 +833,29 @@ routes:
             error.to_string().contains(
                 "upstream.proxy.username and upstream.proxy.password must be set together"
             )
+        );
+    }
+
+    #[test]
+    fn reject_invalid_user_agent() {
+        let yaml = r#"
+listen: "127.0.0.1:8080"
+gateway_auth:
+  tokens:
+    - "gw_token"
+routes:
+  - id: "openai"
+    prefix: "/openai"
+    upstream:
+      base_url: "https://api.openai.com"
+      user_agent: "bad\nua"
+"#;
+
+        let error = AppConfig::from_yaml_str(yaml).expect_err("config should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("upstream.user_agent must be a valid header value")
         );
     }
 

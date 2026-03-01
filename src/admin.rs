@@ -422,6 +422,7 @@ function routeCardHtml(r, i) {{
       </div>
       <div class="field"><label>Connect Timeout (ms)</label><input type="number" value="${{u.connect_timeout_ms || 10000}}" onchange="cfg.routes[${{i}}].upstream.connect_timeout_ms=+this.value"/></div>
       <div class="field"><label>Request Timeout (ms)</label><input type="number" value="${{u.request_timeout_ms || 60000}}" onchange="cfg.routes[${{i}}].upstream.request_timeout_ms=+this.value"/></div>
+      <div class="field"><label>User-Agent (可选)</label><input value="${{esc(u.user_agent||'')}}" placeholder="(未设置)" onchange="cfg.routes[${{i}}].upstream.user_agent=this.value.trim()?this.value:null"/></div>
       <div class="field full">
         <label>Inject Headers (每行一个, 格式: name: value)</label>
         <textarea onchange="parseInjectHeaders(${{i}}, this.value)">${{esc(injectHeaders)}}</textarea>
@@ -478,7 +479,7 @@ function addRoute() {{
     upstream: {{
       base_url: "", strip_prefix: true, connect_timeout_ms: 10000,
       request_timeout_ms: 60000, inject_headers: [], remove_headers: [],
-      forward_xff: false, proxy: null, upstream_key_max_inflight: null
+      forward_xff: false, proxy: null, upstream_key_max_inflight: null, user_agent: null
     }}
   }});
   renderRoutes();

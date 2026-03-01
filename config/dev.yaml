@@ -42,6 +42,8 @@ routes:
         - "cf-connecting-ip"
         - "true-client-ip"
       forward_xff: false
+      # 可选：自定义 User-Agent 转发到上游
+      # user_agent: "MyGatewayBot/1.0"
 
 cors:
   enabled: false
