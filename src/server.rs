@@ -675,13 +675,11 @@ async fn proxy_handler(State(state): State<AppState>, request: Request<Body>) ->
 
             // 记录 IP 统计
             if let Some(metrics) = &metrics {
-                if let Some(ref ip) = client_ip {
-                    metrics.observe_ip_request(
-                        ip,
-                        &path,
-                        Some(token_label.as_str()),
-                    );
-                }
+                metrics.observe_ip_request(
+                    &client_ip,
+                    &path,
+                    Some(token_label.as_str()),
+                );
             }
 
             let bytes_sent = Arc::new(AtomicU64::new(0));
@@ -783,7 +781,7 @@ fn request_observation_with_token<'a>(
 }
 
 /// 从请求头中提取客户端 IP 地址
-fn extract_client_ip(headers: &HeaderMap) -> Option<String> {
+fn extract_client_ip(headers: &HeaderMap) -> String {
     // 按优先级检查各种转发头
     let header_names = [
         "x-forwarded-for",
@@ -796,15 +794,18 @@ fn extract_client_ip(headers: &HeaderMap) -> Option<String> {
         if let Some(value) = headers.get(header_name) {
             if let Ok(s) = value.to_str() {
                 // x-forwarded-for 可能包含多个 IP，取第一个
-                let ip = s.split(',').next()?.trim();
-                if !ip.is_empty() {
-                    return Some(ip.to_string());
+                if let Some(ip) = s.split(',').next() {
+                    let ip = ip.trim();
+                    if !ip.is_empty() {
+                        return ip.to_string();
+                    }
                 }
             }
         }
     }
 
-    None
+    // 如果没有转发头，返回 "direct" 表示直连
+    "direct".to_string()
 }
 
 fn finalize_observed_proxy_response(
