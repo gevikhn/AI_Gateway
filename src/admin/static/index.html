@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>AI Gateway Admin</title>
+  <style>{{CSS}}</style>
+</head>
+<body>
+  <div class="page">
+    <div class="container">
+      <header class="header">
+        <h1 class="header-title">AI Gateway Admin</h1>
+        <p class="header-subtitle">管理网关配置，修改后点击"应用"即时生效，点击"保存到文件"持久化</p>
+      </header>
+
+      <div class="toolbar">
+        <input id="token" class="input toolbar-input" type="password" placeholder="输入 Admin Token" />
+        <button class="btn btn-primary" onclick="loadConfig()">加载配置</button>
+      </div>
+
+      <div class="main-content">
+        <nav class="tabs" id="tabNav"></nav>
+        <div id="tabPanels"></div>
+
+        <div class="actions" id="actionBar" style="display:none;">
+          <button class="btn btn-primary" onclick="applyConfig()">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M5 12h14M12 5l7 7-7 7"/>
+            </svg>
+            应用配置
+          </button>
+          <button class="btn btn-secondary" onclick="saveConfig()">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/>
+              <polyline points="17 21 17 13 7 13 7 21"/>
+            </svg>
+            保存到文件
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    window.CONFIG = {
+      apiUrl: '{{API_CONFIG_URL}}',
+      saveUrl: '{{API_SAVE_URL}}'
+    };
+  </script>
+  <script>{{JS}}</script>
+</body>
+</html>
