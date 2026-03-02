@@ -6,6 +6,14 @@ use ai_gw_lite::config::{
 use ai_gw_lite::observability;
 use ai_gw_lite::server::build_app;
 use axum::Router;
+use std::path::PathBuf;
+
+/// Helper to build app in tests (async wrapper)
+async fn build_test_app(config: AppConfig) -> Router {
+    build_app(Arc::new(config), None)
+        .await
+        .expect("gateway app should build")
+}
 use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::header::CONTENT_TYPE;
@@ -36,7 +44,7 @@ async fn proxy_rewrites_and_injects_headers() {
     let (upstream_addr, upstream_handle) = spawn_router(upstream).await;
 
     let config = gateway_config(upstream_addr.to_string(), 2_000);
-    let app = build_app(Arc::new(config), None).expect("gateway app should build");
+    let app = build_test_app(config).await;
     let (gateway_addr, gateway_handle) = spawn_router(app).await;
 
     let response = reqwest::Client::new()
@@ -83,7 +91,7 @@ async fn route_specific_user_agent_is_applied_independently() {
     route_b.upstream.user_agent = Some("Route-B-UA/2.0".to_string());
     config.routes.push(route_b);
 
-    let app = build_app(Arc::new(config), None).expect("gateway app should build");
+    let app = build_test_app(config).await;
     let (gateway_addr, gateway_handle) = spawn_router(app).await;
 
     let client = reqwest::Client::new();
@@ -130,7 +138,7 @@ async fn proxy_passes_sse_response() {
     let (upstream_addr, upstream_handle) = spawn_router(upstream).await;
 
     let config = gateway_config(upstream_addr.to_string(), 2_000);
-    let app = build_app(Arc::new(config), None).expect("gateway app should build");
+    let app = build_test_app(config).await;
     let (gateway_addr, gateway_handle) = spawn_router(app).await;
 
     let response = reqwest::Client::new()
@@ -164,7 +172,7 @@ async fn sse_is_not_cut_by_request_timeout() {
     let (upstream_addr, upstream_handle) = spawn_router(upstream).await;
 
     let config = gateway_config(upstream_addr.to_string(), 80);
-    let app = build_app(Arc::new(config), None).expect("gateway app should build");
+    let app = build_test_app(config).await;
     let (gateway_addr, gateway_handle) = spawn_router(app).await;
 
     let response = reqwest::Client::new()
@@ -203,7 +211,7 @@ async fn timeout_is_mapped_to_504() {
     let (upstream_addr, upstream_handle) = spawn_router(upstream).await;
 
     let config = gateway_config(upstream_addr.to_string(), 80);
-    let app = build_app(Arc::new(config), None).expect("gateway app should build");
+    let app = build_test_app(config).await;
     let (gateway_addr, gateway_handle) = spawn_router(app).await;
 
     let response = reqwest::Client::new()
@@ -236,7 +244,7 @@ async fn rate_limit_rejects_excess_downstream_requests() {
 
     let mut config = gateway_config(upstream_addr.to_string(), 2_000);
     config.rate_limit = Some(RateLimitConfig { per_minute: 1 });
-    let app = build_app(Arc::new(config), None).expect("gateway app should build");
+    let app = build_test_app(config).await;
     let (gateway_addr, gateway_handle) = spawn_router(app).await;
 
     let client = reqwest::Client::new();
@@ -284,7 +292,7 @@ async fn downstream_concurrency_limit_rejects_when_inflight_is_full() {
         downstream_max_inflight: Some(1),
         upstream_per_key_max_inflight: None,
     });
-    let app = build_app(Arc::new(config), None).expect("gateway app should build");
+    let app = build_test_app(config).await;
     let (gateway_addr, gateway_handle) = spawn_router(app).await;
 
     let client = reqwest::Client::new();
@@ -343,7 +351,7 @@ async fn upstream_concurrency_limit_is_scoped_by_upstream_key() {
         downstream_max_inflight: None,
         upstream_per_key_max_inflight: Some(1),
     });
-    let app = build_app(Arc::new(config), None).expect("gateway app should build");
+    let app = build_test_app(config).await;
     let (gateway_addr, gateway_handle) = spawn_router(app).await;
 
     let client = reqwest::Client::new();
@@ -389,7 +397,7 @@ async fn upstream_concurrency_limit_is_scoped_by_upstream_key() {
 async fn connect_error_is_mapped_to_502() {
     let unused = unused_local_addr();
     let config = gateway_config(unused.to_string(), 2_000);
-    let app = build_app(Arc::new(config), None).expect("gateway app should build");
+    let app = build_test_app(config).await;
     let (gateway_addr, gateway_handle) = spawn_router(app).await;
 
     let response = reqwest::Client::new()
@@ -410,7 +418,7 @@ async fn stalled_non_sse_body_is_bounded_by_request_timeout() {
     let (upstream_addr, upstream_handle) = spawn_router(upstream).await;
 
     let config = gateway_config(upstream_addr.to_string(), 80);
-    let app = build_app(Arc::new(config), None).expect("gateway app should build");
+    let app = build_test_app(config).await;
     let (gateway_addr, gateway_handle) = spawn_router(app).await;
 
     let response = reqwest::Client::new()
@@ -448,7 +456,7 @@ async fn cors_preflight_returns_allow_headers_without_auth() {
         expose_headers: vec![],
     });
 
-    let app = build_app(Arc::new(config), None).expect("gateway app should build");
+    let app = build_test_app(config).await;
     let (gateway_addr, gateway_handle) = spawn_router(app).await;
 
     let response = reqwest::Client::new()
@@ -509,7 +517,7 @@ async fn cors_allows_origin_without_scheme_config() {
         allow_methods: vec![],
         expose_headers: vec!["x-request-id".to_string()],
     });
-    let app = build_app(Arc::new(config), None).expect("gateway app should build");
+    let app = build_test_app(config).await;
     let (gateway_addr, gateway_handle) = spawn_router(app).await;
 
     let response = reqwest::Client::new()
@@ -558,7 +566,7 @@ async fn http_proxy_with_auth_is_used_for_upstream() {
         password: Some("proxy-pass".to_string()),
     });
 
-    let app = build_app(Arc::new(config), None).expect("gateway app should build");
+    let app = build_test_app(config).await;
     let (gateway_addr, gateway_handle) = spawn_router(app).await;
 
     let response = reqwest::Client::new()
@@ -602,7 +610,7 @@ async fn proxy_response_preserves_request_id() {
     let (upstream_addr, upstream_handle) = spawn_router(upstream).await;
 
     let config = gateway_config(upstream_addr.to_string(), 2_000);
-    let app = build_app(Arc::new(config), None).expect("gateway app should build");
+    let app = build_test_app(config).await;
     let (gateway_addr, gateway_handle) = spawn_router(app).await;
 
     let response = reqwest::Client::new()
@@ -634,7 +642,7 @@ async fn proxy_response_generates_request_id_when_missing() {
     let (upstream_addr, upstream_handle) = spawn_router(upstream).await;
 
     let config = gateway_config(upstream_addr.to_string(), 2_000);
-    let app = build_app(Arc::new(config), None).expect("gateway app should build");
+    let app = build_test_app(config).await;
     let (gateway_addr, gateway_handle) = spawn_router(app).await;
 
     let response = reqwest::Client::new()
@@ -670,6 +678,7 @@ async fn metrics_endpoint_requires_dedicated_token() {
             enabled: true,
             path: "/metrics".to_string(),
             token: "metrics_token".to_string(),
+            sqlite: None,
         },
         tracing: TracingConfig {
             enabled: false,
@@ -677,7 +686,7 @@ async fn metrics_endpoint_requires_dedicated_token() {
             otlp: None,
         },
     });
-    let app = build_app(Arc::new(config), None).expect("gateway app should build");
+    let app = build_test_app(config).await;
     let (gateway_addr, gateway_handle) = spawn_router(app).await;
 
     let unauthorized = reqwest::Client::new()
@@ -712,6 +721,7 @@ async fn metrics_endpoint_exposes_prometheus_metrics_with_valid_token() {
             enabled: true,
             path: "/metrics".to_string(),
             token: "metrics_token".to_string(),
+            sqlite: None,
         },
         tracing: TracingConfig {
             enabled: false,
@@ -719,7 +729,7 @@ async fn metrics_endpoint_exposes_prometheus_metrics_with_valid_token() {
             otlp: None,
         },
     });
-    let app = build_app(Arc::new(config), None).expect("gateway app should build");
+    let app = build_test_app(config).await;
     let (gateway_addr, gateway_handle) = spawn_router(app).await;
 
     let response = reqwest::Client::new()
@@ -769,6 +779,7 @@ async fn metrics_summary_endpoint_requires_metrics_token() {
             enabled: true,
             path: "/metrics".to_string(),
             token: "metrics_token".to_string(),
+            sqlite: None,
         },
         tracing: TracingConfig {
             enabled: false,
@@ -776,7 +787,7 @@ async fn metrics_summary_endpoint_requires_metrics_token() {
             otlp: None,
         },
     });
-    let app = build_app(Arc::new(config), None).expect("gateway app should build");
+    let app = build_test_app(config).await;
     let (gateway_addr, gateway_handle) = spawn_router(app).await;
 
     let unauthorized = reqwest::Client::new()
@@ -809,6 +820,7 @@ async fn metrics_summary_endpoint_reports_route_and_token_windows() {
             enabled: true,
             path: "/metrics".to_string(),
             token: "metrics_token".to_string(),
+            sqlite: None,
         },
         tracing: TracingConfig {
             enabled: false,
@@ -817,7 +829,7 @@ async fn metrics_summary_endpoint_reports_route_and_token_windows() {
         },
     });
 
-    let app = build_app(Arc::new(config), None).expect("gateway app should build");
+    let app = build_test_app(config).await;
     let (gateway_addr, gateway_handle) = spawn_router(app).await;
     let client = reqwest::Client::new();
 
@@ -875,6 +887,7 @@ async fn metrics_ui_endpoint_serves_html_dashboard() {
             enabled: true,
             path: "/metrics".to_string(),
             token: "metrics_token".to_string(),
+            sqlite: None,
         },
         tracing: TracingConfig {
             enabled: false,
@@ -882,7 +895,7 @@ async fn metrics_ui_endpoint_serves_html_dashboard() {
             otlp: None,
         },
     });
-    let app = build_app(Arc::new(config), None).expect("gateway app should build");
+    let app = build_test_app(config).await;
     let (gateway_addr, gateway_handle) = spawn_router(app).await;
 
     let response = reqwest::Client::new()
@@ -906,6 +919,8 @@ async fn metrics_ui_endpoint_serves_html_dashboard() {
 }
 
 async fn spawn_router(router: Router) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    use std::net::SocketAddr;
+
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("listener should bind");
@@ -914,9 +929,12 @@ async fn spawn_router(router: Router) -> (std::net::SocketAddr, tokio::task::Joi
         .expect("listener should have local addr");
 
     let handle = tokio::spawn(async move {
-        axum::serve(listener, router)
-            .await
-            .expect("server should run");
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .expect("server should run");
     });
 
     (addr, handle)

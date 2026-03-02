@@ -132,6 +132,8 @@ curl -k https://127.0.0.1:8080/healthz
 
 ### 2.6 可观测性（Metrics + 内置观测页）
 
+#### 基础 Metrics
+
 若在配置中启用了 `observability.metrics.enabled=true`，可通过独立 token 访问 `/metrics`：
 
 ```bash
@@ -173,6 +175,29 @@ http://127.0.0.1:8080/metrics/ui
 curl http://127.0.0.1:8080/metrics/summary \
   -H "Authorization: Bearer <GW_METRICS_TOKEN>"
 ```
+
+#### SQLite 持久化（可选）
+
+配置 `observability.metrics.sqlite` 后，监控数据会持久化到 SQLite 数据库：
+
+```yaml
+observability:
+  metrics:
+    enabled: true
+    path: "/metrics"
+    token: "${GW_METRICS_TOKEN}"
+    sqlite:
+      path: "./data/metrics.db"      # 数据库文件路径
+      flush_interval_secs: 60         # 批量写入间隔（秒）
+      batch_size: 1000                # 批量大小
+      retention_days: 7               # 数据保留天数
+```
+
+特性：
+- 服务重启后数据保留
+- 后台异步批量写入，不影响请求性能
+- 自动清理过期数据
+- 可直接使用 SQLite 客户端查询分析
 
 ## 3. `config.yaml` 详细说明
 [配置说明.md](配置说明)

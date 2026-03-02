@@ -199,6 +199,25 @@ pub struct MetricsConfig {
     pub path: String,
     #[serde(default)]
     pub token: String,
+    /// SQLite persistence configuration
+    #[serde(default)]
+    pub sqlite: Option<MetricsSqliteConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetricsSqliteConfig {
+    #[serde(default = "default_sqlite_path")]
+    pub path: String,
+    /// Flush interval in seconds (default: 60)
+    #[serde(default = "default_sqlite_flush_interval_secs")]
+    pub flush_interval_secs: u64,
+    /// Maximum batch size before flush (default: 1000)
+    #[serde(default = "default_sqlite_batch_size")]
+    pub batch_size: usize,
+    /// Retention days for detailed records (default: 7)
+    #[serde(default = "default_sqlite_retention_days")]
+    pub retention_days: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -247,6 +266,7 @@ impl Default for MetricsConfig {
             enabled: false,
             path: default_metrics_path(),
             token: String::new(),
+            sqlite: None,
         }
     }
 }
@@ -706,6 +726,22 @@ fn default_otlp_timeout_ms() -> u64 {
 
 fn default_admin_path_prefix() -> String {
     "/admin".to_string()
+}
+
+fn default_sqlite_path() -> String {
+    "./data/metrics.db".to_string()
+}
+
+fn default_sqlite_flush_interval_secs() -> u64 {
+    60
+}
+
+fn default_sqlite_batch_size() -> usize {
+    1000
+}
+
+fn default_sqlite_retention_days() -> u32 {
+    7
 }
 
 fn default_self_signed_cert_path() -> String {

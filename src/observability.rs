@@ -1,5 +1,6 @@
 use crate::config::{
-    LogFileConfig, LogFormat, LogRotation, LoggingConfig, ObservabilityConfig, TracingConfig,
+    LogFileConfig, LogFormat, LogRotation, LoggingConfig, MetricsSqliteConfig, ObservabilityConfig,
+    TracingConfig,
 };
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use http::header::AUTHORIZATION;
@@ -15,13 +16,20 @@ use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::metrics::histogram::{Histogram, exponential_buckets};
 use prometheus_client::registry::Registry;
 use serde::Serialize;
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use sqlx::{Pool, Row, Sqlite};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::hash::{Hash, Hasher};
+use std::path::Path;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::mpsc;
+use tokio::time::interval;
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 
@@ -37,33 +45,58 @@ type FileLogWriter = (
     Option<tracing_appender::non_blocking::WorkerGuard>,
 );
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct ObservabilityRuntime {
     pub metrics: Option<Arc<GatewayMetrics>>,
     metrics_path: Option<String>,
     metrics_ui_path: Option<String>,
     metrics_summary_path: Option<String>,
     metrics_token: Option<String>,
+    pub storage: Option<Arc<MetricsStorage>>,
+}
+
+impl Default for ObservabilityRuntime {
+    fn default() -> Self {
+        Self {
+            metrics: None,
+            metrics_path: None,
+            metrics_ui_path: None,
+            metrics_summary_path: None,
+            metrics_token: None,
+            storage: None,
+        }
+    }
 }
 
 impl ObservabilityRuntime {
-    pub fn from_config(config: Option<&ObservabilityConfig>) -> Self {
+    pub async fn from_config(config: Option<&ObservabilityConfig>) -> Result<Self, String> {
         let Some(config) = config else {
-            return Self::default();
+            return Ok(Self::default());
         };
 
         if config.metrics.enabled {
             let metrics_path = normalize_metrics_path(config.metrics.path.as_str());
-            return Self {
-                metrics: Some(Arc::new(GatewayMetrics::new())),
+
+            // Initialize SQLite storage if configured
+            let storage = if let Some(sqlite_config) = &config.metrics.sqlite {
+                let (storage, _handle) = MetricsStorage::new(sqlite_config.clone()).await?;
+                info!("Metrics SQLite storage initialized at: {}", sqlite_config.path);
+                Some(Arc::new(storage))
+            } else {
+                None
+            };
+
+            return Ok(Self {
+                metrics: Some(Arc::new(GatewayMetrics::new(storage.clone()))),
                 metrics_path: Some(metrics_path.clone()),
                 metrics_ui_path: Some(metrics_sub_path(metrics_path.as_str(), "ui")),
                 metrics_summary_path: Some(metrics_sub_path(metrics_path.as_str(), "summary")),
                 metrics_token: Some(config.metrics.token.clone()),
-            };
+                storage,
+            });
         }
 
-        Self::default()
+        Ok(Self::default())
     }
 
     pub fn metrics_path(&self) -> Option<&str> {
@@ -108,10 +141,11 @@ pub struct GatewayMetrics {
     inflight_requests: Family<RouteLabels, Gauge>,
     sse_streams_inflight: Family<RouteLabels, Gauge>,
     summary_state: Mutex<SummaryState>,
+    storage: Option<Arc<MetricsStorage>>,
 }
 
 impl GatewayMetrics {
-    pub fn new() -> Self {
+    pub fn new(storage: Option<Arc<MetricsStorage>>) -> Self {
         let requests_total = Family::<RequestCounterLabels, Counter>::default();
         let request_duration_seconds =
             Family::<RequestDurationLabels, Histogram>::new_with_constructor(|| {
@@ -159,6 +193,7 @@ impl GatewayMetrics {
             inflight_requests,
             sse_streams_inflight,
             summary_state: Mutex::new(SummaryState::default()),
+            storage,
         }
     }
 
@@ -191,6 +226,28 @@ impl GatewayMetrics {
 
         if let Ok(mut state) = self.summary_state.lock() {
             state.observe_request(route_id, token_label, epoch_minute_now());
+        }
+
+        // Queue for SQLite persistence if enabled
+        if let Some(storage) = &self.storage {
+            let record = MetricsRecord {
+                timestamp: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64,
+                route_id: route_id.to_string(),
+                method: method.as_str().to_string(),
+                status_code: status.as_u16() as i32,
+                outcome: outcome.to_string(),
+                duration_ms: duration.as_millis() as i64,
+                token_label: token_label.map(|s| s.to_string()),
+                client_ip: None,
+                request_path: None,
+                upstream_host: None,
+                upstream_result: None,
+                upstream_duration_ms: None,
+            };
+            storage.queue_record(record);
         }
     }
 
@@ -257,6 +314,28 @@ impl GatewayMetrics {
         if let Ok(mut state) = self.summary_state.lock() {
             state.observe_ip_request(ip, url, token_label, epoch_minute_now());
         }
+
+        // Queue IP record for SQLite persistence
+        if let Some(storage) = &self.storage {
+            let record = MetricsRecord {
+                timestamp: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64,
+                route_id: String::new(),
+                method: String::new(),
+                status_code: 0,
+                outcome: String::new(),
+                duration_ms: 0,
+                token_label: token_label.map(|s| s.to_string()),
+                client_ip: Some(ip.to_string()),
+                request_path: Some(url.to_string()),
+                upstream_host: None,
+                upstream_result: None,
+                upstream_duration_ms: None,
+            };
+            storage.queue_record(record);
+        }
     }
 
     pub fn encode(&self) -> String {
@@ -278,7 +357,7 @@ impl GatewayMetrics {
 
 impl Default for GatewayMetrics {
     fn default() -> Self {
-        Self::new()
+        Self::new(None)
     }
 }
 
@@ -1085,6 +1164,370 @@ fn is_valid_request_id(value: &str) -> bool {
     value
         .chars()
         .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+}
+
+/// Metrics record for batch insertion
+#[derive(Debug, Clone)]
+struct MetricsRecord {
+    timestamp: i64,
+    route_id: String,
+    method: String,
+    status_code: i32,
+    outcome: String,
+    duration_ms: i64,
+    token_label: Option<String>,
+    client_ip: Option<String>,
+    request_path: Option<String>,
+    upstream_host: Option<String>,
+    upstream_result: Option<String>,
+    upstream_duration_ms: Option<i64>,
+}
+
+/// SQLite-backed metrics storage
+#[derive(Debug)]
+pub struct MetricsStorage {
+    pool: Pool<Sqlite>,
+    config: MetricsSqliteConfig,
+    sender: mpsc::UnboundedSender<MetricsRecord>,
+}
+
+impl MetricsStorage {
+    /// Initialize SQLite storage and create tables
+    pub async fn new(config: MetricsSqliteConfig) -> Result<(Self, MetricsStorageHandle), String> {
+        let db_path = Path::new(&config.path);
+
+        // Ensure parent directory exists
+        if let Some(parent) = db_path.parent() {
+            fs::create_dir_all(parent).map_err(|e| {
+                format!("Failed to create metrics db directory: {}", e)
+            })?;
+        }
+
+        let connection_string = format!("sqlite:{}", config.path);
+        let options = SqliteConnectOptions::from_str(&connection_string)
+            .map_err(|e| format!("Invalid SQLite connection string: {}", e))?
+            .create_if_missing(true);
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect_with(options)
+            .await
+            .map_err(|e| format!("Failed to connect to SQLite: {}", e))?;
+
+        // Create tables
+        Self::create_tables(&pool).await?;
+
+        // Start background batch writer
+        let (sender, receiver) = mpsc::unbounded_channel::<MetricsRecord>();
+        let pool_clone = pool.clone();
+        let flush_interval = Duration::from_secs(config.flush_interval_secs);
+        let batch_size = config.batch_size;
+        let retention_days = config.retention_days;
+
+        let handle = tokio::spawn(async move {
+            Self::batch_writer_task(
+                pool_clone,
+                receiver,
+                flush_interval,
+                batch_size,
+                retention_days,
+            )
+            .await;
+        });
+
+        let storage = Self {
+            pool,
+            config: config.clone(),
+            sender,
+        };
+
+        let handle = MetricsStorageHandle { handle };
+
+        Ok((storage, handle))
+    }
+
+    async fn create_tables(pool: &Pool<Sqlite>) -> Result<(), String> {
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS metrics_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp INTEGER NOT NULL,
+                route_id TEXT NOT NULL,
+                method TEXT NOT NULL,
+                status_code INTEGER NOT NULL,
+                outcome TEXT NOT NULL,
+                duration_ms INTEGER NOT NULL,
+                token_label TEXT,
+                client_ip TEXT,
+                request_path TEXT,
+                upstream_host TEXT,
+                upstream_result TEXT,
+                upstream_duration_ms INTEGER
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_metrics_timestamp ON metrics_requests(timestamp);
+            CREATE INDEX IF NOT EXISTS idx_metrics_route ON metrics_requests(route_id);
+            CREATE INDEX IF NOT EXISTS idx_metrics_ip ON metrics_requests(client_ip);
+            CREATE INDEX IF NOT EXISTS idx_metrics_token ON metrics_requests(token_label);
+            "#,
+        )
+        .execute(pool)
+        .await
+        .map_err(|e| format!("Failed to create metrics tables: {}", e))?;
+
+        // Create aggregated stats tables for faster queries
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS metrics_ip_stats (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                window_start INTEGER NOT NULL,
+                window_end INTEGER NOT NULL,
+                window_type TEXT NOT NULL,
+                client_ip TEXT NOT NULL,
+                request_count INTEGER NOT NULL DEFAULT 0,
+                error_count INTEGER NOT NULL DEFAULT 0,
+                total_duration_ms INTEGER NOT NULL DEFAULT 0,
+                avg_duration_ms INTEGER NOT NULL DEFAULT 0,
+                min_duration_ms INTEGER NOT NULL DEFAULT 0,
+                max_duration_ms INTEGER NOT NULL DEFAULT 0,
+                routes TEXT, -- JSON array of routes
+                tokens TEXT, -- JSON array of tokens
+                UNIQUE(window_start, window_type, client_ip)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_ip_stats_window ON metrics_ip_stats(window_start, window_type);
+            CREATE INDEX IF NOT EXISTS idx_ip_stats_ip ON metrics_ip_stats(client_ip);
+            "#,
+        )
+        .execute(pool)
+        .await
+        .map_err(|e| format!("Failed to create IP stats table: {}", e))?;
+
+        Ok(())
+    }
+
+    /// Queue a record for batch insertion
+    pub fn queue_record(&self, record: MetricsRecord) {
+        let _ = self.sender.send(record);
+    }
+
+    async fn batch_writer_task(
+        pool: Pool<Sqlite>,
+        mut receiver: mpsc::UnboundedReceiver<MetricsRecord>,
+        flush_interval: Duration,
+        batch_size: usize,
+        retention_days: u32,
+    ) {
+        let mut batch = Vec::with_capacity(batch_size);
+        let mut interval = interval(flush_interval);
+
+        loop {
+            tokio::select! {
+                Some(record) = receiver.recv() => {
+                    batch.push(record);
+                    if batch.len() >= batch_size {
+                        Self::flush_batch(&pool, &batch).await;
+                        batch.clear();
+                    }
+                }
+                _ = interval.tick() => {
+                    if !batch.is_empty() {
+                        Self::flush_batch(&pool, &batch).await;
+                        batch.clear();
+                    }
+                    // Periodic cleanup of old records
+                    Self::cleanup_old_records(&pool, retention_days).await;
+                }
+            }
+        }
+    }
+
+    async fn flush_batch(pool: &Pool<Sqlite>, batch: &[MetricsRecord]) {
+        if batch.is_empty() {
+            return;
+        }
+
+        let mut query_builder = String::from(
+            "INSERT INTO metrics_requests \
+             (timestamp, route_id, method, status_code, outcome, duration_ms, \
+              token_label, client_ip, request_path, upstream_host, upstream_result, upstream_duration_ms) \
+             VALUES "
+        );
+
+        let mut param_count = 0;
+        for (i, _) in batch.iter().enumerate() {
+            if i > 0 {
+                query_builder.push_str(", ");
+            }
+            query_builder.push_str("(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+            param_count += 12;
+        }
+
+        let mut query = sqlx::query(&query_builder);
+
+        for record in batch {
+            query = query
+                .bind(record.timestamp)
+                .bind(&record.route_id)
+                .bind(&record.method)
+                .bind(record.status_code)
+                .bind(&record.outcome)
+                .bind(record.duration_ms)
+                .bind(record.token_label.as_deref())
+                .bind(record.client_ip.as_deref())
+                .bind(record.request_path.as_deref())
+                .bind(record.upstream_host.as_deref())
+                .bind(record.upstream_result.as_deref())
+                .bind(record.upstream_duration_ms);
+        }
+
+        if let Err(e) = query.execute(pool).await {
+            warn!("Failed to flush metrics batch: {}", e);
+        }
+    }
+
+    async fn cleanup_old_records(pool: &Pool<Sqlite>, retention_days: u32) {
+        let cutoff = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64
+            - (retention_days as i64 * 24 * 60 * 60);
+
+        // Cleanup detailed request records
+        if let Err(e) = sqlx::query("DELETE FROM metrics_requests WHERE timestamp < ?")
+            .bind(cutoff)
+            .execute(pool)
+            .await
+        {
+            warn!("Failed to cleanup old metrics records: {}", e);
+        }
+
+        // Cleanup old aggregated stats (keep 30 days worth)
+        let stats_cutoff = cutoff - (23 * 24 * 60 * 60); // Additional 23 days for stats
+        if let Err(e) = sqlx::query("DELETE FROM metrics_ip_stats WHERE window_end < ?")
+            .bind(stats_cutoff)
+            .execute(pool)
+            .await
+        {
+            warn!("Failed to cleanup old stats records: {}", e);
+        }
+    }
+
+    /// Query IP statistics for a time window
+    pub async fn query_ip_stats(
+        &self,
+        window_seconds: u64,
+        ip_filter: Option<&str>,
+        sort_by: &str,
+        descending: bool,
+        limit: usize,
+    ) -> Result<Vec<IpStatsRow>, sqlx::Error> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let window_start = now - window_seconds as i64;
+
+        let order_clause = match sort_by {
+            "requests" => "ORDER BY request_count",
+            "errors" => "ORDER BY error_count",
+            "latency_avg" => "ORDER BY avg_duration_ms",
+            _ => "ORDER BY request_count",
+        };
+
+        let order_dir = if descending { "DESC" } else { "ASC" };
+
+        let query_str = format!(
+            r#"SELECT
+                client_ip,
+                SUM(request_count) as requests,
+                SUM(error_count) as errors,
+                AVG(avg_duration_ms) as latency_avg,
+                routes,
+                tokens
+            FROM metrics_requests_view
+            WHERE timestamp >= ?
+                AND (?1 IS NULL OR client_ip LIKE ?)
+            GROUP BY client_ip
+            {} {}
+            LIMIT ?"#,
+            order_clause, order_dir
+        );
+
+        let ip_pattern = ip_filter.map(|f| format!("%{}%", f));
+
+        let rows = sqlx::query_as::<_, IpStatsRow>(&query_str)
+            .bind(window_start)
+            .bind(ip_pattern)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await?;
+
+        Ok(rows)
+    }
+
+    /// Aggregate and store IP stats for a time window
+    pub async fn aggregate_ip_stats(&self, window_start: i64, window_end: i64, window_type: &str) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            INSERT INTO metrics_ip_stats
+                (window_start, window_end, window_type, client_ip, request_count,
+                 error_count, total_duration_ms, avg_duration_ms, min_duration_ms, max_duration_ms)
+            SELECT
+                ? as window_start,
+                ? as window_end,
+                ? as window_type,
+                client_ip,
+                COUNT(*) as request_count,
+                SUM(CASE WHEN outcome != 'success' THEN 1 ELSE 0 END) as error_count,
+                SUM(duration_ms) as total_duration_ms,
+                AVG(duration_ms) as avg_duration_ms,
+                MIN(duration_ms) as min_duration_ms,
+                MAX(duration_ms) as max_duration_ms
+            FROM metrics_requests
+            WHERE timestamp >= ? AND timestamp < ? AND client_ip IS NOT NULL
+            GROUP BY client_ip
+            ON CONFLICT(window_start, window_type, client_ip) DO UPDATE SET
+                request_count = excluded.request_count,
+                error_count = excluded.error_count,
+                total_duration_ms = excluded.total_duration_ms,
+                avg_duration_ms = excluded.avg_duration_ms,
+                min_duration_ms = excluded.min_duration_ms,
+                max_duration_ms = excluded.max_duration_ms
+            "#,
+        )
+        .bind(window_start)
+        .bind(window_end)
+        .bind(window_type)
+        .bind(window_start)
+        .bind(window_end)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+}
+
+/// Row structure for IP stats query
+#[derive(Debug, sqlx::FromRow)]
+pub struct IpStatsRow {
+    pub client_ip: String,
+    pub requests: i64,
+    pub errors: i64,
+    pub latency_avg: i64,
+    pub routes: Option<String>,
+    pub tokens: Option<String>,
+}
+
+/// Handle to the background storage task
+pub struct MetricsStorageHandle {
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl MetricsStorageHandle {
+    pub fn abort(&self) {
+        self.handle.abort();
+    }
 }
 
 #[cfg(test)]

@@ -59,11 +59,11 @@ pub fn build_runtime_state(config: Arc<AppConfig>) -> Result<RuntimeState, Strin
     })
 }
 
-pub fn build_app(config: Arc<AppConfig>, config_path: Option<PathBuf>) -> Result<Router, String> {
+pub async fn build_app(config: Arc<AppConfig>, config_path: Option<PathBuf>) -> Result<Router, String> {
     let runtime_state = build_runtime_state(config.clone())?;
-    let observability = Arc::new(observability::ObservabilityRuntime::from_config(
-        config.observability.as_ref(),
-    ));
+    let observability = Arc::new(
+        observability::ObservabilityRuntime::from_config(config.observability.as_ref()).await?,
+    );
 
     let admin_token = config
         .admin
@@ -105,7 +105,7 @@ pub async fn run_server(config: Arc<AppConfig>, config_path: Option<String>) -> 
         .listen
         .parse()
         .map_err(|err| format!("invalid listen address `{}`: {err}", config.listen))?;
-    let app = build_app(config.clone(), config_path.map(PathBuf::from))?;
+    let app = build_app(config.clone(), config_path.map(PathBuf::from)).await?;
 
     if let Some(tls_config) = &config.inbound_tls {
         install_rustls_crypto_provider();
@@ -124,7 +124,7 @@ pub async fn run_server(config: Arc<AppConfig>, config_path: Option<String>) -> 
         })?;
 
         axum_server::bind_rustls(listen_addr, rustls_config)
-            .serve(app.into_make_service())
+            .serve(app.into_make_service_with_connect_info::<SocketAddr>())
             .await
             .map_err(|err| format!("server error: {err}"))
     } else {
@@ -132,9 +132,12 @@ pub async fn run_server(config: Arc<AppConfig>, config_path: Option<String>) -> 
             .await
             .map_err(|err| format!("failed to bind `{listen_addr}`: {err}"))?;
 
-        axum::serve(listener, app)
-            .await
-            .map_err(|err| format!("server error: {err}"))
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .map_err(|err| format!("server error: {err}"))
     }
 }
 
@@ -429,7 +432,7 @@ async fn proxy_handler(
     let metrics = state.observability.metrics.clone();
 
     // 获取客户端 IP（优先从转发头，否则从 TCP 连接）
-    let client_ip = extract_client_ip(request.headers(), &client_addr);
+    let client_ip = extract_client_ip(request.headers(), client_addr);
 
     // 检查是否是 admin 路径，如果是则不记录监控统计
     let is_admin_path = state
@@ -679,11 +682,13 @@ async fn proxy_handler(
 
             // 记录 IP 统计
             if let Some(metrics) = &metrics {
-                metrics.observe_ip_request(
-                    &client_ip,
-                    &path,
-                    Some(token_label.as_str()),
-                );
+                if let Some(ref ip) = client_ip {
+                    metrics.observe_ip_request(
+                        ip,
+                        &path,
+                        Some(token_label.as_str()),
+                    );
+                }
             }
 
             let bytes_sent = Arc::new(AtomicU64::new(0));
@@ -785,7 +790,7 @@ fn request_observation_with_token<'a>(
 }
 
 /// 从请求头或 TCP 连接中提取客户端 IP 地址
-fn extract_client_ip(headers: &HeaderMap, client_addr: &SocketAddr) -> String {
+fn extract_client_ip(headers: &HeaderMap, client_addr: SocketAddr) -> Option<String> {
     // 按优先级检查各种转发头（适用于反向代理场景）
     let header_names = [
         "x-forwarded-for",
@@ -801,7 +806,7 @@ fn extract_client_ip(headers: &HeaderMap, client_addr: &SocketAddr) -> String {
                 if let Some(ip) = s.split(',').next() {
                     let ip = ip.trim();
                     if !ip.is_empty() {
-                        return ip.to_string();
+                        return Some(ip.to_string());
                     }
                 }
             }
@@ -809,7 +814,7 @@ fn extract_client_ip(headers: &HeaderMap, client_addr: &SocketAddr) -> String {
     }
 
     // 如果没有转发头，使用 TCP 连接的客户端地址
-    client_addr.ip().to_string()
+    Some(client_addr.ip().to_string())
 }
 
 fn finalize_observed_proxy_response(
@@ -1379,18 +1384,35 @@ mod tests {
         UpstreamConfig, UpstreamProxyConfig,
     };
     use axum::body::{Body, to_bytes};
+    use axum::extract::ConnectInfo;
     use axum::http::{Method, Request, StatusCode};
+    use std::net::SocketAddr;
     use std::sync::Arc;
     use tower::util::ServiceExt;
 
+    /// Helper to create a request with ConnectInfo extension for tests
+    fn test_request_with_connect_info(
+        method: Method,
+        uri: &str,
+        body: Body,
+        auth_header: Option<&str>,
+    ) -> Request<Body> {
+        let mut builder = Request::builder().method(method).uri(uri);
+        if let Some(auth) = auth_header {
+            builder = builder.header("authorization", auth);
+        }
+        let mut request = builder.body(body).expect("request should build");
+        // Add ConnectInfo extension to simulate TCP connection
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 12345))));
+        request
+    }
+
     #[tokio::test]
     async fn healthz_returns_ok() {
-        let app = build_app(Arc::new(test_config()), None).expect("app should build");
-        let request = Request::builder()
-            .method(Method::GET)
-            .uri("/healthz")
-            .body(Body::empty())
-            .expect("request should build");
+        let app = build_app(Arc::new(test_config()), None).await.expect("app should build");
+        let request = test_request_with_connect_info(Method::GET, "/healthz", Body::empty(), None);
 
         let response = app.oneshot(request).await.expect("request should succeed");
         assert_eq!(response.status(), StatusCode::OK);
@@ -1406,13 +1428,13 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_route_returns_404() {
-        let app = build_app(Arc::new(test_config()), None).expect("app should build");
-        let request = Request::builder()
-            .method(Method::GET)
-            .uri("/unknown")
-            .header("authorization", "Bearer gw_token")
-            .body(Body::empty())
-            .expect("request should build");
+        let app = build_app(Arc::new(test_config()), None).await.expect("app should build");
+        let request = test_request_with_connect_info(
+            Method::GET,
+            "/unknown",
+            Body::empty(),
+            Some("Bearer gw_token"),
+        );
 
         let response = app.oneshot(request).await.expect("request should succeed");
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
@@ -1433,12 +1455,13 @@ mod tests {
 
     #[tokio::test]
     async fn auth_failure_returns_401() {
-        let app = build_app(Arc::new(test_config()), None).expect("app should build");
-        let request = Request::builder()
-            .method(Method::GET)
-            .uri("/openai/v1/models")
-            .body(Body::empty())
-            .expect("request should build");
+        let app = build_app(Arc::new(test_config()), None).await.expect("app should build");
+        let request = test_request_with_connect_info(
+            Method::GET,
+            "/openai/v1/models",
+            Body::empty(),
+            None,
+        );
 
         let response = app.oneshot(request).await.expect("request should succeed");
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
