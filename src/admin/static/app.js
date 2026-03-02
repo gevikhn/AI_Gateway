@@ -1111,6 +1111,15 @@ function renderMetrics() {
     ? new Date(metricsData.generated_at_unix_ms).toLocaleString()
     : '-';
 
+  // 准备图表数据
+  const routeChartData = (metricsData.routes || [])
+    .sort((a, b) => b.requests_24h - a.requests_24h)
+    .slice(0, 10);
+
+  const tokenChartData = (metricsData.tokens || [])
+    .sort((a, b) => b.requests_24h - a.requests_24h)
+    .slice(0, 8);
+
   panel.innerHTML = `
     <div class="metrics-header">
       <div class="metrics-title">
@@ -1126,6 +1135,17 @@ function renderMetrics() {
         </svg>
         刷新
       </button>
+    </div>
+
+    <div class="metrics-charts">
+      <div class="chart-container">
+        <h3 class="chart-title">Top 10 路由请求量 (24h)</h3>
+        <canvas id="routeChart"></canvas>
+      </div>
+      <div class="chart-container">
+        <h3 class="chart-title">Token 使用量分布 (24h)</h3>
+        <canvas id="tokenChart"></canvas>
+      </div>
     </div>
 
     <div class="metrics-cards">
@@ -1194,6 +1214,112 @@ function renderMetrics() {
 
   // 加载并渲染 IP 维度数据
   loadIPMetrics();
+
+  // 初始化图表
+  initCharts(routeChartData, tokenChartData);
+}
+
+// ===== 图表功能 =====
+let routeChart = null;
+let tokenChart = null;
+
+function initCharts(routeData, tokenData) {
+  // 销毁旧图表
+  if (routeChart) {
+    routeChart.destroy();
+  }
+  if (tokenChart) {
+    tokenChart.destroy();
+  }
+
+  // 路由柱状图
+  const routeCtx = document.getElementById('routeChart');
+  if (routeCtx && routeData.length > 0) {
+    routeChart = new Chart(routeCtx, {
+      type: 'bar',
+      data: {
+        labels: routeData.map(r => r.route_id),
+        datasets: [{
+          label: '24小时请求数',
+          data: routeData.map(r => r.requests_24h),
+          backgroundColor: 'rgba(20, 184, 166, 0.8)',
+          borderColor: 'rgba(20, 184, 166, 1)',
+          borderWidth: 1,
+          borderRadius: 4
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: {
+            display: false
+          }
+        },
+        scales: {
+          y: {
+            beginAtZero: true,
+            grid: {
+              color: 'rgba(0, 0, 0, 0.05)'
+            }
+          },
+          x: {
+            grid: {
+              display: false
+            },
+            ticks: {
+              maxRotation: 45,
+              minRotation: 45
+            }
+          }
+        }
+      }
+    });
+  }
+
+  // Token 饼图
+  const tokenCtx = document.getElementById('tokenChart');
+  if (tokenCtx && tokenData.length > 0) {
+    const colors = [
+      'rgba(20, 184, 166, 0.8)',
+      'rgba(59, 130, 246, 0.8)',
+      'rgba(245, 158, 11, 0.8)',
+      'rgba(239, 68, 68, 0.8)',
+      'rgba(139, 92, 246, 0.8)',
+      'rgba(236, 72, 153, 0.8)',
+      'rgba(99, 102, 241, 0.8)',
+      'rgba(16, 185, 129, 0.8)'
+    ];
+
+    tokenChart = new Chart(tokenCtx, {
+      type: 'doughnut',
+      data: {
+        labels: tokenData.map(t => t.token.substring(0, 8) + '...'),
+        datasets: [{
+          data: tokenData.map(t => t.requests_24h),
+          backgroundColor: colors.slice(0, tokenData.length),
+          borderWidth: 2,
+          borderColor: '#ffffff'
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: {
+            position: 'right',
+            labels: {
+              boxWidth: 12,
+              padding: 10,
+              font: {
+                size: 11
+              }
+            }
+          }
+        }
+      }
+    });
+  }
 }
 
 function formatNumber(n) {

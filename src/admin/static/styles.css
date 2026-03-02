@@ -1177,6 +1177,43 @@ body {
   margin-bottom: var(--space-3);
 }
 
+/* 图表样式 */
+.metrics-charts {
+  display: grid;
+  grid-template-columns: 2fr 1fr;
+  gap: var(--space-5);
+  margin-bottom: var(--space-6);
+}
+
+.chart-container {
+  background: var(--bg-primary);
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-xl);
+  padding: var(--space-5);
+  min-height: 300px;
+  display: flex;
+  flex-direction: column;
+}
+
+.chart-title {
+  font-size: 0.875rem;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-bottom: var(--space-4);
+  margin-top: 0;
+}
+
+.chart-container canvas {
+  flex: 1;
+  max-height: 250px;
+}
+
+@media (max-width: 1024px) {
+  .metrics-charts {
+    grid-template-columns: 1fr;
+  }
+}
+
 .metrics-table-wrapper {
   background: var(--bg-primary);
   border: 1px solid var(--border-light);
