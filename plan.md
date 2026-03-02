@@ -63,7 +63,8 @@ Phase 2 范围（按需启用）:
 | M18 | 轻量观测界面（HTML + JS）与窗口统计 | DONE | `src/server.rs`, `src/observability.rs`, `tests/gateway_e2e.rs`, `README.md`, `docs/System Design.md`, `config/dev.yaml`, `plan.md` | 提供浏览器可访问观测页面与 JSON 接口；支持 route 维度 1h/24h 请求数、并发与 GW_TOKEN 维度请求数 |
 | M19 | Linux `--install` 一键安装（systemd + `/etc/ai_gw_lite/conf.yaml`） | DONE | `src/main.rs`, `src/install.rs`, `src/lib.rs`, `README.md`, `docs/System Design.md`, `plan.md` | Linux 下执行 `--install` 可自动创建配置目录/配置文件与 service 文件，且 `ExecStart` 使用 `/etc/ai_gw_lite/conf.yaml` |
 | M20 | Admin 管理页面（热加载配置 + REST API + 内置 UI） | DONE | `Cargo.toml`, `src/config.rs`, `src/server.rs`, `src/main.rs`, `src/lib.rs`, `src/admin.rs`, `src/concurrency.rs`, `tests/gateway_e2e.rs`, `tests/inbound_tls_e2e.rs`, `config/dev.yaml` | Admin API + UI 可用；运行时热加载路由等配置即时生效；`cargo test` 42/42 全绿 |
-| M21 | 交叉编译能力（Windows → Linux） | DONE | `.cargo/config.toml`, `README.md`, `plan.md` | 在 Windows 上可通过 `cargo zigbuild` 编译出 `x86_64-unknown-linux-musl` 和 `x86_64-unknown-linux-gnu` 二进制 |
+| M21 | 自定义 User-Agent（按 route 配置独立 UA） | DONE | `src/config.rs`, `src/proxy.rs`, `src/server.rs`, `tests/gateway_e2e.rs`, `config/dev.yaml`, `docs/System Design.md` | 每个 route 可配置 `user_agent`，转发到上游时注入该 UA；支持 `${ENV_VAR}` 插值 |
+| M22 | 交叉编译能力（Windows → Linux） | DONE | `.cargo/config.toml`, `README.md`, `plan.md` | 在 Windows 上可通过 `cargo zigbuild` 编译出 `x86_64-unknown-linux-musl` 和 `x86_64-unknown-linux-gnu` 二进制 |
 
 ## 4. 详细实施步骤（执行顺序）
 
@@ -124,7 +125,7 @@ Phase 2 范围（按需启用）:
 每次任务改动必须两次更新本文件:
 
 1. 改动开始前（Before Change）:
-- 在“里程碑表”将对应任务状态改为 `IN_PROGRESS`
+- 在"里程碑表"将对应任务状态改为 `IN_PROGRESS`
 - 写明本次拟改动文件与目标
 
 2. 改动完成后（After Change）:
@@ -140,7 +141,7 @@ Phase 2 范围（按需启用）:
 > 按时间倒序追加，每条记录必须包含：任务 ID、变更摘要、验证命令、结果。
 
 ### 2026-02-25
-- 任务: M21
+- 任务: M22
 - 变更（After Change）:
   - 新建 `.cargo/config.toml`，配置 Linux target 使用 Zig 作为链接器
   - 安装工具链：`rustup target add x86_64-unknown-linux-musl x86_64-unknown-linux-gnu`、`cargo install cargo-zigbuild`、`winget install zig.zig`
@@ -157,6 +158,115 @@ Phase 2 范围（按需启用）:
 - 剩余事项:
   - 工具链安装（zig、cargo-zigbuild、rustup target）为开发机本地环境要求，未纳入 CI；如需 CI 交叉编译可后续添加 GitHub Actions workflow
 
+### 2026-03-02
+- 任务: M21（自定义 User-Agent 缺陷修复）
+- 变更（After Change）:
+  - `src/config.rs`:
+    - 新增 `upstream.user_agent` 配置校验：提供时不能为空，且必须是合法 HTTP header value
+    - 新增单测 `reject_invalid_user_agent`
+  - `src/proxy.rs`:
+    - `prepare_upstream_headers` 不再静默忽略非法 `user_agent`，改为返回 `ProxyError::InvalidHeaderValue`
+    - 新增单测 `reject_invalid_user_agent_when_configured`
+  - `tests/gateway_e2e.rs`:
+    - 新增 `route_specific_user_agent_is_applied_independently`，验证不同 route 可独立覆盖不同 UA
+  - `src/admin.rs`:
+    - Routes 页面新增 `User-Agent (可选)` 输入项
+    - 新建 route 默认配置补充 `user_agent: null`
+  - `src/server.rs`:
+    - 错误映射调整为优先判断 `is_connect()`，修复连接类错误被误映射为 504 的问题
+  - `plan.md`:
+    - 修复里程碑表头分隔列数错误
+  - 清理工作区临时文件：`EOF`、`ENDOFFILE`
+- 实际改动文件:
+  - `src/config.rs`
+  - `src/proxy.rs`
+  - `tests/gateway_e2e.rs`
+  - `src/admin.rs`
+  - `src/server.rs`
+  - `plan.md`
+- 验证:
+  - `cargo fmt --all -- --check` → PASS
+  - `cargo test` → PASS（73 passed）
+  - `cargo clippy --all-targets --all-features -- -D warnings` → PASS（0 warnings）
+- 结果: DONE
+- 剩余事项:
+  - 无
+
+### 2026-03-02
+- 任务: M21（自定义 User-Agent 缺陷修复）
+- 变更（Before Change）:
+  - 修复 `user_agent` 非法值被静默忽略的问题，改为显式校验并返回错误
+  - 补充 e2e 测试，验证不同 route 可独立应用不同 User-Agent
+  - 在 Admin Routes 页面补充 `user_agent` 可视化配置项
+  - 清理 `plan.md` 表头分隔列数错误与工作区无关临时文件
+- 拟改动文件:
+  - `src/config.rs`
+  - `src/proxy.rs`
+  - `tests/gateway_e2e.rs`
+  - `src/admin.rs`
+  - `plan.md`
+  - `EOF`（删除）
+  - `ENDOFFILE`（删除）
+- 验证:
+  - 完成后执行 `cargo fmt --all`、`cargo test`、`cargo clippy --all-targets --all-features -- -D warnings`
+- 结果: IN_PROGRESS
+
+### 2026-03-02
+- 任务: M21（自定义 User-Agent）
+- 变更（Before Change）:
+  - 计划为每个 route 添加 `user_agent` 配置项，支持自定义 User-Agent 转发到上游
+  - 支持 `${ENV_VAR}` 环境变量插值
+  - 在 `prepare_upstream_headers` 中处理 User-Agent header 注入
+  - 若未配置 `user_agent`，保持现有行为（使用客户端原始 UA 或 reqwest 默认 UA）
+- 拟改动文件:
+  - `src/config.rs`: UpstreamConfig 添加 `user_agent: Option<String>` 字段
+  - `src/proxy.rs`: `prepare_upstream_headers` 处理 User-Agent
+  - `src/server.rs`: `forward_to_upstream` 传入 User-Agent 配置
+  - `tests/gateway_e2e.rs`: 添加 User-Agent 注入测试
+  - `config/dev.yaml`: 添加 user_agent 配置示例
+  - `docs/System Design.md`: 更新配置文档
+  - `plan.md`: 更新任务状态与执行记录
+- 验证:
+  - 完成后执行 `cargo fmt --all`、`cargo test`、`cargo clippy --all-targets --all-features -- -D warnings`
+- 结果: IN_PROGRESS
+
+### 2026-03-02
+- 任务: M21（自定义 User-Agent）
+- 变更（After Change）:
+  - `src/config.rs`: UpstreamConfig 添加 `user_agent: Option<String>` 字段
+    - 支持 `${ENV_VAR}` 环境变量插值（复用现有 interpolate_env_vars）
+  - `src/proxy.rs`: `prepare_upstream_headers` 处理 User-Agent
+    - 添加 `use http::header::{HOST, USER_AGENT};`
+    - 在 inject_headers 之后、remove(HOST) 之前插入 User-Agent 处理逻辑
+    - 若配置了 user_agent 且能解析为 HeaderValue，则插入/覆盖 User-Agent header
+  - 新增 3 个单元测试验证 User-Agent 行为：
+    - `inject_custom_user_agent`: 验证配置的 UA 被正确注入
+    - `preserve_original_user_agent_when_not_configured`: 验证未配置时保留原始 UA
+    - `override_original_user_agent_when_configured`: 验证配置 UA 覆盖原始 UA
+  - 更新测试文件中的 UpstreamConfig 构造：
+    - `src/concurrency.rs`: 添加 `user_agent: None`
+    - `src/server.rs`: 添加 `user_agent: None`
+    - `tests/gateway_e2e.rs`: 添加 `user_agent: None`
+    - `tests/inbound_tls_e2e.rs`: 添加 `user_agent: None`
+  - `config/dev.yaml`: 添加 user_agent 配置示例注释
+  - `docs/System Design.md`: 在 OpenAI route 示例中添加 user_agent 配置说明
+- 实际改动文件:
+  - `src/config.rs`
+  - `src/proxy.rs`
+  - `src/concurrency.rs`
+  - `src/server.rs`
+  - `tests/gateway_e2e.rs`
+  - `tests/inbound_tls_e2e.rs`
+  - `config/dev.yaml`
+  - `docs/System Design.md`
+  - `plan.md`
+- 验证:
+  - `cargo fmt --all` → PASS
+  - `cargo test --lib` → 45/45 passed (新增 3 个 User-Agent 测试), PASS
+  - `cargo clippy --all-targets --all-features -- -D warnings` → 0 warnings, PASS
+- 结果: DONE
+- 剩余事项:
+  - 无
 
 ### 2026-02-19
 - 任务: M20（文档补充）
@@ -407,7 +517,7 @@ Phase 2 范围（按需启用）:
   - `cargo clippy --all-targets --all-features -- -D warnings`
 - 结果: DONE
 - 剩余事项:
-  - 当前滚动策略基于时间分片；若后续需要“按文件大小滚动”，可在新任务中引入 size-based rotate 后端。
+  - 当前滚动策略基于时间分片；若后续需要"按文件大小滚动"，可在新任务中引入 size-based rotate 后端。
 
 ### 2026-02-11
 - 任务: M17
@@ -509,7 +619,7 @@ Phase 2 范围（按需启用）:
   - `src/concurrency.rs` 去除对可配置 header 列表的依赖，改为固定识别并仅从 `inject_headers.value` 提取
   - 更新测试：
     - 移除旧字段相关断言
-    - 新增“旧字段应报 unknown field”校验用例
+    - 新增"旧字段应报 unknown field"校验用例
   - 同步更新 `README.md`、`docs/System Design.md`、`config/dev.yaml`，删除 `upstream_key_headers` 配置说明与示例
 - 实际改动文件:
   - `src/config.rs`
@@ -559,7 +669,7 @@ Phase 2 范围（按需启用）:
     - `src/concurrency.rs` 单测改为基于 YAML 注入值验证按 key 分组
     - `tests/gateway_e2e.rs` 改为两条 route（不同注入 key）验证相同 key 限制、不同 key 并行
     - `src/config.rs` 新增缺少注入 key 的校验失败用例
-  - 更新文档与示例注释，明确“上游 key 仅来源于 YAML 注入值”
+  - 更新文档与示例注释，明确"上游 key 仅来源于 YAML 注入值"
 - 实际改动文件:
   - `src/config.rs`
   - `src/concurrency.rs`
@@ -580,7 +690,7 @@ Phase 2 范围（按需启用）:
 ### 2026-02-11
 - 任务: M14
 - 变更（Before Change）:
-  - 计划将“上游并发 key 提取来源”收敛为 YAML 配置注入值
+  - 计划将"上游并发 key 提取来源"收敛为 YAML 配置注入值
   - 禁止从客户端请求头提取上游 key
   - 增加配置校验：启用上游并发限制时，路由必须在 `inject_headers` 提供可识别的 key header
   - 同步更新测试与文档说明
@@ -669,7 +779,7 @@ Phase 2 范围（按需启用）:
   - 新增 e2e 测试：
     - preflight 无需鉴权即可通过并返回正确 CORS 头
     - `allow_origins` 配置 host 写法时，响应可正确回写 `Origin`
-  - 更新 `README.md` 与 `docs/System Design.md`，将 CORS 从“仅解析”更新为“已生效”
+  - 更新 `README.md` 与 `docs/System Design.md`，将 CORS 从"仅解析"更新为"已生效"
 - 实际改动文件:
   - `src/server.rs`
   - `tests/gateway_e2e.rs`
@@ -687,7 +797,7 @@ Phase 2 范围（按需启用）:
 ### 2026-02-11
 - 任务: M12
 - 变更（Before Change）:
-  - 计划将现有仅“解析不生效”的 `cors` 配置改为运行时生效
+  - 计划将现有仅"解析不生效"的 `cors` 配置改为运行时生效
   - 计划实现 preflight (`OPTIONS`) 处理，并在常规响应上注入 CORS 相关响应头
   - 计划补充集成测试覆盖跨域成功路径与预检路径，并同步更新文档说明
 - 拟改动文件:
@@ -731,7 +841,7 @@ Phase 2 范围（按需启用）:
   - `cargo clippy --all-targets --all-features -- -D warnings`
 - 结果: DONE
 - 剩余事项:
-  - 当前 HTTPS 为“开启后仅 HTTPS 监听”，如需 HTTP+HTTPS 同时监听可在后续任务扩展双监听模式
+  - 当前 HTTPS 为"开启后仅 HTTPS 监听"，如需 HTTP+HTTPS 同时监听可在后续任务扩展双监听模式
 
 ### 2026-02-11
 - 任务: M11
@@ -803,7 +913,7 @@ Phase 2 范围（按需启用）:
 ### 2026-02-10
 - 任务: M9
 - 变更（After Change）:
-  - 新增 `README.md`，面向“人类”提供完整使用手册
+  - 新增 `README.md`，面向"人类"提供完整使用手册
   - 补充 `config.yaml` 全字段说明（类型、默认值、限制、作用、示例）
   - 补充编译、运行、部署（Linux systemd / Windows）与常见错误码、排障建议
   - 文档内容已按当前代码行为对齐（含 SSE 与 timeout 语义、CORS 当前状态）
@@ -821,7 +931,7 @@ Phase 2 范围（按需启用）:
 ### 2026-02-10
 - 任务: M9
 - 变更（Before Change）:
-  - 计划新增面向“人类”的 `README.md` 使用手册
+  - 计划新增面向"人类"的 `README.md` 使用手册
   - 重点覆盖：`config.yaml` 全字段说明、编译运行、部署方式、排障与安全建议
   - 内容需与当前代码行为一致（包含默认值、限制、已实现与未实现项）
 - 拟改动文件:
@@ -837,9 +947,9 @@ Phase 2 范围（按需启用）:
 - 任务: M5
 - 变更（After Change）:
   - `src/server.rs` 引入按路由预构建并复用的上游 `reqwest::Client`，避免每请求重建客户端
-  - `src/server.rs` 将 `request_timeout_ms` 从“仅 send 阶段”扩展到非 SSE 响应体读取阶段（SSE 保持不施加总超时）
-  - `tests/gateway_e2e.rs` 新增“非 SSE 响应体卡顿时在超时预算内终止”用例
-  - `tests/gateway_e2e.rs` 新增“小 request timeout 下 SSE 仍持续透传”回归用例
+  - `src/server.rs` 将 `request_timeout_ms` 从"仅 send 阶段"扩展到非 SSE 响应体读取阶段（SSE 保持不施加总超时）
+  - `tests/gateway_e2e.rs` 新增"非 SSE 响应体卡顿时在超时预算内终止"用例
+  - `tests/gateway_e2e.rs` 新增"小 request timeout 下 SSE 仍持续透传"回归用例
   - 同步调整 `build_app` 构建路径与相关测试调用
 - 实际改动文件:
   - `src/server.rs`
@@ -871,7 +981,7 @@ Phase 2 范围（按需启用）:
 - 任务: M7
 - 变更（After Change）:
   - 更新 `AGENTS.md` 项目结构，补充 `src/server.rs` 并修正 `proxy.rs` 职责描述
-  - 更新 `docs/System Design.md` 模块划分，新增“当前实现状态（2026-02-10）”章节
+  - 更新 `docs/System Design.md` 模块划分，新增"当前实现状态（2026-02-10）"章节
   - 更新 `plan.md` 里程碑状态与步骤文案，使实现路径与当前技术选型一致
 - 实际改动文件:
   - `AGENTS.md`
@@ -975,19 +1085,19 @@ Phase 2 范围（按需启用）:
 ### 2026-02-10
 - 任务: M8
 - 变更（After Change）:
-  - 已在 `AGENTS.md` 添加“单文件不超过 2000 行”硬约束
+  - 已在 `AGENTS.md` 添加"单文件不超过 2000 行"硬约束
   - 已新增 Rust 社区最佳实践约束（格式化/lint、错误处理、unsafe、异步阻塞、测试、模块职责）
-  - 已在 PR checklist 增加“2000 行限制”检查项
+  - 已在 PR checklist 增加"2000 行限制"检查项
 - 验证:
   - `rg -n "2000|Rust 最佳实践约束|Community Baseline|PR 必填检查项" AGENTS.md plan.md`
 - 结果: DONE
 - 剩余事项:
-  - 后续如引入 CI，可将“单文件行数 <= 2000”自动化为检查脚本
+  - 后续如引入 CI，可将"单文件行数 <= 2000"自动化为检查脚本
 
 ### 2026-02-10
 - 任务: M8
 - 变更（Before Change）:
-  - 计划更新 `AGENTS.md`，新增“单文件不超过 2000 行”强约束
+  - 计划更新 `AGENTS.md`，新增"单文件不超过 2000 行"强约束
   - 计划补充 Rust 社区最佳实践代码约束（格式化、lint、错误处理、unsafe、测试等）
   - 关联更新 `plan.md` 状态与执行记录
 - 验证:
@@ -998,7 +1108,7 @@ Phase 2 范围（按需启用）:
 - 任务: M7
 - 变更:
   - 新增 `plan.md` 作为实施执行计划与记录文档
-  - 更新 `AGENTS.md`，增加“改动前后必须更新 `plan.md`”硬约束
+  - 更新 `AGENTS.md`，增加"改动前后必须更新 `plan.md`"硬约束
   - 在 PR checklist 中加入 `plan.md` 更新检查项
 - 验证:
   - `AGENTS.md` 与 `plan.md` 内容一致，规则已落地

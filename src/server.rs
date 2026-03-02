@@ -1028,10 +1028,10 @@ fn error_response(error: UpstreamError) -> Response<Body> {
     match error {
         UpstreamError::Timeout => json_error(StatusCode::GATEWAY_TIMEOUT, "upstream_timeout"),
         UpstreamError::Request(err) => {
-            if err.is_timeout() {
-                json_error(StatusCode::GATEWAY_TIMEOUT, "upstream_timeout")
-            } else if err.is_connect() {
+            if err.is_connect() {
                 json_error(StatusCode::BAD_GATEWAY, "upstream_connect_error")
+            } else if err.is_timeout() {
+                json_error(StatusCode::GATEWAY_TIMEOUT, "upstream_timeout")
             } else {
                 json_error(StatusCode::BAD_GATEWAY, "upstream_request_failed")
             }
@@ -1415,6 +1415,7 @@ mod tests {
                     password: None,
                 }),
                 upstream_key_max_inflight: None,
+                user_agent: None,
             },
         });
 
@@ -1461,6 +1462,7 @@ mod tests {
                     forward_xff: false,
                     proxy: None,
                     upstream_key_max_inflight: None,
+                    user_agent: None,
                 },
             }],
             inbound_tls: None,

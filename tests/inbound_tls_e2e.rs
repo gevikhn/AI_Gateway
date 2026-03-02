@@ -37,6 +37,7 @@ async fn https_listener_auto_generates_self_signed_cert() {
                 forward_xff: false,
                 proxy: None,
                 upstream_key_max_inflight: None,
+                user_agent: None,
             },
         }],
         inbound_tls: Some(InboundTlsConfig {

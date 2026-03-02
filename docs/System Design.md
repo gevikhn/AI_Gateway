@@ -148,6 +148,8 @@ routes:
         - "true-client-ip"
       # 是否把 x-forwarded-for 传给上游（默认 false）
       forward_xff: false
+      # 可选：自定义 User-Agent 转发到上游（支持 ${ENV_VAR} 插值）
+      user_agent: "AI-Gateway/1.0"
 
   - id: "anthropic"
     prefix: "/claude"

@@ -209,6 +209,7 @@ mod tests {
                 forward_xff: false,
                 proxy: None,
                 upstream_key_max_inflight: None,
+                user_agent: None,
             },
         });
         let controller = ConcurrencyController::new(&config).expect("controller should exist");
@@ -289,6 +290,7 @@ mod tests {
                     forward_xff: false,
                     proxy: None,
                     upstream_key_max_inflight: route_upstream_limit,
+                    user_agent: None,
                 },
             }],
             inbound_tls: None,

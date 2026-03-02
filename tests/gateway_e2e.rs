@@ -70,6 +70,61 @@ async fn proxy_rewrites_and_injects_headers() {
 }
 
 #[tokio::test]
+async fn route_specific_user_agent_is_applied_independently() {
+    let upstream = Router::new().route("/v1/ua", get(upstream_echo_user_agent));
+    let (upstream_addr, upstream_handle) = spawn_router(upstream).await;
+
+    let mut config = gateway_config(upstream_addr.to_string(), 2_000);
+    config.routes[0].upstream.user_agent = Some("Route-A-UA/1.0".to_string());
+
+    let mut route_b = config.routes[0].clone();
+    route_b.id = "anthropic".to_string();
+    route_b.prefix = "/claude".to_string();
+    route_b.upstream.user_agent = Some("Route-B-UA/2.0".to_string());
+    config.routes.push(route_b);
+
+    let app = build_app(Arc::new(config), None).expect("gateway app should build");
+    let (gateway_addr, gateway_handle) = spawn_router(app).await;
+
+    let client = reqwest::Client::new();
+
+    let route_a_response = client
+        .get(format!("http://{gateway_addr}/openai/v1/ua"))
+        .header("authorization", "Bearer gw_token")
+        .header("user-agent", "client-original-a")
+        .send()
+        .await
+        .expect("request should succeed");
+    assert_eq!(route_a_response.status(), StatusCode::OK);
+    assert_eq!(
+        route_a_response
+            .text()
+            .await
+            .expect("body should be readable"),
+        "Route-A-UA/1.0"
+    );
+
+    let route_b_response = client
+        .get(format!("http://{gateway_addr}/claude/v1/ua"))
+        .header("authorization", "Bearer gw_token")
+        .header("user-agent", "client-original-b")
+        .send()
+        .await
+        .expect("request should succeed");
+    assert_eq!(route_b_response.status(), StatusCode::OK);
+    assert_eq!(
+        route_b_response
+            .text()
+            .await
+            .expect("body should be readable"),
+        "Route-B-UA/2.0"
+    );
+
+    gateway_handle.abort();
+    upstream_handle.abort();
+}
+
+#[tokio::test]
 async fn proxy_passes_sse_response() {
     let upstream = Router::new().route("/v1/sse", get(upstream_sse));
     let (upstream_addr, upstream_handle) = spawn_router(upstream).await;
@@ -905,6 +960,7 @@ fn gateway_config(upstream_addr: String, request_timeout_ms: u64) -> AppConfig {
                 forward_xff: false,
                 proxy: None,
                 upstream_key_max_inflight: None,
+                user_agent: None,
             },
         }],
         inbound_tls: None,
@@ -938,6 +994,19 @@ async fn upstream_echo(
     } else {
         StatusCode::BAD_REQUEST
     }
+}
+
+async fn upstream_echo_user_agent(headers: HeaderMap) -> Response<Body> {
+    let user_agent = headers
+        .get("user-agent")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .body(Body::from(user_agent))
+        .expect("response should build")
 }
 
 async fn upstream_sse() -> Response<Body> {

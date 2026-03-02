@@ -1,5 +1,5 @@
 use crate::config::{HeaderInjection, RouteConfig, UpstreamConfig};
-use http::header::HOST;
+use http::header::{HOST, USER_AGENT};
 use http::{HeaderMap, HeaderName, HeaderValue};
 use std::fmt;
 
@@ -142,6 +142,11 @@ pub fn prepare_upstream_headers(
         upsert_header(&mut outbound, header)?;
     }
 
+    if let Some(user_agent) = upstream.user_agent.as_deref() {
+        let ua_value = HeaderValue::from_str(user_agent)
+            .map_err(|_| ProxyError::InvalidHeaderValue(user_agent.to_string()))?;
+        outbound.insert(USER_AGENT, ua_value);
+    }
     outbound.remove(HOST);
     Ok(outbound)
 }
@@ -251,6 +256,7 @@ mod tests {
             forward_xff: false,
             proxy: None,
             upstream_key_max_inflight: None,
+            user_agent: None,
         };
 
         let outbound = prepare_upstream_headers(&inbound, &upstream).expect("headers are valid");
@@ -278,6 +284,89 @@ mod tests {
         );
     }
 
+    #[test]
+    fn inject_custom_user_agent() {
+        let inbound = HeaderMap::new();
+        let upstream = UpstreamConfig {
+            base_url: "https://api.openai.com".to_string(),
+            strip_prefix: true,
+            connect_timeout_ms: 10_000,
+            request_timeout_ms: 60_000,
+            inject_headers: Vec::new(),
+            remove_headers: Vec::new(),
+            forward_xff: false,
+            proxy: None,
+            upstream_key_max_inflight: None,
+            user_agent: Some("MyCustomBot/1.0".to_string()),
+        };
+
+        let outbound = prepare_upstream_headers(&inbound, &upstream).expect("headers are valid");
+        assert_eq!(
+            outbound.get("user-agent").and_then(|v| v.to_str().ok()),
+            Some("MyCustomBot/1.0")
+        );
+    }
+
+    #[test]
+    fn preserve_original_user_agent_when_not_configured() {
+        let mut inbound = HeaderMap::new();
+        inbound.insert("user-agent", HeaderValue::from_static("OriginalAgent/2.0"));
+        let upstream = minimal_upstream();
+
+        let outbound = prepare_upstream_headers(&inbound, &upstream).expect("headers are valid");
+        assert_eq!(
+            outbound.get("user-agent").and_then(|v| v.to_str().ok()),
+            Some("OriginalAgent/2.0")
+        );
+    }
+
+    #[test]
+    fn override_original_user_agent_when_configured() {
+        let mut inbound = HeaderMap::new();
+        inbound.insert("user-agent", HeaderValue::from_static("OriginalAgent/2.0"));
+        let upstream = UpstreamConfig {
+            base_url: "https://api.openai.com".to_string(),
+            strip_prefix: true,
+            connect_timeout_ms: 10_000,
+            request_timeout_ms: 60_000,
+            inject_headers: Vec::new(),
+            remove_headers: Vec::new(),
+            forward_xff: false,
+            proxy: None,
+            upstream_key_max_inflight: None,
+            user_agent: Some("OverrideBot/3.0".to_string()),
+        };
+
+        let outbound = prepare_upstream_headers(&inbound, &upstream).expect("headers are valid");
+        assert_eq!(
+            outbound.get("user-agent").and_then(|v| v.to_str().ok()),
+            Some("OverrideBot/3.0")
+        );
+    }
+
+    #[test]
+    fn reject_invalid_user_agent_when_configured() {
+        let inbound = HeaderMap::new();
+        let upstream = UpstreamConfig {
+            base_url: "https://api.openai.com".to_string(),
+            strip_prefix: true,
+            connect_timeout_ms: 10_000,
+            request_timeout_ms: 60_000,
+            inject_headers: Vec::new(),
+            remove_headers: Vec::new(),
+            forward_xff: false,
+            proxy: None,
+            upstream_key_max_inflight: None,
+            user_agent: Some("bad\nua".to_string()),
+        };
+
+        let error = prepare_upstream_headers(&inbound, &upstream).expect_err("must reject");
+        assert!(matches!(
+            error,
+            super::ProxyError::InvalidHeaderValue(value) if value == "bad\nua"
+        ));
+    }
+
     fn minimal_upstream() -> UpstreamConfig {
         UpstreamConfig {
             base_url: "https://api.openai.com".to_string(),
@@ -289,6 +378,7 @@ mod tests {
             forward_xff: false,
             proxy: None,
             upstream_key_max_inflight: None,
+            user_agent: None,
         }
     }
 }
