@@ -864,6 +864,11 @@ function esc(s) {
 
 // ===== Metrics =====
 let metricsRefreshInterval = null;
+let ipMetricsData = null;
+let ipMetricsWindow = '1h';
+let ipMetricsSearch = '';
+let ipMetricsSortBy = 'requests';
+let ipMetricsOrder = 'desc';
 
 async function loadMetrics() {
   const token = getToken();
@@ -893,6 +898,169 @@ async function loadMetrics() {
   } catch (e) {
     console.error('加载 metrics 失败:', e);
   }
+}
+
+async function loadIPMetrics() {
+  const token = getToken();
+  if (!token) {
+    logout();
+    return;
+  }
+
+  try {
+    const params = new URLSearchParams({
+      window: ipMetricsWindow,
+      sort_by: ipMetricsSortBy,
+      order: ipMetricsOrder,
+      limit: '100'
+    });
+    if (ipMetricsSearch) {
+      params.append('ip', ipMetricsSearch);
+    }
+
+    const res = await fetch(`${CONFIG.metricsUrl}/ip?${params}`, {
+      headers: { Authorization: 'Bearer ' + token },
+      cache: 'no-store'
+    });
+
+    if (res.status === 401) {
+      localStorage.removeItem(TOKEN_KEY);
+      logout();
+      return;
+    }
+
+    if (!res.ok) {
+      throw new Error('HTTP ' + res.status);
+    }
+
+    ipMetricsData = await res.json();
+    renderIPMetrics();
+  } catch (e) {
+    console.error('加载 IP metrics 失败:', e);
+  }
+}
+
+function setIPMetricsWindow(window) {
+  ipMetricsWindow = window;
+  loadIPMetrics();
+}
+
+function setIPMetricsSearch(value) {
+  ipMetricsSearch = value.trim();
+  loadIPMetrics();
+}
+
+function setIPMetricsSort(sortBy) {
+  if (ipMetricsSortBy === sortBy) {
+    ipMetricsOrder = ipMetricsOrder === 'desc' ? 'asc' : 'desc';
+  } else {
+    ipMetricsSortBy = sortBy;
+    ipMetricsOrder = 'desc';
+  }
+  loadIPMetrics();
+}
+
+function formatBytes(bytes) {
+  if (bytes === 0) return '0 B';
+  const k = 1024;
+  const sizes = ['B', 'KB', 'MB', 'GB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+}
+
+function formatDuration(ms) {
+  if (ms < 1) return '<1ms';
+  if (ms < 1000) return Math.round(ms) + 'ms';
+  return (ms / 1000).toFixed(2) + 's';
+}
+
+function renderIPMetrics() {
+  const container = document.getElementById('ip-metrics-container');
+  if (!container) return;
+
+  const windows = [
+    { key: '5m', label: '5分钟' },
+    { key: '1h', label: '1小时' },
+    { key: '24h', label: '24小时' },
+    { key: '1w', label: '1周' },
+    { key: '1m', label: '1月' }
+  ];
+
+  const windowButtons = windows.map(w => `
+    <button class="metrics-window-btn ${ipMetricsWindow === w.key ? 'active' : ''}" onclick="setIPMetricsWindow('${w.key}')">${w.label}</button>
+  `).join('');
+
+  const sortIndicators = {
+    requests: ipMetricsSortBy === 'requests' ? (ipMetricsOrder === 'desc' ? '↓' : '↑') : '',
+    errors: ipMetricsSortBy === 'errors' ? (ipMetricsOrder === 'desc' ? '↓' : '↑') : '',
+    bytes_in: ipMetricsSortBy === 'bytes_in' ? (ipMetricsOrder === 'desc' ? '↓' : '↑') : '',
+    bytes_out: ipMetricsSortBy === 'bytes_out' ? (ipMetricsOrder === 'desc' ? '↓' : '↑') : '',
+    latency_avg: ipMetricsSortBy === 'latency_avg' ? (ipMetricsOrder === 'desc' ? '↓' : '↑') : ''
+  };
+
+  let tableContent = '';
+  if (!ipMetricsData || !ipMetricsData.ips || ipMetricsData.ips.length === 0) {
+    tableContent = `<tr><td colspan="8" class="empty-cell">暂无 IP 数据</td></tr>`;
+  } else {
+    tableContent = ipMetricsData.ips.map(ip => `
+      <tr>
+        <td><code class="ip-address">${esc(ip.ip)}</code></td>
+        <td>${formatNumber(ip.requests)}</td>
+        <td>${formatNumber(ip.errors)}</td>
+        <td>${formatBytes(ip.bytes_in)}</td>
+        <td>${formatBytes(ip.bytes_out)}</td>
+        <td>${formatDuration(ip.latency_avg_ms)}</td>
+        <td>${formatDuration(ip.latency_p99_ms)}</td>
+        <td>
+          <div class="ip-routes">
+            ${(ip.routes || []).slice(0, 3).map(r => `<span class="ip-tag route">${esc(r)}</span>`).join('')}
+            ${(ip.routes || []).length > 3 ? `<span class="ip-tag more">+${(ip.routes || []).length - 3}</span>` : ''}
+          </div>
+        </td>
+      </tr>
+    `).join('');
+  }
+
+  const summary = ipMetricsData ? `
+    <div class="ip-metrics-summary">
+      <span class="summary-item">IP 数: <strong>${ipMetricsData.total_ips || 0}</strong></span>
+      <span class="summary-item">总请求: <strong>${formatNumber(ipMetricsData.total_requests || 0)}</strong></span>
+      <span class="summary-item">总错误: <strong>${formatNumber(ipMetricsData.total_errors || 0)}</strong></span>
+    </div>
+  ` : '';
+
+  container.innerHTML = `
+    <div class="ip-metrics-header">
+      <div class="metrics-window-selector">
+        ${windowButtons}
+      </div>
+      <div class="ip-metrics-search">
+        <input type="text" class="input" placeholder="搜索 IP..." value="${esc(ipMetricsSearch)}" onchange="setIPMetricsSearch(this.value)" />
+        <svg class="search-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="11" cy="11" r="8"/>
+          <path d="m21 21-4.3-4.3"/>
+        </svg>
+      </div>
+    </div>
+    ${summary}
+    <div class="metrics-table-wrapper">
+      <table class="metrics-table ip-metrics-table">
+        <thead>
+          <tr>
+            <th onclick="setIPMetricsSort('ip')">IP 地址</th>
+            <th onclick="setIPMetricsSort('requests')" class="sortable">请求数 ${sortIndicators.requests}</th>
+            <th onclick="setIPMetricsSort('errors')" class="sortable">错误数 ${sortIndicators.errors}</th>
+            <th onclick="setIPMetricsSort('bytes_in')" class="sortable">入流量 ${sortIndicators.bytes_in}</th>
+            <th onclick="setIPMetricsSort('bytes_out')" class="sortable">出流量 ${sortIndicators.bytes_out}</th>
+            <th onclick="setIPMetricsSort('latency_avg')" class="sortable">平均延迟 ${sortIndicators.latency_avg}</th>
+            <th>P99 延迟</th>
+            <th>访问路由</th>
+          </tr>
+        </thead>
+        <tbody>${tableContent}</tbody>
+      </table>
+    </div>
+  `;
 }
 
 function renderMetrics() {
@@ -1013,7 +1181,19 @@ function renderMetrics() {
         </table>
       </div>
     </div>
+
+    <div class="metrics-section">
+      <h3>IP 维度</h3>
+      <div id="ip-metrics-container">
+        <div class="empty-state">
+          <div class="empty-state-description">加载中...</div>
+        </div>
+      </div>
+    </div>
   `;
+
+  // 加载并渲染 IP 维度数据
+  loadIPMetrics();
 }
 
 function formatNumber(n) {
@@ -1040,6 +1220,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const metricsPanel = document.getElementById('tab-metrics');
     if (metricsPanel && metricsPanel.classList.contains('active')) {
       loadMetrics();
+      loadIPMetrics();
     }
   }, 30000); // 30秒刷新一次
 });

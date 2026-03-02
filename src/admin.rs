@@ -2,10 +2,11 @@ use crate::config::AppConfig;
 use crate::server::{AppState, build_runtime_state};
 use axum::Router;
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::{HeaderMap, Response, StatusCode};
 use axum::routing::{get, post};
 use http::header::CONTENT_TYPE;
+use serde::Deserialize;
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
@@ -23,6 +24,10 @@ pub fn register_admin_routes(router: Router<AppState>, prefix: &str) -> Router<A
             post(admin_config_save_handler),
         )
         .route(&format!("{prefix}/api/metrics"), get(admin_metrics_handler))
+        .route(
+            &format!("{prefix}/api/metrics/ip"),
+            get(admin_ip_metrics_handler),
+        )
 }
 
 fn is_admin_authorized(state: &AppState, headers: &HeaderMap) -> bool {
@@ -69,6 +74,62 @@ fn json_ok(data: &impl serde::Serialize) -> Response<Body> {
             &format!("serialization_error: {err}"),
         ),
     }
+}
+
+/// IP 监控查询参数
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+struct IpMetricsQuery {
+    /// 时间窗口: 5m, 1h, 24h, 1w, 1m
+    window: String,
+    /// 按 IP 筛选（支持部分匹配）
+    ip: Option<String>,
+    /// 排序字段: requests, errors, bytes_in, bytes_out, latency_avg
+    sort_by: String,
+    /// 排序方向: asc, desc
+    order: String,
+    /// 返回数量限制
+    limit: usize,
+}
+
+impl Default for IpMetricsQuery {
+    fn default() -> Self {
+        Self {
+            window: "1h".to_string(),
+            ip: None,
+            sort_by: "requests".to_string(),
+            order: "desc".to_string(),
+            limit: 100,
+        }
+    }
+}
+
+/// IP 监控响应结构
+#[derive(Debug, serde::Serialize)]
+struct IpMetricsResponse {
+    generated_at_unix_ms: u64,
+    window: String,
+    window_seconds: u64,
+    total_ips: usize,
+    total_requests: u64,
+    total_errors: u64,
+    ips: Vec<IpMetricsEntry>,
+}
+
+/// 单个 IP 的监控数据
+#[derive(Debug, serde::Serialize)]
+struct IpMetricsEntry {
+    ip: String,
+    requests: u64,
+    errors: u64,
+    bytes_in: u64,
+    bytes_out: u64,
+    latency_avg_ms: u64,
+    latency_p99_ms: u64,
+    routes: Vec<String>,
+    tokens: Vec<String>,
+    first_seen_unix_ms: u64,
+    last_seen_unix_ms: u64,
 }
 
 async fn admin_ui_handler(State(state): State<AppState>) -> Response<Body> {
@@ -198,6 +259,149 @@ async fn admin_metrics_handler(
     } else {
         json_error(StatusCode::NOT_FOUND, "metrics_not_available")
     }
+}
+
+/// IP 监控 API 处理函数
+/// GET /admin/api/metrics/ip?window=1h&ip=192.168&sort_by=requests&order=desc&limit=50
+async fn admin_ip_metrics_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<IpMetricsQuery>,
+) -> Response<Body> {
+    if !is_admin_authorized(&state, &headers) {
+        return json_error(StatusCode::UNAUTHORIZED, "unauthorized");
+    }
+
+    // 验证时间窗口参数
+    let window_seconds = match query.window.as_str() {
+        "5m" => 5 * 60,
+        "1h" => 60 * 60,
+        "24h" => 24 * 60 * 60,
+        "1w" => 7 * 24 * 60 * 60,
+        "1m" => 30 * 24 * 60 * 60,
+        _ => {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_window: supported values are 5m, 1h, 24h, 1w, 1m",
+            );
+        }
+    };
+
+    // 验证排序字段
+    let valid_sort_fields = ["requests", "errors", "bytes_in", "bytes_out", "latency_avg"];
+    if !valid_sort_fields.contains(&query.sort_by.as_str()) {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_sort_by: supported values are requests, errors, bytes_in, bytes_out, latency_avg",
+        );
+    }
+
+    // 验证排序方向
+    let sort_desc = match query.order.as_str() {
+        "asc" => false,
+        "desc" => true,
+        _ => {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_order: supported values are asc, desc",
+            );
+        }
+    };
+
+    // 限制返回数量
+    let limit = query.limit.min(1000).max(1);
+
+    // 从 observability 模块获取 IP 监控数据
+    let summary = match state.observability.snapshot_summary() {
+        Some(s) => s,
+        None => {
+            return json_error(StatusCode::NOT_FOUND, "metrics_not_available");
+        }
+    };
+
+    // 转换 IP 统计数据为响应格式
+    let mut ips: Vec<IpMetricsEntry> = summary
+        .ip_stats
+        .ips
+        .into_iter()
+        .filter(|ip| {
+            // IP 筛选
+            if let Some(ref filter) = query.ip {
+                if !filter.is_empty() && !ip.ip.contains(filter) {
+                    return false;
+                }
+            }
+            true
+        })
+        .map(|ip| {
+            // 根据时间窗口获取对应的请求数
+            let requests = match query.window.as_str() {
+                "5m" => ip.requests_5m,
+                "1h" => ip.requests_1h,
+                "24h" => ip.requests_24h,
+                "1w" => ip.requests_7d,
+                "1m" => ip.requests_30d,
+                _ => ip.requests_1h,
+            };
+
+            // 从 urls 中提取路由信息
+            let routes: Vec<String> = ip.urls.iter().map(|u| u.url.clone()).collect();
+
+            // 从 tokens 中提取 token 信息
+            let tokens: Vec<String> = ip.tokens.iter().map(|t| t.token.clone()).collect();
+
+            IpMetricsEntry {
+                ip: ip.ip,
+                requests,
+                // 目前 observability 模块不记录错误数、字节数和延迟，使用默认值
+                errors: 0,
+                bytes_in: 0,
+                bytes_out: 0,
+                latency_avg_ms: 0,
+                latency_p99_ms: 0,
+                routes,
+                tokens,
+                // 目前不记录首次/最后访问时间，使用当前时间
+                first_seen_unix_ms: summary.generated_at_unix_ms,
+                last_seen_unix_ms: summary.generated_at_unix_ms,
+            }
+        })
+        .collect();
+
+    // 排序
+    ips.sort_by(|a, b| {
+        let cmp = match query.sort_by.as_str() {
+            "requests" => a.requests.cmp(&b.requests),
+            "errors" => a.errors.cmp(&b.errors),
+            "bytes_in" => a.bytes_in.cmp(&b.bytes_in),
+            "bytes_out" => a.bytes_out.cmp(&b.bytes_out),
+            "latency_avg" => a.latency_avg_ms.cmp(&b.latency_avg_ms),
+            _ => a.requests.cmp(&b.requests),
+        };
+        if sort_desc {
+            cmp.reverse()
+        } else {
+            cmp
+        }
+    });
+
+    // 限制数量
+    let total_ips = ips.len();
+    let total_requests: u64 = ips.iter().map(|ip| ip.requests).sum();
+    let total_errors: u64 = ips.iter().map(|ip| ip.errors).sum();
+    ips.truncate(limit);
+
+    let response = IpMetricsResponse {
+        generated_at_unix_ms: summary.generated_at_unix_ms,
+        window: query.window,
+        window_seconds: window_seconds as u64,
+        total_ips,
+        total_requests,
+        total_errors,
+        ips,
+    };
+
+    json_ok(&response)
 }
 
 async fn admin_login_handler(State(state): State<AppState>) -> Response<Body> {

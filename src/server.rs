@@ -648,6 +648,9 @@ async fn proxy_handler(State(state): State<AppState>, request: Request<Body>) ->
         None
     };
 
+    // 提前提取 client_ip，因为 request 会被 move
+    let client_ip = extract_client_ip(request.headers());
+
     if let Some(metrics) = &metrics {
         metrics.inc_inflight(route.id.as_str());
     }
@@ -668,6 +671,17 @@ async fn proxy_handler(State(state): State<AppState>, request: Request<Body>) ->
                 && is_sse
             {
                 metrics.inc_sse_inflight(route.id.as_str());
+            }
+
+            // 记录 IP 统计
+            if let Some(metrics) = &metrics {
+                if let Some(ref ip) = client_ip {
+                    metrics.observe_ip_request(
+                        ip,
+                        &path,
+                        Some(token_label.as_str()),
+                    );
+                }
             }
 
             let bytes_sent = Arc::new(AtomicU64::new(0));
@@ -766,6 +780,31 @@ fn request_observation_with_token<'a>(
         request_id,
         request_started_at,
     }
+}
+
+/// 从请求头中提取客户端 IP 地址
+fn extract_client_ip(headers: &HeaderMap) -> Option<String> {
+    // 按优先级检查各种转发头
+    let header_names = [
+        "x-forwarded-for",
+        "x-real-ip",
+        "cf-connecting-ip",
+        "true-client-ip",
+    ];
+
+    for header_name in header_names {
+        if let Some(value) = headers.get(header_name) {
+            if let Ok(s) = value.to_str() {
+                // x-forwarded-for 可能包含多个 IP，取第一个
+                let ip = s.split(',').next()?.trim();
+                if !ip.is_empty() {
+                    return Some(ip.to_string());
+                }
+            }
+        }
+    }
+
+    None
 }
 
 fn finalize_observed_proxy_response(

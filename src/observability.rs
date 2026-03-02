@@ -28,6 +28,9 @@ use tracing_subscriber::layer::SubscriberExt;
 pub const REQUEST_ID_HEADER: &str = "x-request-id";
 const ONE_HOUR_MINUTES: u64 = 60;
 const TWENTY_FOUR_HOURS_MINUTES: u64 = 24 * 60;
+const ONE_WEEK_MINUTES: u64 = 7 * 24 * 60;
+const ONE_MONTH_MINUTES: u64 = 30 * 24 * 60;
+const FIVE_MINUTES: u64 = 5;
 
 type FileLogWriter = (
     Option<tracing_appender::non_blocking::NonBlocking>,
@@ -245,6 +248,17 @@ impl GatewayMetrics {
             .dec();
     }
 
+    pub fn observe_ip_request(
+        &self,
+        ip: &str,
+        url: &str,
+        token_label: Option<&str>,
+    ) {
+        if let Ok(mut state) = self.summary_state.lock() {
+            state.observe_ip_request(ip, url, token_label, epoch_minute_now());
+        }
+    }
+
     pub fn encode(&self) -> String {
         let mut output = String::new();
         if let Ok(registry) = self.registry.read() {
@@ -302,6 +316,41 @@ pub struct ObservabilitySummary {
     pub total_requests_24h: u64,
     pub routes: Vec<RouteWindowSummary>,
     pub tokens: Vec<TokenWindowSummary>,
+    pub ip_stats: IPStatsSummary,
+}
+
+#[derive(Clone, Debug, Serialize, Default)]
+pub struct IPStatsSummary {
+    pub total_requests_5m: u64,
+    pub total_requests_1h: u64,
+    pub total_requests_24h: u64,
+    pub total_requests_7d: u64,
+    pub total_requests_30d: u64,
+    pub ips: Vec<IPWindowSummary>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct IPWindowSummary {
+    pub ip: String,
+    pub requests_5m: u64,
+    pub requests_1h: u64,
+    pub requests_24h: u64,
+    pub requests_7d: u64,
+    pub requests_30d: u64,
+    pub urls: Vec<UrlSummary>,
+    pub tokens: Vec<IPTokenSummary>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct UrlSummary {
+    pub url: String,
+    pub count: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct IPTokenSummary {
+    pub token: String,
+    pub count: u64,
 }
 
 impl ObservabilitySummary {
@@ -312,6 +361,7 @@ impl ObservabilitySummary {
             total_requests_24h: 0,
             routes: Vec::new(),
             tokens: Vec::new(),
+            ip_stats: IPStatsSummary::default(),
         }
     }
 }
@@ -346,11 +396,26 @@ struct RouteMinuteBucket {
     max_inflight: u64,
 }
 
+// IP 监控数据结构
+#[derive(Clone, Debug, Default)]
+struct IPMinuteBucket {
+    minute_epoch: u64,
+    requests: u64,
+    urls: HashMap<String, u64>,
+    tokens: HashMap<String, u64>,
+}
+
+#[derive(Debug, Default)]
+struct IPStats {
+    buckets: VecDeque<IPMinuteBucket>,
+}
+
 #[derive(Debug, Default)]
 struct SummaryState {
     route_buckets: HashMap<String, VecDeque<RouteMinuteBucket>>,
     token_buckets: HashMap<String, VecDeque<RequestMinuteBucket>>,
     route_inflight: HashMap<String, u64>,
+    ip_stats: HashMap<String, IPStats>,
 }
 
 impl SummaryState {
@@ -374,6 +439,63 @@ impl SummaryState {
         }
 
         self.prune(minute_epoch);
+    }
+
+    fn observe_ip_request(
+        &mut self,
+        ip: &str,
+        url: &str,
+        token_label: Option<&str>,
+        minute_epoch: u64,
+    ) {
+        let ip_stats = self.ip_stats.entry(ip.to_string()).or_default();
+
+        // 查找或创建当前分钟的 bucket
+        let bucket = if let Some(existing) = ip_stats
+            .buckets
+            .iter_mut()
+            .find(|b| b.minute_epoch == minute_epoch)
+        {
+            existing
+        } else {
+            ip_stats.buckets.push_back(IPMinuteBucket {
+                minute_epoch,
+                requests: 0,
+                urls: HashMap::new(),
+                tokens: HashMap::new(),
+            });
+            ip_stats.buckets.back_mut().unwrap()
+        };
+
+        bucket.requests = bucket.requests.saturating_add(1);
+
+        // 记录 URL
+        let url_entry = bucket.urls.entry(url.to_string()).or_insert(0);
+        *url_entry = url_entry.saturating_add(1);
+
+        // 记录 token
+        if let Some(label) = token_label {
+            let token_entry = bucket.tokens.entry(label.to_string()).or_insert(0);
+            *token_entry = token_entry.saturating_add(1);
+        }
+
+        // 清理过期数据（保留30天）
+        self.prune_ip_stats(minute_epoch);
+    }
+
+    fn prune_ip_stats(&mut self, minute_epoch: u64) {
+        let cutoff = minute_epoch.saturating_sub(ONE_MONTH_MINUTES.saturating_sub(1));
+
+        let mut empty_ips = Vec::new();
+        for (ip, stats) in &mut self.ip_stats {
+            stats.buckets.retain(|b| b.minute_epoch >= cutoff);
+            if stats.buckets.is_empty() {
+                empty_ips.push(ip.clone());
+            }
+        }
+        for ip in empty_ips {
+            self.ip_stats.remove(&ip);
+        }
     }
 
     fn adjust_inflight(&mut self, route_id: &str, delta: i64, minute_epoch: u64) {
@@ -423,6 +545,9 @@ impl SummaryState {
         for token in empty_tokens {
             self.token_buckets.remove(token.as_str());
         }
+
+        // 清理 IP 统计
+        self.prune_ip_stats(minute_epoch);
     }
 
     fn snapshot(&self) -> ObservabilitySummary {
@@ -514,12 +639,124 @@ impl SummaryState {
         let total_requests_24h = routes
             .iter()
             .fold(0_u64, |acc, route| acc.saturating_add(route.requests_24h));
+
+        // 聚合 IP 统计
+        let ip_stats = self.snapshot_ip_stats(now_minute);
+
         ObservabilitySummary {
             generated_at_unix_ms: epoch_millis_now(),
             total_requests_1h,
             total_requests_24h,
             routes,
             tokens,
+            ip_stats,
+        }
+    }
+
+    fn snapshot_ip_stats(&self, now_minute: u64) -> IPStatsSummary {
+        let minute_5m = now_minute.saturating_sub(FIVE_MINUTES.saturating_sub(1));
+        let minute_1h = now_minute.saturating_sub(ONE_HOUR_MINUTES.saturating_sub(1));
+        let minute_24h = now_minute.saturating_sub(TWENTY_FOUR_HOURS_MINUTES.saturating_sub(1));
+        let minute_7d = now_minute.saturating_sub(ONE_WEEK_MINUTES.saturating_sub(1));
+        let minute_30d = now_minute.saturating_sub(ONE_MONTH_MINUTES.saturating_sub(1));
+
+        let mut ip_summaries: Vec<IPWindowSummary> = self
+            .ip_stats
+            .iter()
+            .map(|(ip, stats)| {
+                let mut requests_5m = 0_u64;
+                let mut requests_1h = 0_u64;
+                let mut requests_24h = 0_u64;
+                let mut requests_7d = 0_u64;
+                let mut requests_30d = 0_u64;
+
+                // URL 和 token 聚合（24小时窗口）
+                let mut url_counts: HashMap<String, u64> = HashMap::new();
+                let mut token_counts: HashMap<String, u64> = HashMap::new();
+
+                for bucket in &stats.buckets {
+                    if bucket.minute_epoch >= minute_30d {
+                        requests_30d = requests_30d.saturating_add(bucket.requests);
+                        if bucket.minute_epoch >= minute_7d {
+                            requests_7d = requests_7d.saturating_add(bucket.requests);
+                            if bucket.minute_epoch >= minute_24h {
+                                requests_24h = requests_24h.saturating_add(bucket.requests);
+                                // 只聚合24小时内的 URL 和 token
+                                for (url, count) in &bucket.urls {
+                                    let entry = url_counts.entry(url.clone()).or_insert(0);
+                                    *entry = entry.saturating_add(*count);
+                                }
+                                for (token, count) in &bucket.tokens {
+                                    let entry = token_counts.entry(token.clone()).or_insert(0);
+                                    *entry = entry.saturating_add(*count);
+                                }
+                                if bucket.minute_epoch >= minute_1h {
+                                    requests_1h = requests_1h.saturating_add(bucket.requests);
+                                    if bucket.minute_epoch >= minute_5m {
+                                        requests_5m = requests_5m.saturating_add(bucket.requests);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let mut urls: Vec<UrlSummary> = url_counts
+                    .into_iter()
+                    .map(|(url, count)| UrlSummary { url, count })
+                    .collect();
+                urls.sort_by(|a, b| b.count.cmp(&a.count));
+                urls.truncate(10); // 只保留 top 10 URL
+
+                let mut tokens: Vec<IPTokenSummary> = token_counts
+                    .into_iter()
+                    .map(|(token, count)| IPTokenSummary { token, count })
+                    .collect();
+                tokens.sort_by(|a, b| b.count.cmp(&a.count));
+
+                IPWindowSummary {
+                    ip: ip.clone(),
+                    requests_5m,
+                    requests_1h,
+                    requests_24h,
+                    requests_7d,
+                    requests_30d,
+                    urls,
+                    tokens,
+                }
+            })
+            .filter(|ip| ip.requests_30d > 0)
+            .collect();
+
+        ip_summaries.sort_by(|a, b| {
+            b.requests_24h
+                .cmp(&a.requests_24h)
+                .then_with(|| a.ip.cmp(&b.ip))
+        });
+
+        let total_requests_5m = ip_summaries.iter().fold(0_u64, |acc, ip| {
+            acc.saturating_add(ip.requests_5m)
+        });
+        let total_requests_1h = ip_summaries.iter().fold(0_u64, |acc, ip| {
+            acc.saturating_add(ip.requests_1h)
+        });
+        let total_requests_24h = ip_summaries.iter().fold(0_u64, |acc, ip| {
+            acc.saturating_add(ip.requests_24h)
+        });
+        let total_requests_7d = ip_summaries.iter().fold(0_u64, |acc, ip| {
+            acc.saturating_add(ip.requests_7d)
+        });
+        let total_requests_30d = ip_summaries.iter().fold(0_u64, |acc, ip| {
+            acc.saturating_add(ip.requests_30d)
+        });
+
+        IPStatsSummary {
+            total_requests_5m,
+            total_requests_1h,
+            total_requests_24h,
+            total_requests_7d,
+            total_requests_30d,
+            ips: ip_summaries,
         }
     }
 }
