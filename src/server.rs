@@ -9,7 +9,7 @@ use crate::ratelimit::{RateLimitDecision, RateLimiter};
 use crate::tls;
 use arc_swap::ArcSwap;
 use axum::body::{Body, Bytes};
-use axum::extract::State;
+use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, Method, Request, Response, StatusCode};
 use axum::routing::{any, get};
 use axum::{Json, Router, response::IntoResponse};
@@ -413,7 +413,11 @@ fn metrics_dashboard_html(summary_path: &str) -> String {
     )
 }
 
-async fn proxy_handler(State(state): State<AppState>, request: Request<Body>) -> Response<Body> {
+async fn proxy_handler(
+    State(state): State<AppState>,
+    ConnectInfo(client_addr): ConnectInfo<SocketAddr>,
+    request: Request<Body>,
+) -> Response<Body> {
     let runtime = state.runtime.load();
     let request_started_at = tokio::time::Instant::now();
     let method = request.method().clone();
@@ -423,6 +427,9 @@ async fn proxy_handler(State(state): State<AppState>, request: Request<Body>) ->
     let request_id = observability::extract_or_generate_request_id(request.headers());
     let cors_config = runtime.config.cors.as_ref().filter(|cors| cors.enabled);
     let metrics = state.observability.metrics.clone();
+
+    // 获取客户端 IP（优先从转发头，否则从 TCP 连接）
+    let client_ip = extract_client_ip(request.headers(), &client_addr);
 
     // 检查是否是 admin 路径，如果是则不记录监控统计
     let is_admin_path = state
@@ -648,9 +655,6 @@ async fn proxy_handler(State(state): State<AppState>, request: Request<Body>) ->
         None
     };
 
-    // 提前提取 client_ip，因为 request 会被 move
-    let client_ip = extract_client_ip(request.headers());
-
     if let Some(metrics) = &metrics {
         metrics.inc_inflight(route.id.as_str());
     }
@@ -780,9 +784,9 @@ fn request_observation_with_token<'a>(
     }
 }
 
-/// 从请求头中提取客户端 IP 地址
-fn extract_client_ip(headers: &HeaderMap) -> String {
-    // 按优先级检查各种转发头
+/// 从请求头或 TCP 连接中提取客户端 IP 地址
+fn extract_client_ip(headers: &HeaderMap, client_addr: &SocketAddr) -> String {
+    // 按优先级检查各种转发头（适用于反向代理场景）
     let header_names = [
         "x-forwarded-for",
         "x-real-ip",
@@ -804,8 +808,8 @@ fn extract_client_ip(headers: &HeaderMap) -> String {
         }
     }
 
-    // 如果没有转发头，返回 "direct" 表示直连
-    "direct".to_string()
+    // 如果没有转发头，使用 TCP 连接的客户端地址
+    client_addr.ip().to_string()
 }
 
 fn finalize_observed_proxy_response(
