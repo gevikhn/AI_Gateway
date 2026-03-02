@@ -1,11 +1,12 @@
 // AI Gateway Admin UI - JavaScript
 
 const CONFIG = {
-  apiUrl: '{{API_CONFIG_URL}}',
-  saveUrl: '{{API_SAVE_URL}}'
+  apiUrl: window.CONFIG?.apiUrl || '{{API_CONFIG_URL}}',
+  saveUrl: window.CONFIG?.saveUrl || '{{API_SAVE_URL}}',
+  adminPrefix: window.CONFIG?.adminPrefix || '/admin'
 };
 
-const TOKEN_KEY = 'ai_gw_admin_token';
+const TOKEN_KEY = 'ai_gateway_admin_token';
 let cfg = null;
 let loadingStates = new Map();
 
@@ -211,15 +212,24 @@ class FormValidator {
 }
 
 // ===== Token 管理 =====
-const tokenInput = document.getElementById('token');
-if (tokenInput) {
-  tokenInput.value = localStorage.getItem(TOKEN_KEY) || '';
+function getToken() {
+  return localStorage.getItem(TOKEN_KEY);
 }
 
-function getToken() {
-  const t = tokenInput.value.trim();
-  if (t) localStorage.setItem(TOKEN_KEY, t);
-  return t;
+function logout() {
+  localStorage.removeItem(TOKEN_KEY);
+  window.location.href = CONFIG.adminPrefix + '/login';
+}
+
+// 检查登录状态
+function checkAuth() {
+  const token = getToken();
+  if (!token) {
+    // 未登录，跳转到登录页
+    window.location.href = CONFIG.adminPrefix + '/login';
+    return false;
+  }
+  return true;
 }
 
 // ===== 标签页系统 =====
@@ -268,13 +278,9 @@ function switchTab(id) {
 async function loadConfig() {
   const token = getToken();
   if (!token) {
-    Toast.show('请先填写 Admin Token', 'error');
+    logout();
     return;
   }
-
-  const btn = document.querySelector('button[onclick="loadConfig()"]');
-  const loading = new LoadingState(btn);
-  loading.start();
 
   try {
     const res = await fetch(CONFIG.apiUrl, {
@@ -282,18 +288,24 @@ async function loadConfig() {
       cache: 'no-store'
     });
 
+    if (res.status === 401) {
+      // Token 无效，清除并跳转
+      localStorage.removeItem(TOKEN_KEY);
+      logout();
+      return;
+    }
+
     if (!res.ok) {
       throw new Error('HTTP ' + res.status);
     }
 
     cfg = await res.json();
     renderAll();
-    document.getElementById('actionBar').style.display = 'flex';
+    const actionBar = document.getElementById('actionBar');
+    if (actionBar) actionBar.style.display = '';
     Toast.show('配置已加载', 'success');
   } catch (e) {
     Toast.show('加载失败: ' + e.message, 'error');
-  } finally {
-    loading.stop();
   }
 }
 
@@ -772,7 +784,7 @@ function renderAdvanced() {
 async function applyConfig() {
   const token = getToken();
   if (!token) {
-    Toast.show('请先填写 Admin Token', 'error');
+    logout();
     return;
   }
   if (!cfg) {
@@ -807,7 +819,7 @@ async function applyConfig() {
 async function saveConfig() {
   const token = getToken();
   if (!token) {
-    Toast.show('请先填写 Admin Token', 'error');
+    logout();
     return;
   }
 
@@ -826,7 +838,13 @@ async function saveConfig() {
       throw new Error(data.error || res.status);
     }
 
-    Toast.show('配置已保存到 ' + (data.path || '文件'), 'success');
+    // 更新保存状态显示
+    const saveStatus = document.getElementById('saveStatus');
+    if (saveStatus) {
+      const now = new Date();
+      saveStatus.textContent = `已保存 ${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`;
+    }
+    Toast.show('配置已保存', 'success');
   } catch (e) {
     Toast.show('保存失败: ' + e.message, 'error');
   } finally {
@@ -841,11 +859,13 @@ function esc(s) {
 
 // ===== 初始化 =====
 document.addEventListener('DOMContentLoaded', () => {
+  // 检查登录状态
+  if (!checkAuth()) {
+    return;
+  }
+
   initTabs();
 
-  // 添加表单验证
-  const toolbar = document.querySelector('.toolbar');
-  if (toolbar) {
-    new FormValidator(toolbar);
-  }
+  // 自动加载配置
+  loadConfig();
 });

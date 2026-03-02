@@ -13,6 +13,7 @@ pub fn register_admin_routes(router: Router<AppState>, prefix: &str) -> Router<A
     let prefix = prefix.trim_end_matches('/');
     router
         .route(&format!("{prefix}/ui"), get(admin_ui_handler))
+        .route(&format!("{prefix}/login"), get(admin_login_handler))
         .route(
             &format!("{prefix}/api/config"),
             get(admin_config_get_handler).put(admin_config_apply_handler),
@@ -184,11 +185,34 @@ async fn admin_config_save_handler(
     }))
 }
 
+async fn admin_login_handler(State(state): State<AppState>) -> Response<Body> {
+    let prefix = state.admin_path_prefix.as_deref().unwrap_or("/admin");
+    let api_config_url = format!("{prefix}/api/config");
+    let api_save_url = format!("{prefix}/api/config/save");
+
+    let html = LOGIN_TEMPLATE
+        .replace("{{CSS}}", CSS_STYLES)
+        .replace("{{JS}}", LOGIN_JS)
+        .replace("{{API_CONFIG_URL}}", &api_config_url)
+        .replace("{{API_SAVE_URL}}", &api_save_url)
+        .replace("{{ADMIN_PREFIX}}", prefix);
+
+    let mut response = Response::new(Body::from(html));
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        http::HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    response
+}
+
 // 静态文件嵌入 - 使用 include_str! 在编译时嵌入
 // 注意：路径相对于 src/admin.rs 所在位置
 const HTML_TEMPLATE: &str = include_str!("./admin/static/index.html");
+const LOGIN_TEMPLATE: &str = include_str!("./admin/static/login.html");
 const CSS_STYLES: &str = include_str!("./admin/static/styles.css");
 const JS_APP: &str = include_str!("./admin/static/app.js");
+const LOGIN_JS: &str = include_str!("./admin/static/login.js");
 
 fn admin_dashboard_html(prefix: &str) -> String {
     let api_config_url = format!("{prefix}/api/config");
@@ -199,4 +223,5 @@ fn admin_dashboard_html(prefix: &str) -> String {
         .replace("{{JS}}", JS_APP)
         .replace("{{API_CONFIG_URL}}", &api_config_url)
         .replace("{{API_SAVE_URL}}", &api_save_url)
+        .replace("{{ADMIN_PREFIX}}", prefix)
 }
