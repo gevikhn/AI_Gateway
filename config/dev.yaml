@@ -9,7 +9,7 @@ listen: "127.0.0.1:8080"
 #   self_signed_key_path: "./certs/gateway-selfsigned.key"
 
 gateway_auth:
-  tokens:
+  api_keys:
     - "gw_dev_token"
   token_sources:
     - type: "authorization_bearer"
@@ -19,6 +19,12 @@ gateway_auth:
 routes:
   - id: "openai"
     prefix: "/openai"
+    # Route-level API keys for multi-tenant isolation
+    # If specified, only these keys can access this route (global tokens won't work)
+    # If not specified, falls back to global gateway_auth.api_keys
+    api_keys:
+      - "openai_tenant_key_1"
+      - "openai_tenant_key_2"
     upstream:
       base_url: "https://api.openai.com"
       strip_prefix: true
@@ -69,6 +75,12 @@ observability:
     token: "metrics_dev_token"
     # 内置轻量观测页面: /metrics/ui
     # 观测 JSON 摘要接口: /metrics/summary (Bearer metrics_dev_token)
+    # SQLite 持久化配置 - 重启后保留监控数据
+    sqlite:
+      path: "./data/metrics.db"
+      flush_interval_secs: 60
+      batch_size: 1000
+      retention_days: 7
   tracing:
     enabled: true
     sample_ratio: 0.05

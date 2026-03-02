@@ -953,12 +953,13 @@ fn gateway_config(upstream_addr: String, request_timeout_ms: u64) -> AppConfig {
     AppConfig {
         listen: "127.0.0.1:8080".to_string(),
         gateway_auth: GatewayAuthConfig {
-            tokens: vec!["gw_token".to_string()],
+            api_keys: vec!["gw_token".to_string()],
             token_sources: vec![TokenSourceConfig::AuthorizationBearer],
         },
         routes: vec![RouteConfig {
             id: "openai".to_string(),
             prefix: "/openai".to_string(),
+            api_keys: None,
             upstream: UpstreamConfig {
                 base_url: format!("http://{upstream_addr}"),
                 strip_prefix: true,
@@ -981,6 +982,7 @@ fn gateway_config(upstream_addr: String, request_timeout_ms: u64) -> AppConfig {
                 user_agent: None,
             },
         }],
+        api_keys: None,
         inbound_tls: None,
         cors: None,
         rate_limit: None,

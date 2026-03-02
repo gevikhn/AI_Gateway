@@ -16,6 +16,7 @@ name = "ai-gw-lite"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "async-trait",
  "axum 0.8.8",
  "axum-server",
  "chrono",
@@ -33,6 +34,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sqlx",
+ "thiserror 2.0.18",
  "tokio",
  "tower 0.5.3",
  "tracing",

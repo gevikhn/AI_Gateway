@@ -86,8 +86,10 @@ impl ObservabilityRuntime {
                 None
             };
 
+            let metrics = Arc::new(GatewayMetrics::new(storage.clone()).await);
+
             return Ok(Self {
-                metrics: Some(Arc::new(GatewayMetrics::new(storage.clone()))),
+                metrics: Some(metrics),
                 metrics_path: Some(metrics_path.clone()),
                 metrics_ui_path: Some(metrics_sub_path(metrics_path.as_str(), "ui")),
                 metrics_summary_path: Some(metrics_sub_path(metrics_path.as_str(), "summary")),
@@ -145,7 +147,8 @@ pub struct GatewayMetrics {
 }
 
 impl GatewayMetrics {
-    pub fn new(storage: Option<Arc<MetricsStorage>>) -> Self {
+    /// Synchronous constructor for Default
+    fn new_sync(storage: Option<Arc<MetricsStorage>>) -> Self {
         let requests_total = Family::<RequestCounterLabels, Counter>::default();
         let request_duration_seconds =
             Family::<RequestDurationLabels, Histogram>::new_with_constructor(|| {
@@ -195,6 +198,37 @@ impl GatewayMetrics {
             summary_state: Mutex::new(SummaryState::default()),
             storage,
         }
+    }
+
+    /// Asynchronous constructor that loads historical data from SQLite
+    pub async fn new(storage: Option<Arc<MetricsStorage>>) -> Self {
+        // Load historical data first (before creating the instance)
+        // to avoid holding MutexGuard across await points
+        let historical_data = if let Some(storage) = &storage {
+            match storage.load_historical_data().await {
+                Ok(data) => Some(data),
+                Err(e) => {
+                    warn!("Failed to load historical metrics data: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let metrics = Self::new_sync(storage);
+
+        // Apply historical data if loaded successfully
+        if let Some((route_buckets, route_token_buckets, ip_stats)) = historical_data {
+            if let Ok(mut state) = metrics.summary_state.lock() {
+                state.route_buckets = route_buckets;
+                state.route_token_buckets = route_token_buckets;
+                state.ip_stats = ip_stats;
+            }
+            info!("Historical metrics data loaded successfully");
+        }
+
+        metrics
     }
 
     pub fn observe_request(
@@ -357,7 +391,7 @@ impl GatewayMetrics {
 
 impl Default for GatewayMetrics {
     fn default() -> Self {
-        Self::new(None)
+        Self::new_sync(None)
     }
 }
 
@@ -458,6 +492,7 @@ pub struct RouteWindowSummary {
 #[derive(Clone, Debug, Serialize)]
 pub struct TokenWindowSummary {
     pub token: String,
+    pub route_id: String,
     pub requests_1h: u64,
     pub requests_24h: u64,
 }
@@ -492,7 +527,8 @@ struct IPStats {
 #[derive(Debug, Default)]
 struct SummaryState {
     route_buckets: HashMap<String, VecDeque<RouteMinuteBucket>>,
-    token_buckets: HashMap<String, VecDeque<RequestMinuteBucket>>,
+    // Changed from global token_buckets to route-isolated: route_id -> token_label -> buckets
+    route_token_buckets: HashMap<String, HashMap<String, VecDeque<RequestMinuteBucket>>>,
     route_inflight: HashMap<String, u64>,
     ip_stats: HashMap<String, IPStats>,
 }
@@ -508,13 +544,15 @@ impl SummaryState {
             route_bucket.max_inflight = route_bucket.max_inflight.max(current_inflight);
         }
 
-        if let Some(label) = token_label
-            && let Some(token_bucket) = ensure_request_bucket(
-                self.token_buckets.entry(label.to_string()).or_default(),
+        // Route-isolated token stats: route_id -> token_label -> buckets
+        if let Some(label) = token_label {
+            let route_tokens = self.route_token_buckets.entry(route_id.to_string()).or_default();
+            if let Some(token_bucket) = ensure_request_bucket(
+                route_tokens.entry(label.to_string()).or_default(),
                 minute_epoch,
-            )
-        {
-            token_bucket.requests = token_bucket.requests.saturating_add(1);
+            ) {
+                token_bucket.requests = token_bucket.requests.saturating_add(1);
+            }
         }
 
         self.prune(minute_epoch);
@@ -614,15 +652,25 @@ impl SummaryState {
             *inflight > 0 || self.route_buckets.contains_key(route_id)
         });
 
-        let mut empty_tokens = Vec::new();
-        for (token, buckets) in &mut self.token_buckets {
-            prune_old_request_buckets(buckets, cutoff);
-            if buckets.is_empty() {
-                empty_tokens.push(token.clone());
+        // 清理 route-isolated token stats
+        let mut empty_routes_for_tokens = Vec::new();
+        for (route_id, token_map) in &mut self.route_token_buckets {
+            let mut empty_tokens = Vec::new();
+            for (token, buckets) in token_map.iter_mut() {
+                prune_old_request_buckets(buckets, cutoff);
+                if buckets.is_empty() {
+                    empty_tokens.push(token.clone());
+                }
+            }
+            for token in empty_tokens {
+                token_map.remove(&token);
+            }
+            if token_map.is_empty() {
+                empty_routes_for_tokens.push(route_id.clone());
             }
         }
-        for token in empty_tokens {
-            self.token_buckets.remove(token.as_str());
+        for route_id in empty_routes_for_tokens {
+            self.route_token_buckets.remove(&route_id);
         }
 
         // 清理 IP 统计
@@ -684,10 +732,10 @@ impl SummaryState {
                 .then_with(|| left.route_id.cmp(&right.route_id))
         });
 
-        let mut tokens: Vec<TokenWindowSummary> = self
-            .token_buckets
-            .iter()
-            .map(|(token, buckets)| {
+        // Collect route-isolated token stats
+        let mut tokens: Vec<TokenWindowSummary> = Vec::new();
+        for (route_id, token_map) in &self.route_token_buckets {
+            for (token, buckets) in token_map {
                 let mut requests_1h = 0_u64;
                 let mut requests_24h = 0_u64;
                 for bucket in buckets {
@@ -698,17 +746,19 @@ impl SummaryState {
                         requests_1h = requests_1h.saturating_add(bucket.requests);
                     }
                 }
-                TokenWindowSummary {
+                tokens.push(TokenWindowSummary {
                     token: token.clone(),
+                    route_id: route_id.clone(),
                     requests_1h,
                     requests_24h,
-                }
-            })
-            .collect();
+                });
+            }
+        }
         tokens.sort_by(|left, right| {
             right
                 .requests_24h
                 .cmp(&left.requests_24h)
+                .then_with(|| left.route_id.cmp(&right.route_id))
                 .then_with(|| left.token.cmp(&right.token))
         });
 
@@ -1309,6 +1359,135 @@ impl MetricsStorage {
     /// Queue a record for batch insertion
     pub fn queue_record(&self, record: MetricsRecord) {
         let _ = self.sender.send(record);
+    }
+
+    /// Load historical data from SQLite and return the data structures
+    pub async fn load_historical_data(
+        &self,
+    ) -> Result<
+        (
+            HashMap<String, VecDeque<RouteMinuteBucket>>,
+            HashMap<String, HashMap<String, VecDeque<RequestMinuteBucket>>>,
+            HashMap<String, IPStats>,
+        ),
+        String,
+    > {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        // Load data for the last 24 hours (in minutes)
+        let twenty_four_hours_ago = now - (24 * 60 * 60);
+        let one_month_ago = now - (30 * 24 * 60 * 60);
+
+        let mut route_buckets: HashMap<String, VecDeque<RouteMinuteBucket>> = HashMap::new();
+        let mut route_token_buckets: HashMap<String, HashMap<String, VecDeque<RequestMinuteBucket>>> =
+            HashMap::new();
+        let mut ip_stats: HashMap<String, IPStats> = HashMap::new();
+
+        // Load route and token stats from metrics_requests table
+        let rows = sqlx::query_as::<_, (String, String, i64, i64)>(
+            r#"
+            SELECT
+                route_id,
+                COALESCE(token_label, '') as token_label,
+                (timestamp / 60) as minute_epoch,
+                COUNT(*) as request_count
+            FROM metrics_requests
+            WHERE timestamp >= ?
+            GROUP BY route_id, token_label, minute_epoch
+            ORDER BY minute_epoch DESC
+            "#,
+        )
+        .bind(twenty_four_hours_ago)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| format!("Failed to load historical metrics: {}", e))?;
+
+        for (route_id, token_label, minute_epoch, request_count) in rows {
+            let minute_epoch = minute_epoch as u64;
+
+            // Update route buckets
+            let buckets = route_buckets.entry(route_id.clone()).or_default();
+            if let Some(bucket) = ensure_route_bucket(buckets, minute_epoch) {
+                bucket.requests = bucket.requests.saturating_add(request_count as u64);
+            }
+
+            // Update token buckets
+            if !token_label.is_empty() {
+                let route_tokens = route_token_buckets.entry(route_id).or_default();
+                let token_buckets = route_tokens.entry(token_label).or_default();
+                if let Some(bucket) = ensure_request_bucket(token_buckets, minute_epoch) {
+                    bucket.requests = bucket.requests.saturating_add(request_count as u64);
+                }
+            }
+        }
+
+        // Load IP stats
+        let ip_rows = sqlx::query_as::<_, (String, String, String, i64, i64)>(
+            r#"
+            SELECT
+                client_ip,
+                request_path,
+                COALESCE(token_label, '') as token_label,
+                (timestamp / 60) as minute_epoch,
+                COUNT(*) as request_count
+            FROM metrics_requests
+            WHERE timestamp >= ? AND client_ip IS NOT NULL
+            GROUP BY client_ip, request_path, token_label, minute_epoch
+            ORDER BY minute_epoch DESC
+            "#,
+        )
+        .bind(one_month_ago)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| format!("Failed to load historical IP stats: {}", e))?;
+
+        for (client_ip, request_path, token_label, minute_epoch, request_count) in ip_rows {
+            let minute_epoch = minute_epoch as u64;
+
+            let ip_stat = ip_stats.entry(client_ip).or_default();
+
+            // Find or create the bucket for this minute
+            let bucket = if let Some(existing) = ip_stat.buckets.iter_mut().find(|b| b.minute_epoch == minute_epoch) {
+                existing
+            } else {
+                ip_stat.buckets.push_back(IPMinuteBucket {
+                    minute_epoch,
+                    requests: 0,
+                    urls: HashMap::new(),
+                    tokens: HashMap::new(),
+                });
+                ip_stat.buckets.back_mut().unwrap()
+            };
+
+            bucket.requests = bucket.requests.saturating_add(request_count as u64);
+
+            if !request_path.is_empty() {
+                let url_entry = bucket.urls.entry(request_path).or_insert(0);
+                *url_entry = url_entry.saturating_add(request_count as u64);
+            }
+
+            if !token_label.is_empty() {
+                let token_entry = bucket.tokens.entry(token_label).or_insert(0);
+                *token_entry = token_entry.saturating_add(request_count as u64);
+            }
+        }
+
+        let total_routes: usize = route_buckets.values().map(|b| b.len()).sum();
+        let total_tokens: usize = route_token_buckets
+            .values()
+            .map(|m| m.values().map(|b| b.len()).sum::<usize>())
+            .sum();
+        info!(
+            "Loaded historical metrics: {} route buckets, {} token buckets, {} IPs",
+            total_routes,
+            total_tokens,
+            ip_stats.len()
+        );
+
+        Ok((route_buckets, route_token_buckets, ip_stats))
     }
 
     async fn batch_writer_task(

@@ -11,23 +11,27 @@ pub struct AppConfig {
     pub listen: String,
     pub gateway_auth: GatewayAuthConfig,
     pub routes: Vec<RouteConfig>,
-    #[serde(default)]
+    /// API Key 全局配置（独立管理）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_keys: Option<ApiKeysGlobalConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inbound_tls: Option<InboundTlsConfig>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cors: Option<CorsConfig>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit: Option<RateLimitConfig>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub concurrency: Option<ConcurrencyConfig>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observability: Option<ObservabilityConfig>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub admin: Option<AdminConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GatewayAuthConfig {
-    pub tokens: Vec<String>,
+    #[serde(alias = "tokens")]
+    pub api_keys: Vec<String>,
     #[serde(default = "default_token_sources")]
     pub token_sources: Vec<TokenSourceConfig>,
 }
@@ -44,6 +48,10 @@ pub struct RouteConfig {
     pub id: String,
     pub prefix: String,
     pub upstream: UpstreamConfig,
+    /// Route-level API keys for multi-tenant isolation
+    /// If not specified, falls back to global gateway_auth.api_keys
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_keys: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,17 +63,17 @@ pub struct UpstreamConfig {
     pub connect_timeout_ms: u64,
     #[serde(default = "default_request_timeout_ms")]
     pub request_timeout_ms: u64,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inject_headers: Vec<HeaderInjection>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub remove_headers: Vec<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub forward_xff: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy: Option<UpstreamProxyConfig>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_key_max_inflight: Option<usize>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_agent: Option<String>,
 }
 
@@ -79,9 +87,9 @@ pub struct HeaderInjection {
 pub struct UpstreamProxyConfig {
     pub protocol: ProxyProtocol,
     pub address: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
 }
 
@@ -95,9 +103,9 @@ pub enum ProxyProtocol {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InboundTlsConfig {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cert_path: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_path: Option<String>,
     #[serde(default = "default_self_signed_cert_path")]
     pub self_signed_cert_path: String,
@@ -107,15 +115,15 @@ pub struct InboundTlsConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CorsConfig {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub enabled: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow_origins: Vec<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow_headers: Vec<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow_methods: Vec<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub expose_headers: Vec<String>,
 }
 
@@ -127,9 +135,9 @@ pub struct RateLimitConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConcurrencyConfig {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub downstream_max_inflight: Option<usize>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_per_key_max_inflight: Option<usize>,
 }
 
@@ -153,7 +161,7 @@ pub struct LoggingConfig {
     pub format: LogFormat,
     #[serde(default = "default_true")]
     pub to_stdout: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<LogFileConfig>,
 }
 
@@ -193,14 +201,14 @@ pub enum LogRotation {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MetricsConfig {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub enabled: bool,
     #[serde(default = "default_metrics_path")]
     pub path: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub token: String,
     /// SQLite persistence configuration
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sqlite: Option<MetricsSqliteConfig>,
 }
 
@@ -223,11 +231,11 @@ pub struct MetricsSqliteConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TracingConfig {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub enabled: bool,
     #[serde(default = "default_trace_sample_ratio")]
     pub sample_ratio: f64,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub otlp: Option<OtlpConfig>,
 }
 
@@ -241,12 +249,136 @@ pub struct OtlpConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdminConfig {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub enabled: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub token: String,
     #[serde(default = "default_admin_path_prefix")]
     pub path_prefix: String,
+}
+
+// ==================== API Key Management ====================
+
+/// API Key 全局配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiKeysGlobalConfig {
+    /// API Key 列表
+    pub keys: Vec<ApiKeyConfig>,
+}
+
+/// API Key 配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiKeyConfig {
+    /// 唯一标识符
+    pub id: String,
+    /// 关联的路由ID（None 表示所有路由）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_id: Option<String>,
+    /// API Key 值
+    pub key: String,
+    /// 是否启用
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 备注说明
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub remark: String,
+    /// 限流配置（覆盖全局/路由级）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit: Option<RateLimitConfig>,
+    /// 并发配置（覆盖全局/路由级）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrency: Option<ApiKeyConcurrencyConfig>,
+    /// 封禁规则
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ban_rules: Vec<BanRule>,
+    /// 封禁状态
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ban_status: Option<BanStatus>,
+}
+
+/// 封禁规则
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BanRule {
+    /// 规则ID
+    pub id: String,
+    /// 规则名称
+    pub name: String,
+    /// 触发条件
+    pub condition: BanCondition,
+    /// 封禁时长（秒）
+    pub ban_duration_secs: u64,
+    /// 是否启用
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+/// 封禁触发条件
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum BanCondition {
+    /// 错误率超过阈值
+    ErrorRate {
+        /// 时间窗口（秒）
+        window_secs: u64,
+        /// 错误率阈值（0.0-1.0）
+        threshold: f64,
+        /// 最小请求数（避免样本过少）
+        min_requests: u64,
+    },
+    /// 请求数超过阈值
+    RequestCount {
+        /// 时间窗口（秒）
+        window_secs: u64,
+        /// 最大请求数
+        max_requests: u64,
+    },
+    /// 连续错误数
+    ConsecutiveErrors {
+        /// 连续错误数阈值
+        count: u32,
+    },
+}
+
+/// 封禁状态
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct BanStatus {
+    /// 是否被封禁
+    pub is_banned: bool,
+    /// 封禁开始时间（Unix秒）
+    pub banned_at: Option<u64>,
+    /// 封禁结束时间（Unix秒）
+    pub banned_until: Option<u64>,
+    /// 触发封禁的规则ID
+    pub triggered_rule_id: Option<String>,
+    /// 封禁原因
+    pub reason: Option<String>,
+    /// 历史封禁次数
+    pub ban_count: u32,
+}
+
+/// API Key 级别的并发配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiKeyConcurrencyConfig {
+    /// 该API Key的最大并发请求数（下游）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub downstream_max_inflight: Option<usize>,
+    /// 上游每个key的最大并发
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_per_key_max_inflight: Option<usize>,
+}
+
+/// 运行时解析后的 API Key 配置
+#[derive(Debug, Clone)]
+pub struct ResolvedApiKey {
+    pub id: String,
+    pub key: String,
+    pub route_id: Option<String>,
+    pub enabled: bool,
+    pub remark: String,
+    pub rate_limit: Option<RateLimitConfig>,
+    pub concurrency: Option<ApiKeyConcurrencyConfig>,
+    pub ban_rules: Vec<BanRule>,
+    pub ban_status: Option<BanStatus>,
 }
 
 impl Default for LoggingConfig {
@@ -289,7 +421,125 @@ pub enum ConfigError {
     Validation(String),
 }
 
+/// 生成 API Key 的 ID（基于 key 的 hash）
+fn generate_key_id(key: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    key.hash(&mut hasher);
+    format!("ak-{:016x}", hasher.finish())
+}
+
+impl ResolvedApiKey {
+    /// 从配置创建
+    pub fn from_config(config: &ApiKeyConfig) -> Self {
+        Self {
+            id: config.id.clone(),
+            key: config.key.clone(),
+            route_id: config.route_id.clone(),
+            enabled: config.enabled,
+            remark: config.remark.clone(),
+            rate_limit: config.rate_limit.clone(),
+            concurrency: config.concurrency.clone(),
+            ban_rules: config.ban_rules.clone(),
+            ban_status: config.ban_status.clone(),
+        }
+    }
+
+    /// 从简写格式创建（向后兼容）
+    pub fn from_key_string(key: &str) -> Self {
+        Self {
+            id: generate_key_id(key),
+            key: key.to_string(),
+            route_id: None,
+            enabled: true,
+            remark: String::new(),
+            rate_limit: None,
+            concurrency: None,
+            ban_rules: Vec::new(),
+            ban_status: None,
+        }
+    }
+}
+
 impl AppConfig {
+    /// 获取所有解析后的 API Key 配置（合并所有来源）
+    pub fn resolved_api_keys(&self) -> Vec<ResolvedApiKey> {
+        let mut resolved = Vec::new();
+        let mut seen_keys = HashSet::new();
+
+        // 1. 处理 api_keys.keys（新的全局配置，优先级最高）
+        if let Some(global) = &self.api_keys {
+            for config in &global.keys {
+                if seen_keys.insert(config.key.clone()) {
+                    resolved.push(ResolvedApiKey::from_config(config));
+                }
+            }
+        }
+
+        // 2. 处理 gateway_auth.api_keys（简写格式，向后兼容）
+        for key in &self.gateway_auth.api_keys {
+            if seen_keys.insert(key.clone()) {
+                resolved.push(ResolvedApiKey::from_key_string(key));
+            }
+        }
+
+        // 3. 处理 route.api_keys（路由级白名单，向后兼容）
+        for route in &self.routes {
+            if let Some(route_keys) = &route.api_keys {
+                for key in route_keys {
+                    if seen_keys.insert(key.clone()) {
+                        let mut resolved_key = ResolvedApiKey::from_key_string(key);
+                        resolved_key.route_id = Some(route.id.clone());
+                        resolved_key.remark = format!("Migrated from route {}", route.id);
+                        resolved.push(resolved_key);
+                    }
+                }
+            }
+        }
+
+        resolved
+    }
+
+    /// 获取指定 API Key 的有效限流配置（继承机制：api_key级 > 全局级）
+    pub fn resolve_rate_limit(
+        &self,
+        api_key: &ResolvedApiKey,
+    ) -> Option<RateLimitConfig> {
+        // 优先级1: API Key 级别
+        if let Some(limit) = &api_key.rate_limit {
+            return Some(limit.clone());
+        }
+
+        // 优先级2: 全局级别
+        self.rate_limit.clone()
+    }
+
+    /// 获取指定 API Key 的有效并发配置（继承机制：api_key级 > 路由级 > 全局级）
+    pub fn resolve_concurrency(
+        &self,
+        api_key: &ResolvedApiKey,
+        route: &RouteConfig,
+    ) -> Option<ApiKeyConcurrencyConfig> {
+        // 优先级1: API Key 级别
+        if api_key.concurrency.is_some() {
+            return api_key.concurrency.clone();
+        }
+
+        // 优先级2: 路由级别
+        if route.upstream.upstream_key_max_inflight.is_some() {
+            return Some(ApiKeyConcurrencyConfig {
+                downstream_max_inflight: None,
+                upstream_per_key_max_inflight: route.upstream.upstream_key_max_inflight,
+            });
+        }
+
+        // 优先级3: 全局级别
+        self.concurrency.as_ref().map(|c| ApiKeyConcurrencyConfig {
+            downstream_max_inflight: c.downstream_max_inflight,
+            upstream_per_key_max_inflight: c.upstream_per_key_max_inflight,
+        })
+    }
     pub fn load_from_file(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let raw = fs::read_to_string(path).map_err(ConfigError::Io)?;
         Self::from_yaml_str(&raw)
@@ -309,21 +559,83 @@ impl AppConfig {
             ));
         }
 
-        if self.gateway_auth.tokens.is_empty() {
+        // 检查至少有一个 API Key 来源
+        let has_gateway_keys = !self.gateway_auth.api_keys.is_empty();
+        let has_global_api_keys = self
+            .api_keys
+            .as_ref()
+            .map(|g| !g.keys.is_empty())
+            .unwrap_or(false);
+
+        if !has_gateway_keys && !has_global_api_keys {
             return Err(ConfigError::Validation(
-                "`gateway_auth.tokens` must not be empty".to_string(),
+                "must configure at least one API key in `gateway_auth.api_keys` or `api_keys.keys`"
+                    .to_string(),
             ));
         }
 
+        // 验证 gateway_auth.api_keys（简写格式）
         if self
             .gateway_auth
-            .tokens
+            .api_keys
             .iter()
-            .any(|token| token.trim().is_empty())
+            .any(|key| key.trim().is_empty())
         {
             return Err(ConfigError::Validation(
-                "`gateway_auth.tokens` must not contain empty values".to_string(),
+                "`gateway_auth.api_keys` must not contain empty values".to_string(),
             ));
+        }
+
+        // 验证 api_keys.keys（完整格式）
+        if let Some(global) = &self.api_keys {
+            let mut ids = HashSet::new();
+            for key_config in &global.keys {
+                if key_config.id.trim().is_empty() {
+                    return Err(ConfigError::Validation(
+                        "api_key id must not be empty".to_string(),
+                    ));
+                }
+                if !ids.insert(key_config.id.clone()) {
+                    return Err(ConfigError::Validation(format!(
+                        "duplicate api_key id: {}",
+                        key_config.id
+                    )));
+                }
+                if key_config.key.trim().is_empty() {
+                    return Err(ConfigError::Validation(format!(
+                        "api_key {}: key must not be empty",
+                        key_config.id
+                    )));
+                }
+                // 验证限流配置
+                if let Some(rate_limit) = &key_config.rate_limit {
+                    if rate_limit.per_minute == 0 {
+                        return Err(ConfigError::Validation(format!(
+                            "api_key {}: rate_limit.per_minute must be > 0",
+                            key_config.id
+                        )));
+                    }
+                }
+                // 验证并发配置
+                if let Some(concurrency) = &key_config.concurrency {
+                    if let Some(limit) = concurrency.downstream_max_inflight {
+                        if limit == 0 {
+                            return Err(ConfigError::Validation(format!(
+                                "api_key {}: concurrency.downstream_max_inflight must be > 0",
+                                key_config.id
+                            )));
+                        }
+                    }
+                    if let Some(limit) = concurrency.upstream_per_key_max_inflight {
+                        if limit == 0 {
+                            return Err(ConfigError::Validation(format!(
+                                "api_key {}: concurrency.upstream_per_key_max_inflight must be > 0",
+                                key_config.id
+                            )));
+                        }
+                    }
+                }
+            }
         }
 
         if self.routes.is_empty() {
@@ -448,6 +760,22 @@ impl AppConfig {
                 if header.name.trim().is_empty() {
                     return Err(ConfigError::Validation(format!(
                         "route `{}` has empty inject_headers.name",
+                        route.id
+                    )));
+                }
+            }
+
+            // Validate route-level API keys if specified
+            if let Some(api_keys) = &route.api_keys {
+                if api_keys.is_empty() {
+                    return Err(ConfigError::Validation(format!(
+                        "route `{}` api_keys must not be empty when specified",
+                        route.id
+                    )));
+                }
+                if api_keys.iter().any(|key| key.trim().is_empty()) {
+                    return Err(ConfigError::Validation(format!(
+                        "route `{}` api_keys must not contain empty values",
                         route.id
                     )));
                 }
@@ -763,6 +1091,10 @@ fn validate_optional_path(path: Option<&str>, message: &str) -> Result<(), Confi
     Ok(())
 }
 
+fn is_false(v: &bool) -> bool {
+    !*v
+}
+
 fn route_has_upstream_key_injection(route: &RouteConfig) -> bool {
     route.upstream.inject_headers.iter().any(|header| {
         !header.value.trim().is_empty()
@@ -781,7 +1113,7 @@ mod tests {
         let yaml = r#"
 listen: "127.0.0.1:8080"
 gateway_auth:
-  tokens:
+  api_keys:
     - "gw_token"
 routes:
   - id: "openai"
@@ -802,7 +1134,7 @@ routes:
         let yaml = r#"
 listen: "127.0.0.1:8080"
 gateway_auth:
-  tokens:
+  api_keys:
     - '${PATH}'
 routes:
   - id: "openai"
@@ -812,7 +1144,7 @@ routes:
 "#;
 
         let config = AppConfig::from_yaml_str(yaml).expect("config should parse");
-        assert!(!config.gateway_auth.tokens[0].is_empty());
+        assert!(!config.gateway_auth.api_keys[0].is_empty());
     }
 
     #[test]
@@ -820,7 +1152,7 @@ routes:
         let yaml = r#"
 listen: "127.0.0.1:8080"
 gateway_auth:
-  tokens:
+  api_keys:
     - "gw_token"
 routes:
   - id: "openai"
@@ -851,7 +1183,7 @@ routes:
         let yaml = r#"
 listen: "127.0.0.1:8080"
 gateway_auth:
-  tokens:
+  api_keys:
     - "gw_token"
 routes:
   - id: "openai"
@@ -877,7 +1209,7 @@ routes:
         let yaml = r#"
 listen: "127.0.0.1:8080"
 gateway_auth:
-  tokens:
+  api_keys:
     - "gw_token"
 routes:
   - id: "openai"
@@ -900,7 +1232,7 @@ routes:
         let yaml = r#"
 listen: "127.0.0.1:8443"
 gateway_auth:
-  tokens:
+  api_keys:
     - "gw_token"
 routes:
   - id: "openai"
@@ -928,7 +1260,7 @@ inbound_tls:
         let yaml = r#"
 listen: "127.0.0.1:8443"
 gateway_auth:
-  tokens:
+  api_keys:
     - "gw_token"
 routes:
   - id: "openai"
@@ -952,7 +1284,7 @@ inbound_tls:
         let yaml = r#"
 listen: "127.0.0.1:8080"
 gateway_auth:
-  tokens:
+  api_keys:
     - "gw_token"
 routes:
   - id: "openai"
@@ -986,7 +1318,7 @@ concurrency:
         let yaml = r#"
 listen: "127.0.0.1:8080"
 gateway_auth:
-  tokens:
+  api_keys:
     - "gw_token"
 routes:
   - id: "openai"
@@ -1053,7 +1385,7 @@ observability:
         let yaml = r#"
 listen: "127.0.0.1:8080"
 gateway_auth:
-  tokens:
+  api_keys:
     - "gw_token"
 routes:
   - id: "openai"
@@ -1080,7 +1412,7 @@ observability:
         let yaml = r#"
 listen: "127.0.0.1:8080"
 gateway_auth:
-  tokens:
+  api_keys:
     - "gw_token"
 routes:
   - id: "openai"
@@ -1106,7 +1438,7 @@ observability:
         let yaml = r#"
 listen: "127.0.0.1:8080"
 gateway_auth:
-  tokens:
+  api_keys:
     - "gw_token"
 routes:
   - id: "openai"
@@ -1133,7 +1465,7 @@ observability:
         let yaml = r#"
 listen: "127.0.0.1:8080"
 gateway_auth:
-  tokens:
+  api_keys:
     - "gw_token"
 routes:
   - id: "openai"
@@ -1166,7 +1498,7 @@ observability:
         let yaml = r#"
 listen: "127.0.0.1:8080"
 gateway_auth:
-  tokens:
+  api_keys:
     - "gw_token"
 routes:
   - id: "openai"
@@ -1190,7 +1522,7 @@ rate_limit:
         let yaml = r#"
 listen: "127.0.0.1:8080"
 gateway_auth:
-  tokens:
+  api_keys:
     - "gw_token"
 routes:
   - id: "openai"
@@ -1216,7 +1548,7 @@ concurrency:
         let yaml = r#"
 listen: "127.0.0.1:8080"
 gateway_auth:
-  tokens:
+  api_keys:
     - "gw_token"
 routes:
   - id: "openai"
@@ -1233,5 +1565,34 @@ concurrency:
                 .to_string()
                 .contains("must configure `upstream.inject_headers` with one of")
         );
+    }
+
+    #[test]
+    fn serialize_config_without_null_fields() {
+        let yaml = r#"
+listen: "127.0.0.1:8080"
+gateway_auth:
+  api_keys:
+    - "gw_token"
+routes:
+  - id: "openai"
+    prefix: "/openai"
+    upstream:
+      base_url: "https://api.openai.com"
+"#;
+
+        let config = AppConfig::from_yaml_str(yaml).expect("config should parse");
+        let serialized = serde_yaml::to_string(&config).expect("should serialize");
+
+        // Should not contain null fields for optional values
+        assert!(!serialized.contains("cors: null"), "should not serialize null cors");
+        assert!(!serialized.contains("inbound_tls: null"), "should not serialize null inbound_tls");
+        assert!(!serialized.contains("rate_limit: null"), "should not serialize null rate_limit");
+        assert!(!serialized.contains("concurrency: null"), "should not serialize null concurrency");
+
+        // Should still be parseable after serialization
+        let reparsed = AppConfig::from_yaml_str(&serialized).expect("should reparse");
+        assert_eq!(reparsed.listen, config.listen);
+        assert_eq!(reparsed.routes.len(), config.routes.len());
     }
 }

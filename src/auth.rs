@@ -29,16 +29,31 @@ pub fn extract_token(headers: &HeaderMap, token_sources: &[TokenSourceConfig]) -
 }
 
 pub fn is_authorized(headers: &HeaderMap, gateway_auth: &GatewayAuthConfig) -> bool {
-    extract_authorized_token(headers, gateway_auth).is_some()
+    extract_authorized_token(headers, gateway_auth, None).is_some()
+}
+
+pub fn is_authorized_for_route(
+    headers: &HeaderMap,
+    gateway_auth: &GatewayAuthConfig,
+    route_api_keys: Option<&[String]>,
+) -> bool {
+    extract_authorized_token(headers, gateway_auth, route_api_keys).is_some()
 }
 
 pub fn extract_authorized_token(
     headers: &HeaderMap,
     gateway_auth: &GatewayAuthConfig,
+    route_api_keys: Option<&[String]>,
 ) -> Option<String> {
     let token = extract_token(headers, &gateway_auth.token_sources)?;
 
-    if gateway_auth.tokens.iter().any(|allowed| allowed == &token) {
+    // Use route-level API keys if specified, otherwise fall back to global tokens
+    let mut allowed_tokens: Box<dyn Iterator<Item = &String>> = match route_api_keys {
+        Some(keys) => Box::new(keys.iter()),
+        None => Box::new(gateway_auth.api_keys.iter()),
+    };
+
+    if allowed_tokens.any(|allowed| allowed == &token) {
         Some(token)
     } else {
         None
@@ -62,7 +77,7 @@ fn parse_bearer_token(value: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_authorized_token, extract_token, is_authorized};
+    use super::{extract_authorized_token, extract_token, is_authorized, is_authorized_for_route};
     use crate::config::{GatewayAuthConfig, TokenSourceConfig};
     use http::header::AUTHORIZATION;
     use http::{HeaderMap, HeaderValue};
@@ -100,14 +115,41 @@ mod tests {
         headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer gw_token"));
 
         let auth = GatewayAuthConfig {
-            tokens: vec!["gw_token".to_string()],
+            api_keys: vec!["gw_token".to_string()],
             token_sources: vec![TokenSourceConfig::AuthorizationBearer],
         };
 
         assert!(is_authorized(&headers, &auth));
         assert_eq!(
-            extract_authorized_token(&headers, &auth).as_deref(),
+            extract_authorized_token(&headers, &auth, None).as_deref(),
             Some("gw_token")
         );
+    }
+
+    #[test]
+    fn authorize_with_route_level_api_keys() {
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer route_token"));
+
+        let auth = GatewayAuthConfig {
+            api_keys: vec!["global_token".to_string()],
+            token_sources: vec![TokenSourceConfig::AuthorizationBearer],
+        };
+
+        // Route-level API keys should be checked first
+        let route_keys = vec!["route_token".to_string()];
+        assert!(is_authorized_for_route(&headers, &auth, Some(&route_keys)));
+        assert_eq!(
+            extract_authorized_token(&headers, &auth, Some(&route_keys)).as_deref(),
+            Some("route_token")
+        );
+
+        // Global token should not work when route-level keys are specified
+        headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer global_token"));
+        assert!(!is_authorized_for_route(&headers, &auth, Some(&route_keys)));
+
+        // Without route-level keys, global tokens should work
+        headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer global_token"));
+        assert!(is_authorized(&headers, &auth));
     }
 }

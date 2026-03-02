@@ -28,6 +28,20 @@ pub fn register_admin_routes(router: Router<AppState>, prefix: &str) -> Router<A
             &format!("{prefix}/api/metrics/ip"),
             get(admin_ip_metrics_handler),
         )
+        // API Key 管理路由
+        .route(&format!("{prefix}/api/keys"), get(admin_list_api_keys))
+        .route(
+            &format!("{prefix}/api/keys/:id/ban"),
+            post(admin_ban_api_key),
+        )
+        .route(
+            &format!("{prefix}/api/keys/:id/unban"),
+            post(admin_unban_api_key),
+        )
+        .route(
+            &format!("{prefix}/api/keys/:id/ban-logs"),
+            get(admin_get_ban_logs),
+        )
 }
 
 fn is_admin_authorized(state: &AppState, headers: &HeaderMap) -> bool {
@@ -445,4 +459,234 @@ fn admin_dashboard_html(prefix: &str) -> String {
         .replace("{{API_SAVE_URL}}", &api_save_url)
         .replace("{{API_METRICS_URL}}", &api_metrics_url)
         .replace("{{ADMIN_PREFIX}}", prefix)
+}
+
+// ===== API Key 管理 API =====
+
+use axum::extract::Path;
+use serde::Serialize;
+
+/// API Key 列表响应
+#[derive(Debug, Serialize)]
+struct ApiKeyListResponse {
+    keys: Vec<ApiKeyInfo>,
+}
+
+/// API Key 信息
+#[derive(Debug, Serialize)]
+struct ApiKeyInfo {
+    id: String,
+    key: String,
+    route_id: Option<String>,
+    enabled: bool,
+    remark: String,
+    is_banned: bool,
+    ban_expires_at: Option<u64>,
+    ban_reason: Option<String>,
+    ban_count: u32,
+}
+
+/// 封禁请求
+#[derive(Debug, Deserialize)]
+struct BanRequest {
+    duration_secs: u64,
+    reason: String,
+}
+
+/// 封禁日志列表响应
+#[derive(Debug, Serialize)]
+struct BanLogListResponse {
+    logs: Vec<BanLogInfo>,
+}
+
+/// 封禁日志信息
+#[derive(Debug, Serialize)]
+struct BanLogInfo {
+    id: String,
+    rule_id: String,
+    reason: String,
+    banned_at: u64,
+    banned_until: u64,
+    unbanned_at: Option<u64>,
+    metrics_requests: u64,
+    metrics_errors: u64,
+    metrics_error_rate: f64,
+}
+
+/// 列出所有 API Keys
+async fn admin_list_api_keys(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    if !is_admin_authorized(&state, &headers) {
+        return json_error(StatusCode::UNAUTHORIZED, "unauthorized");
+    }
+
+    let runtime = state.runtime.load();
+    let api_key_manager = match runtime.api_key_manager.as_ref() {
+        Some(manager) => manager,
+        None => return json_ok(&ApiKeyListResponse { keys: vec![] }),
+    };
+
+    let keys = api_key_manager.get_all_keys().await;
+    let key_infos: Vec<ApiKeyInfo> = keys
+        .into_iter()
+        .map(|key| {
+            let (is_banned, ban_expires_at, ban_reason, ban_count) = key
+                .ban_status
+                .as_ref()
+                .map(|s| {
+                    (
+                        s.is_banned,
+                        s.banned_until,
+                        s.reason.clone(),
+                        s.ban_count,
+                    )
+                })
+                .unwrap_or((false, None, None, 0));
+
+            ApiKeyInfo {
+                id: key.id,
+                key: key.key,
+                route_id: key.route_id,
+                enabled: key.enabled,
+                remark: key.remark,
+                is_banned,
+                ban_expires_at,
+                ban_reason,
+                ban_count,
+            }
+        })
+        .collect();
+
+    json_ok(&ApiKeyListResponse { keys: key_infos })
+}
+
+/// 手动封禁 API Key
+async fn admin_ban_api_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: axum::body::Bytes,
+) -> Response<Body> {
+    if !is_admin_authorized(&state, &headers) {
+        return json_error(StatusCode::UNAUTHORIZED, "unauthorized");
+    }
+
+    let runtime = state.runtime.load();
+    let api_key_manager = match runtime.api_key_manager.as_ref() {
+        Some(manager) => manager,
+        None => return json_error(StatusCode::NOT_FOUND, "api_key_manager_not_available"),
+    };
+
+    let req: BanRequest = match serde_json::from_slice(&body) {
+        Ok(req) => req,
+        Err(err) => {
+            return json_error(StatusCode::BAD_REQUEST, &format!("invalid_json: {err}"));
+        }
+    };
+
+    // 通过 ID 获取 key 值
+    let key_value = match api_key_manager.get_key_by_id(&id).await {
+        Some(key) => key,
+        None => return json_error(StatusCode::NOT_FOUND, "api_key_not_found"),
+    };
+
+    match api_key_manager
+        .ban_key(&key_value, req.duration_secs, req.reason)
+        .await
+    {
+        Ok(status) => json_ok(&serde_json::json!({
+            "status": "banned",
+            "banned_until": status.banned_until,
+            "ban_count": status.ban_count,
+        })),
+        Err(err) => json_error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
+    }
+}
+
+/// 手动解封 API Key
+async fn admin_unban_api_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response<Body> {
+    if !is_admin_authorized(&state, &headers) {
+        return json_error(StatusCode::UNAUTHORIZED, "unauthorized");
+    }
+
+    let runtime = state.runtime.load();
+    let api_key_manager = match runtime.api_key_manager.as_ref() {
+        Some(manager) => manager,
+        None => return json_error(StatusCode::NOT_FOUND, "api_key_manager_not_available"),
+    };
+
+    // 通过 ID 获取 key 值
+    let key_value = match api_key_manager.get_key_by_id(&id).await {
+        Some(key) => key,
+        None => return json_error(StatusCode::NOT_FOUND, "api_key_not_found"),
+    };
+
+    match api_key_manager.unban_key(&key_value).await {
+        Ok(()) => json_ok(&serde_json::json!({
+            "status": "unbanned",
+        })),
+        Err(err) => json_error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
+    }
+}
+
+/// 获取 API Key 的封禁日志
+async fn admin_get_ban_logs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(query): Query<BanLogQuery>,
+) -> Response<Body> {
+    if !is_admin_authorized(&state, &headers) {
+        return json_error(StatusCode::UNAUTHORIZED, "unauthorized");
+    }
+
+    let runtime = state.runtime.load();
+    let api_key_manager = match runtime.api_key_manager.as_ref() {
+        Some(manager) => manager,
+        None => return json_ok(&BanLogListResponse { logs: vec![] }),
+    };
+
+    let Some(ban_log_store) = api_key_manager.ban_log_store() else {
+        return json_ok(&BanLogListResponse { logs: vec![] });
+    };
+
+    let limit = query.limit.unwrap_or(20).min(100);
+    let offset = query.offset.unwrap_or(0);
+
+    match ban_log_store.query_by_api_key(&id, limit, offset).await {
+        Ok(entries) => {
+            let logs: Vec<BanLogInfo> = entries
+                .into_iter()
+                .map(|entry| BanLogInfo {
+                    id: entry.id,
+                    rule_id: entry.rule_id,
+                    reason: entry.reason,
+                    banned_at: entry.banned_at,
+                    banned_until: entry.banned_until,
+                    unbanned_at: entry.unbanned_at,
+                    metrics_requests: entry.metrics_snapshot.requests,
+                    metrics_errors: entry.metrics_snapshot.errors,
+                    metrics_error_rate: entry.metrics_snapshot.error_rate,
+                })
+                .collect();
+            json_ok(&BanLogListResponse { logs })
+        }
+        Err(err) => {
+            error!("Failed to query ban logs: {}", err);
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "query_failed")
+        }
+    }
+}
+
+/// 封禁日志查询参数
+#[derive(Debug, Deserialize)]
+struct BanLogQuery {
+    limit: Option<usize>,
+    offset: Option<usize>,
 }

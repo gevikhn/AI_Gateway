@@ -17,6 +17,12 @@
 - 并发保护：
   - 下游全局并发上限
   - 上游按 route + key 并发上限（支持按路由覆盖）
+- **API Key 精细化管理**：
+  - 独立管理页面（过滤、搜索、备注）
+  - API Key 级别限流与并发控制
+  - 梯度封禁规则（错误率/请求数/连续错误）
+  - 封禁日志与手动封禁/解封
+  - SQLite 持久化存储
 
 暂未实现（Phase 2）：
 - 配置热加载
@@ -169,6 +175,24 @@ scrape_configs:
 http://127.0.0.1:8080/metrics/ui
 ```
 
+### Admin 管理界面（可选）
+
+若配置中启用了 `admin` 块，可通过 Web UI 管理 API Key：
+
+```yaml
+admin:
+  enabled: true
+  bind: "127.0.0.1:8081"      # Admin 服务监听地址
+  auth_token: "${ADMIN_TOKEN}"  # 管理接口鉴权 token
+```
+
+管理界面功能：
+- **API Key 管理**：查看、启用/禁用、删除 API Key，支持按路由、状态、关键词过滤
+- **封禁日志**：查看自动/手动封禁历史，支持手动解封
+- **实时编辑**：在线编辑 API Key 的限流、并发、封禁规则配置
+
+访问地址：`http://127.0.0.1:8081/admin/ui`
+
 命令行拉取摘要：
 
 ```bash
@@ -209,6 +233,7 @@ observability:
 | HTTP 状态码 | Body | 含义 |
 | --- | --- | --- |
 | `401` | `{"error":"unauthorized"}` | token 缺失或不在白名单。 |
+| `403` | `{"error":"api_key_banned"}` | API Key 已被封禁。 |
 | `404` | `{"error":"route_not_found"}` | 未命中任何路由。 |
 | `429` | `{"error":"rate_limited"}` | 下游请求触发限流。 |
 | `503` | `{"error":"downstream_concurrency_exceeded"}` / `{"error":"upstream_concurrency_exceeded"}` | 触发并发保护。 |

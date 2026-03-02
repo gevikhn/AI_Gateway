@@ -1,3 +1,4 @@
+use crate::api_keys::{ApiKeyManager, create_api_key_manager};
 use crate::auth;
 use crate::concurrency::ConcurrencyController;
 use crate::config::{
@@ -33,6 +34,8 @@ pub struct RuntimeState {
     pub upstream_clients: HashMap<String, reqwest::Client>,
     pub rate_limiter: Option<Arc<RateLimiter>>,
     pub concurrency: Option<Arc<ConcurrencyController>>,
+    /// API Key 管理器（支持 API Key 级别的限流和并发控制）
+    pub api_key_manager: Option<Arc<ApiKeyManager>>,
 }
 
 #[derive(Clone)]
@@ -51,11 +54,15 @@ pub fn build_runtime_state(config: Arc<AppConfig>) -> Result<RuntimeState, Strin
         .as_ref()
         .map(|rate_limit| Arc::new(RateLimiter::new(rate_limit.per_minute)));
     let concurrency = ConcurrencyController::new(&config).map(Arc::new);
+    // 创建 API Key 管理器（支持 API Key 级别的限流和并发控制）
+    // TODO: 传入 ban_log_store 以支持封禁日志持久化
+    let api_key_manager = create_api_key_manager(&config, None).map(Arc::new);
     Ok(RuntimeState {
         config,
         upstream_clients,
         rate_limiter,
         concurrency,
+        api_key_manager,
     })
 }
 
@@ -325,9 +332,9 @@ fn metrics_dashboard_html(summary_path: &str) -> String {
       </table>
     </section>
     <section class="panel">
-      <h3>GW_TOKEN 维度</h3>
+      <h3>APIKEY 维度</h3>
       <table id="tokenTable">
-        <thead><tr><th>Token</th><th>Req 1h</th><th>Req 24h</th></tr></thead>
+        <thead><tr><th>APIKEY</th><th>Req 1h</th><th>Req 24h</th></tr></thead>
         <tbody></tbody>
       </table>
     </section>
@@ -495,7 +502,7 @@ async fn proxy_handler(
     }
 
     let Some(token) =
-        auth::extract_authorized_token(request.headers(), &runtime.config.gateway_auth)
+        auth::extract_authorized_token(request.headers(), &runtime.config.gateway_auth, route.api_keys.as_deref())
     else {
         return finalize_observed_proxy_response(
             json_error(StatusCode::UNAUTHORIZED, "unauthorized"),
@@ -514,7 +521,75 @@ async fn proxy_handler(
     };
     let token_label = observability::token_label(&token);
 
-    if let Some(rate_limiter) = &runtime.rate_limiter {
+    // 优先使用 API Key 管理器进行验证（检查启用状态、路由权限等）
+    if let Some(api_key_manager) = &runtime.api_key_manager {
+        if let Err(e) = api_key_manager.validate_key(&token, &route.id).await {
+            let error_code = match e {
+                crate::api_keys::ApiKeyError::KeyDisabled => "api_key_disabled",
+                crate::api_keys::ApiKeyError::RouteNotAllowed => "api_key_route_not_allowed",
+                _ => "unauthorized",
+            };
+            return finalize_observed_proxy_response(
+                json_error(StatusCode::FORBIDDEN, error_code),
+                cors_config,
+                request_origin.as_deref(),
+                request_observation_with_token(
+                    metrics.as_ref(),
+                    route.id.as_str(),
+                    &method,
+                    &path,
+                    Some(token_label.as_str()),
+                    &request_id,
+                    request_started_at,
+                ),
+                error_code,
+            );
+        }
+    }
+
+    // 限流检查：优先使用 API Key 级别，其次使用全局级别
+    let api_key_info = if let Some(manager) = &runtime.api_key_manager {
+        manager.get_key_info(&token).await
+    } else {
+        None
+    };
+
+    let api_key_has_rate_limit = api_key_info
+        .as_ref()
+        .and_then(|k| k.rate_limit.clone())
+        .is_some();
+
+    if api_key_has_rate_limit {
+        // 使用 API Key 级别的限流
+        if let Some(api_key_manager) = &runtime.api_key_manager {
+            if let Err(e) = api_key_manager.check_rate_limit(&token, &route.id).await {
+                if let crate::api_keys::ApiKeyError::RateLimitExceeded { retry_after_secs } = e {
+                    let mut response = json_error(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
+                    set_header(
+                        response.headers_mut(),
+                        "retry-after",
+                        &retry_after_secs.to_string(),
+                    );
+                    return finalize_observed_proxy_response(
+                        response,
+                        cors_config,
+                        request_origin.as_deref(),
+                        request_observation_with_token(
+                            metrics.as_ref(),
+                            route.id.as_str(),
+                            &method,
+                            &path,
+                            Some(token_label.as_str()),
+                            &request_id,
+                            request_started_at,
+                        ),
+                        "rate_limited",
+                    );
+                }
+            }
+        }
+    } else if let Some(rate_limiter) = &runtime.rate_limiter {
+        // 回退到全局限流器
         match rate_limiter.check(&token, &route.id) {
             RateLimitDecision::Allowed => {}
             RateLimitDecision::Rejected { retry_after_secs } => {
@@ -543,7 +618,75 @@ async fn proxy_handler(
         }
     }
 
-    let downstream_permit = if let Some(concurrency) = &runtime.concurrency {
+    // 并发控制：优先使用 API Key 级别，其次使用全局级别
+    // 复用之前获取的 api_key_info
+    let api_key_has_concurrency = api_key_info
+        .as_ref()
+        .and_then(|k| k.concurrency.as_ref())
+        .and_then(|c| c.downstream_max_inflight)
+        .is_some();
+
+    let downstream_permit = if api_key_has_concurrency {
+        // 使用 API Key 级别的并发控制
+        if let Some(api_key_manager) = &runtime.api_key_manager {
+            match api_key_manager.acquire_concurrency_permit(&token).await {
+                Ok(permit) => permit,
+                Err(crate::api_keys::ApiKeyError::ConcurrencyLimitExceeded) => {
+                    return finalize_observed_proxy_response(
+                        json_error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "api_key_concurrency_exceeded",
+                        ),
+                        cors_config,
+                        request_origin.as_deref(),
+                        request_observation_with_token(
+                            metrics.as_ref(),
+                            route.id.as_str(),
+                            &method,
+                            &path,
+                            Some(token_label.as_str()),
+                            &request_id,
+                            request_started_at,
+                        ),
+                        "concurrency",
+                    );
+                }
+                Err(_) => {
+                    // 其他错误（如 key 不存在），回退到全局并发控制
+                    if let Some(concurrency) = &runtime.concurrency {
+                        match concurrency.acquire_downstream() {
+                            Ok(permit) => permit,
+                            Err(_) => {
+                                return finalize_observed_proxy_response(
+                                    json_error(
+                                        StatusCode::SERVICE_UNAVAILABLE,
+                                        "downstream_concurrency_exceeded",
+                                    ),
+                                    cors_config,
+                                    request_origin.as_deref(),
+                                    request_observation_with_token(
+                                        metrics.as_ref(),
+                                        route.id.as_str(),
+                                        &method,
+                                        &path,
+                                        Some(token_label.as_str()),
+                                        &request_id,
+                                        request_started_at,
+                                    ),
+                                    "concurrency",
+                                );
+                            }
+                        }
+                    } else {
+                        None
+                    }
+                }
+            }
+        } else {
+            None
+        }
+    } else if let Some(concurrency) = &runtime.concurrency {
+        // 使用全局并发控制
         match concurrency.acquire_downstream() {
             Ok(permit) => permit,
             Err(_) => {
@@ -1481,6 +1624,7 @@ mod tests {
         config.routes.push(RouteConfig {
             id: "anthropic".to_string(),
             prefix: "/claude".to_string(),
+            api_keys: None,
             upstream: UpstreamConfig {
                 base_url: "https://api.anthropic.com".to_string(),
                 strip_prefix: true,
@@ -1527,12 +1671,13 @@ mod tests {
         AppConfig {
             listen: "127.0.0.1:8080".to_string(),
             gateway_auth: GatewayAuthConfig {
-                tokens: vec!["gw_token".to_string()],
+                api_keys: vec!["gw_token".to_string()],
                 token_sources: vec![TokenSourceConfig::AuthorizationBearer],
             },
             routes: vec![RouteConfig {
                 id: "openai".to_string(),
                 prefix: "/openai".to_string(),
+                api_keys: None,
                 upstream: UpstreamConfig {
                     base_url: "https://api.openai.com".to_string(),
                     strip_prefix: true,
@@ -1546,6 +1691,7 @@ mod tests {
                     user_agent: None,
                 },
             }],
+            api_keys: None,
             inbound_tls: None,
             cors: None,
             rate_limit: None,

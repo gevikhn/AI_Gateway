@@ -18,12 +18,13 @@ async fn https_listener_auto_generates_self_signed_cert() {
     let config = AppConfig {
         listen: listen_addr.to_string(),
         gateway_auth: GatewayAuthConfig {
-            tokens: vec!["gw_token".to_string()],
+            api_keys: vec!["gw_token".to_string()],
             token_sources: vec![TokenSourceConfig::AuthorizationBearer],
         },
         routes: vec![RouteConfig {
             id: "openai".to_string(),
             prefix: "/openai".to_string(),
+            api_keys: None,
             upstream: UpstreamConfig {
                 base_url: "https://api.openai.com".to_string(),
                 strip_prefix: true,
@@ -40,6 +41,7 @@ async fn https_listener_auto_generates_self_signed_cert() {
                 user_agent: None,
             },
         }],
+        api_keys: None,
         inbound_tls: Some(InboundTlsConfig {
             cert_path: None,
             key_path: None,
