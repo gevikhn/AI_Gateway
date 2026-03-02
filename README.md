@@ -46,6 +46,39 @@ cargo build --release
 - Linux/macOS: `target/release/ai-gw-lite`
 - Windows: `target/release/ai-gw-lite.exe`
 
+### 2.2.1 交叉编译（Windows → Linux）
+
+在 Windows 上可直接编译出 Linux 可执行文件，无需 Docker 或 WSL。
+
+**前置安装（仅首次）：**
+
+```powershell
+# 1. 安装 Zig 编译器（用作交叉链接器）
+winget install zig.zig
+
+# 2. 安装 cargo-zigbuild
+cargo install cargo-zigbuild
+
+# 3. 添加 Linux 编译目标
+rustup target add x86_64-unknown-linux-musl x86_64-unknown-linux-gnu
+```
+
+**编译 Linux 二进制：**
+
+```powershell
+# 静态链接（推荐，部署零依赖）
+cargo zigbuild --release --target x86_64-unknown-linux-musl
+
+# 动态链接（需目标系统有 glibc）
+cargo zigbuild --release --target x86_64-unknown-linux-gnu
+```
+
+生成的文件位于：
+- `target/x86_64-unknown-linux-musl/release/ai-gw-lite`（静态链接，~12MB）
+- `target/x86_64-unknown-linux-gnu/release/ai-gw-lite`（动态链接，~13MB）
+
+直接 `scp` 到目标 Linux 服务器即可运行（musl 版本无需安装任何运行时依赖）。
+
 ### 2.3 准备配置
 
 项目内有示例配置：`config/dev.yaml`。你也可以自定义 `config.yaml`，运行时通过 `--config` 指定。

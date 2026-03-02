@@ -63,6 +63,7 @@ Phase 2 范围（按需启用）:
 | M18 | 轻量观测界面（HTML + JS）与窗口统计 | DONE | `src/server.rs`, `src/observability.rs`, `tests/gateway_e2e.rs`, `README.md`, `docs/System Design.md`, `config/dev.yaml`, `plan.md` | 提供浏览器可访问观测页面与 JSON 接口；支持 route 维度 1h/24h 请求数、并发与 GW_TOKEN 维度请求数 |
 | M19 | Linux `--install` 一键安装（systemd + `/etc/ai_gw_lite/conf.yaml`） | DONE | `src/main.rs`, `src/install.rs`, `src/lib.rs`, `README.md`, `docs/System Design.md`, `plan.md` | Linux 下执行 `--install` 可自动创建配置目录/配置文件与 service 文件，且 `ExecStart` 使用 `/etc/ai_gw_lite/conf.yaml` |
 | M20 | Admin 管理页面（热加载配置 + REST API + 内置 UI） | DONE | `Cargo.toml`, `src/config.rs`, `src/server.rs`, `src/main.rs`, `src/lib.rs`, `src/admin.rs`, `src/concurrency.rs`, `tests/gateway_e2e.rs`, `tests/inbound_tls_e2e.rs`, `config/dev.yaml` | Admin API + UI 可用；运行时热加载路由等配置即时生效；`cargo test` 42/42 全绿 |
+| M21 | 交叉编译能力（Windows → Linux） | DONE | `.cargo/config.toml`, `README.md`, `plan.md` | 在 Windows 上可通过 `cargo zigbuild` 编译出 `x86_64-unknown-linux-musl` 和 `x86_64-unknown-linux-gnu` 二进制 |
 
 ## 4. 详细实施步骤（执行顺序）
 
@@ -137,6 +138,25 @@ Phase 2 范围（按需启用）:
 ## 6. 执行记录（Work Log）
 
 > 按时间倒序追加，每条记录必须包含：任务 ID、变更摘要、验证命令、结果。
+
+### 2026-02-25
+- 任务: M21
+- 变更（After Change）:
+  - 新建 `.cargo/config.toml`，配置 Linux target 使用 Zig 作为链接器
+  - 安装工具链：`rustup target add x86_64-unknown-linux-musl x86_64-unknown-linux-gnu`、`cargo install cargo-zigbuild`、`winget install zig.zig`
+  - 更新 `README.md` § 2.2.1 添加交叉编译说明（前置安装 + 编译命令 + 产物位置）
+- 实际改动文件:
+  - `.cargo/config.toml`（新建）
+  - `README.md`
+  - `plan.md`
+- 验证:
+  - `cargo zigbuild --release --target x86_64-unknown-linux-musl` → ELF 64-bit statically linked, 12MB, PASS
+  - `cargo zigbuild --release --target x86_64-unknown-linux-gnu` → ELF 64-bit dynamically linked, 13MB, PASS
+  - `cargo test` → 无影响（交叉编译配置仅影响指定 target，不影响默认 host build）
+- 结果: DONE
+- 剩余事项:
+  - 工具链安装（zig、cargo-zigbuild、rustup target）为开发机本地环境要求，未纳入 CI；如需 CI 交叉编译可后续添加 GitHub Actions workflow
+
 
 ### 2026-02-19
 - 任务: M20（文档补充）
