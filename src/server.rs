@@ -423,6 +423,20 @@ async fn proxy_handler(State(state): State<AppState>, request: Request<Body>) ->
     let request_id = observability::extract_or_generate_request_id(request.headers());
     let cors_config = runtime.config.cors.as_ref().filter(|cors| cors.enabled);
     let metrics = state.observability.metrics.clone();
+
+    // 检查是否是 admin 路径，如果是则不记录监控统计
+    let is_admin_path = state
+        .admin_path_prefix
+        .as_ref()
+        .map(|prefix| path.starts_with(prefix))
+        .unwrap_or(false);
+
+    if is_admin_path {
+        let mut response = json_error(StatusCode::NOT_FOUND, "not_found");
+        observability::insert_request_id_header(response.headers_mut(), &request_id);
+        return response;
+    }
+
     let request_span = tracing::info_span!(
         "gateway_request",
         request_id = request_id.as_str(),

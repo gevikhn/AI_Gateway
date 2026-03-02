@@ -22,6 +22,7 @@ pub fn register_admin_routes(router: Router<AppState>, prefix: &str) -> Router<A
             &format!("{prefix}/api/config/save"),
             post(admin_config_save_handler),
         )
+        .route(&format!("{prefix}/api/metrics"), get(admin_metrics_handler))
 }
 
 fn is_admin_authorized(state: &AppState, headers: &HeaderMap) -> bool {
@@ -185,6 +186,20 @@ async fn admin_config_save_handler(
     }))
 }
 
+async fn admin_metrics_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    if !is_admin_authorized(&state, &headers) {
+        return json_error(StatusCode::UNAUTHORIZED, "unauthorized");
+    }
+    if let Some(summary) = state.observability.snapshot_summary() {
+        json_ok(&summary)
+    } else {
+        json_error(StatusCode::NOT_FOUND, "metrics_not_available")
+    }
+}
+
 async fn admin_login_handler(State(state): State<AppState>) -> Response<Body> {
     let prefix = state.admin_path_prefix.as_deref().unwrap_or("/admin");
     let api_config_url = format!("{prefix}/api/config");
@@ -217,11 +232,13 @@ const LOGIN_JS: &str = include_str!("./admin/static/login.js");
 fn admin_dashboard_html(prefix: &str) -> String {
     let api_config_url = format!("{prefix}/api/config");
     let api_save_url = format!("{prefix}/api/config/save");
+    let api_metrics_url = format!("{prefix}/api/metrics");
 
     HTML_TEMPLATE
         .replace("{{CSS}}", CSS_STYLES)
         .replace("{{JS}}", JS_APP)
         .replace("{{API_CONFIG_URL}}", &api_config_url)
         .replace("{{API_SAVE_URL}}", &api_save_url)
+        .replace("{{API_METRICS_URL}}", &api_metrics_url)
         .replace("{{ADMIN_PREFIX}}", prefix)
 }

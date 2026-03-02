@@ -3,11 +3,13 @@
 const CONFIG = {
   apiUrl: window.CONFIG?.apiUrl || '{{API_CONFIG_URL}}',
   saveUrl: window.CONFIG?.saveUrl || '{{API_SAVE_URL}}',
+  metricsUrl: window.CONFIG?.metricsUrl || '{{API_METRICS_URL}}',
   adminPrefix: window.CONFIG?.adminPrefix || '/admin'
 };
 
 const TOKEN_KEY = 'ai_gateway_admin_token';
 let cfg = null;
+let metricsData = null;
 let loadingStates = new Map();
 
 // ===== Toast 通知系统 =====
@@ -235,6 +237,7 @@ function checkAuth() {
 // ===== 标签页系统 =====
 const TABS = [
   { id: 'routes', label: '路由配置' },
+  { id: 'metrics', label: '监控' },
   { id: 'auth', label: '认证' },
   { id: 'cors', label: 'CORS' },
   { id: 'ratelimit', label: '限流' },
@@ -309,9 +312,11 @@ async function loadConfig() {
   }
 }
 
+
 // ===== 渲染函数 =====
 function renderAll() {
   renderRoutes();
+  renderMetrics();
   renderAuth();
   renderCors();
   renderRateLimit();
@@ -857,6 +862,166 @@ function esc(s) {
   return (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
+// ===== Metrics =====
+let metricsRefreshInterval = null;
+
+async function loadMetrics() {
+  const token = getToken();
+  if (!token) {
+    logout();
+    return;
+  }
+
+  try {
+    const res = await fetch(CONFIG.metricsUrl, {
+      headers: { Authorization: 'Bearer ' + token },
+      cache: 'no-store'
+    });
+
+    if (res.status === 401) {
+      localStorage.removeItem(TOKEN_KEY);
+      logout();
+      return;
+    }
+
+    if (!res.ok) {
+      throw new Error('HTTP ' + res.status);
+    }
+
+    metricsData = await res.json();
+    renderMetrics();
+  } catch (e) {
+    console.error('加载 metrics 失败:', e);
+  }
+}
+
+function renderMetrics() {
+  const panel = document.getElementById('tab-metrics');
+  if (!panel) return;
+
+  if (!metricsData) {
+    panel.innerHTML = `
+      <div class="empty-state">
+        <svg class="empty-state-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+          <path d="M3 3v18h18"/>
+          <path d="M18 17V9"/>
+          <path d="M13 17V5"/>
+          <path d="M8 17v-3"/>
+        </svg>
+        <div class="empty-state-title">加载中...</div>
+        <div class="empty-state-description">正在获取监控数据</div>
+      </div>
+    `;
+    return;
+  }
+
+  const total1h = formatNumber(metricsData.total_requests_1h || 0);
+  const total24h = formatNumber(metricsData.total_requests_24h || 0);
+  const routeCount = metricsData.routes?.length || 0;
+  const tokenCount = metricsData.tokens?.length || 0;
+
+  const routeRows = (metricsData.routes || []).map(r => `
+    <tr>
+      <td>${esc(r.route_id)}</td>
+      <td>${formatNumber(r.requests_1h)}</td>
+      <td>${formatNumber(r.requests_24h)}</td>
+      <td>${r.inflight_current}</td>
+      <td>${r.inflight_peak_1h}</td>
+      <td>${r.inflight_peak_24h}</td>
+    </tr>
+  `).join('');
+
+  const tokenRows = (metricsData.tokens || []).map(t => `
+    <tr>
+      <td>${esc(t.token)}</td>
+      <td>${formatNumber(t.requests_1h)}</td>
+      <td>${formatNumber(t.requests_24h)}</td>
+    </tr>
+  `).join('');
+
+  const generatedAt = metricsData.generated_at_unix_ms
+    ? new Date(metricsData.generated_at_unix_ms).toLocaleString()
+    : '-';
+
+  panel.innerHTML = `
+    <div class="metrics-header">
+      <div class="metrics-title">
+        <h2>实时监控</h2>
+        <span class="metrics-time">生成时间: ${generatedAt}</span>
+      </div>
+      <button class="btn btn-primary btn-sm" onclick="loadMetrics()">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/>
+          <path d="M3 3v5h5"/>
+          <path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/>
+          <path d="M16 21h5v-5"/>
+        </svg>
+        刷新
+      </button>
+    </div>
+
+    <div class="metrics-cards">
+      <div class="metric-card">
+        <div class="metric-label">总请求 (1小时)</div>
+        <div class="metric-value">${total1h}</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">总请求 (24小时)</div>
+        <div class="metric-value">${total24h}</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">路由数</div>
+        <div class="metric-value">${routeCount}</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">Token 数</div>
+        <div class="metric-value">${tokenCount}</div>
+      </div>
+    </div>
+
+    <div class="metrics-section">
+      <h3>路由维度</h3>
+      <div class="metrics-table-wrapper">
+        <table class="metrics-table">
+          <thead>
+            <tr>
+              <th>Route</th>
+              <th>请求 (1h)</th>
+              <th>请求 (24h)</th>
+              <th>当前并发</th>
+              <th>并发峰值 (1h)</th>
+              <th>并发峰值 (24h)</th>
+            </tr>
+          </thead>
+          <tbody>${routeRows || '<tr><td colspan="6" class="empty-cell">暂无数据</td></tr>'}</tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="metrics-section">
+      <h3>Token 维度</h3>
+      <div class="metrics-table-wrapper">
+        <table class="metrics-table">
+          <thead>
+            <tr>
+              <th>Token</th>
+              <th>请求 (1h)</th>
+              <th>请求 (24h)</th>
+            </tr>
+          </thead>
+          <tbody>${tokenRows || '<tr><td colspan="3" class="empty-cell">暂无数据</td></tr>'}</tbody>
+        </table>
+      </div>
+    </div>
+  `;
+}
+
+function formatNumber(n) {
+  if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
+  if (n >= 1000) return (n / 1000).toFixed(1) + 'K';
+  return n.toString();
+}
+
 // ===== 初始化 =====
 document.addEventListener('DOMContentLoaded', () => {
   // 检查登录状态
@@ -866,6 +1031,15 @@ document.addEventListener('DOMContentLoaded', () => {
 
   initTabs();
 
-  // 自动加载配置
+  // 自动加载配置和监控数据
   loadConfig();
+  loadMetrics();
+
+  // 监控页面自动刷新
+  setInterval(() => {
+    const metricsPanel = document.getElementById('tab-metrics');
+    if (metricsPanel && metricsPanel.classList.contains('active')) {
+      loadMetrics();
+    }
+  }, 30000); // 30秒刷新一次
 });
