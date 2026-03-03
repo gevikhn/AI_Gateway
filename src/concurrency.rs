@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
 #[derive(Debug)]
@@ -12,14 +13,20 @@ pub enum ConcurrencyError {
     UpstreamLimitExceeded,
 }
 
+/// 信号量缓存条目，包含信号量和最后访问时间
+struct SemaphoreEntry {
+    semaphore: Arc<Semaphore>,
+    last_accessed: Instant,
+}
+
 /// 并发控制器，支持 API Key 级别的并发限制
 pub struct ConcurrencyController {
     /// 全局下游并发限制
     downstream_semaphore: Option<Arc<Semaphore>>,
     /// 全局上游默认限制
     upstream_default_limit: Option<usize>,
-    /// 上游并发信号量（按 key）
-    upstream_semaphores: Mutex<HashMap<String, Arc<Semaphore>>>,
+    /// 上游并发信号量（按 key），带访问时间戳
+    upstream_semaphores: Mutex<HashMap<String, SemaphoreEntry>>,
     /// API Key 级别的并发配置
     api_key_configs: HashMap<String, ApiKeyConcurrencyConfig>,
 }
@@ -131,10 +138,12 @@ impl ConcurrencyController {
             let semaphore_key = format!("downstream:{api_key}");
             let semaphore = {
                 let mut semaphores = self.upstream_semaphores.lock().await;
-                semaphores
-                    .entry(semaphore_key)
-                    .or_insert_with(|| Arc::new(Semaphore::new(limit)))
-                    .clone()
+                let entry = semaphores.entry(semaphore_key).or_insert_with(|| SemaphoreEntry {
+                    semaphore: Arc::new(Semaphore::new(limit)),
+                    last_accessed: Instant::now(),
+                });
+                entry.last_accessed = Instant::now();
+                entry.semaphore.clone()
             };
 
             return semaphore
@@ -166,10 +175,12 @@ impl ConcurrencyController {
 
         let semaphore = {
             let mut semaphores = self.upstream_semaphores.lock().await;
-            semaphores
-                .entry(semaphore_key)
-                .or_insert_with(|| Arc::new(Semaphore::new(limit)))
-                .clone()
+            let entry = semaphores.entry(semaphore_key).or_insert_with(|| SemaphoreEntry {
+                semaphore: Arc::new(Semaphore::new(limit)),
+                last_accessed: Instant::now(),
+            });
+            entry.last_accessed = Instant::now();
+            entry.semaphore.clone()
         };
 
         semaphore
@@ -204,16 +215,37 @@ impl ConcurrencyController {
 
         let semaphore = {
             let mut semaphores = self.upstream_semaphores.lock().await;
-            semaphores
-                .entry(semaphore_key)
-                .or_insert_with(|| Arc::new(Semaphore::new(limit)))
-                .clone()
+            let entry = semaphores.entry(semaphore_key).or_insert_with(|| SemaphoreEntry {
+                semaphore: Arc::new(Semaphore::new(limit)),
+                last_accessed: Instant::now(),
+            });
+            entry.last_accessed = Instant::now();
+            entry.semaphore.clone()
         };
 
         semaphore
             .try_acquire_owned()
             .map(Some)
             .map_err(map_acquire_error_to_upstream)
+    }
+
+    /// 清理长时间未使用的信号量（5分钟未使用）
+    pub async fn cleanup_unused_semaphores(&self) {
+        let mut semaphores = self.upstream_semaphores.lock().await;
+        let now = Instant::now();
+        let timeout = Duration::from_secs(300); // 5分钟
+
+        let before_count = semaphores.len();
+        semaphores.retain(|_, entry| now.duration_since(entry.last_accessed) < timeout);
+        let after_count = semaphores.len();
+
+        if before_count != after_count {
+            tracing::debug!(
+                "Cleaned up {} unused semaphores, remaining: {}",
+                before_count - after_count,
+                after_count
+            );
+        }
     }
 }
 

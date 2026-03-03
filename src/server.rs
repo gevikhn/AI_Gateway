@@ -57,6 +57,19 @@ pub async fn build_runtime_state(
         .as_ref()
         .map(|rate_limit| Arc::new(RateLimiter::new(rate_limit.per_minute)));
     let concurrency = ConcurrencyController::new(&config).map(Arc::new);
+
+    // 启动信号量清理任务（仅在首次创建时）
+    if let Some(ref ctrl) = concurrency {
+        let ctrl_clone = Arc::clone(ctrl);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                ctrl_clone.cleanup_unused_semaphores().await;
+            }
+        });
+    }
+
     // 获取旧的 api_key_manager（如果存在）
     let old_manager = old_runtime.and_then(|r| r.api_key_manager.clone());
     // 创建 API Key 管理器（支持 API Key 级别的限流和并发控制）
@@ -1243,15 +1256,15 @@ fn response_from_upstream(
 ) -> Response<Body> {
     let status = upstream_response.status();
     let headers = proxy::sanitize_response_headers(upstream_response.headers());
-    let stream: ProxyBodyStream = Box::pin(
-        upstream_response
-            .bytes_stream()
-            .map_err(|err| io::Error::other(err.to_string())),
-    );
-    let stream = if is_sse {
-        stream
+
+    // SSE流使用空闲超时，非SSE流使用请求级超时
+    let stream: ProxyBodyStream = if is_sse {
+        Box::pin(sse_stream_with_idle_timeout(upstream_response.bytes_stream()))
     } else {
-        enforce_response_deadline(stream, deadline)
+        let stream = upstream_response
+            .bytes_stream()
+            .map_err(|err| io::Error::other(err.to_string()));
+        enforce_response_deadline(Box::pin(stream), deadline)
     };
 
     let mut response = Response::new(Body::from_stream(stream));
@@ -1512,7 +1525,12 @@ fn build_upstream_clients(config: &AppConfig) -> Result<HashMap<String, reqwest:
 
 fn build_upstream_client(upstream: &UpstreamConfig) -> Result<reqwest::Client, String> {
     let mut builder = reqwest::Client::builder()
-        .connect_timeout(Duration::from_millis(upstream.connect_timeout_ms));
+        .connect_timeout(Duration::from_millis(upstream.connect_timeout_ms))
+        // HTTP/2 优化配置
+        .http2_adaptive_window(true)
+        // 连接池配置
+        .pool_idle_timeout(Duration::from_secs(30))
+        .pool_max_idle_per_host(10);
 
     if let Some(proxy) = &upstream.proxy {
         let proxy_url = build_proxy_url(proxy)?;
@@ -1573,6 +1591,48 @@ fn enforce_response_deadline(
                     )),
                     stream,
                 )),
+            }
+        },
+    ))
+}
+
+/// SSE流空闲超时配置
+const SSE_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// 为SSE流应用空闲超时机制
+/// SSE连接应该只在空闲时断开，而不是整体超时
+fn sse_stream_with_idle_timeout<S>(stream: S) -> ProxyBodyStream
+where
+    S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + Unpin + 'static,
+{
+    use futures_util::TryStreamExt;
+
+    Box::pin(futures_util::stream::unfold(
+        (stream, None::<tokio::time::Instant>),
+        move |(mut stream, last_activity)| async move {
+            let timeout_duration = last_activity
+                .map(|t| {
+                    let elapsed = t.elapsed();
+                    if elapsed >= SSE_IDLE_TIMEOUT {
+                        Duration::from_secs(0)
+                    } else {
+                        SSE_IDLE_TIMEOUT - elapsed
+                    }
+                })
+                .unwrap_or(SSE_IDLE_TIMEOUT);
+
+            match tokio::time::timeout(timeout_duration, stream.try_next()).await {
+                Ok(Ok(Some(chunk))) => {
+                    // 收到数据，更新活动时间
+                    Some((Ok(chunk), (stream, Some(tokio::time::Instant::now()))))
+                }
+                Ok(Ok(None)) => None, // 流正常结束
+                Ok(Err(error)) => Some((Err(io::Error::other(format!("{}", error))), (stream, last_activity))),
+                Err(_) => {
+                    // 空闲超时
+                    info!("SSE idle timeout after {:?}, closing stream", SSE_IDLE_TIMEOUT);
+                    None
+                }
             }
         },
     ))

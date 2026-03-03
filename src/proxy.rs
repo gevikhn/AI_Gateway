@@ -122,40 +122,62 @@ pub fn prepare_upstream_headers(
     inbound: &HeaderMap,
     upstream: &UpstreamConfig,
 ) -> Result<HeaderMap, ProxyError> {
-    let mut outbound = inbound.clone();
+    // 按需构建outbound headers，避免clone整个map再删除的开销
+    // 预估容量：inbound大小 + 注入的headers数量
+    let estimated_capacity = inbound.len() + upstream.inject_headers.len();
+    let mut outbound = HeaderMap::with_capacity(estimated_capacity);
 
-    for name in HOP_BY_HOP_HEADERS {
-        remove_header_case_insensitive(&mut outbound, name);
-    }
+    // 复制非hop-by-hop且不在remove列表中的头
+    for (name, value) in inbound.iter() {
+        let name_str = name.as_str();
 
-    for name in &upstream.remove_headers {
-        remove_header_case_insensitive(&mut outbound, name);
-    }
-
-    if !upstream.forward_xff {
-        for name in FORWARDED_IP_HEADERS {
-            remove_header_case_insensitive(&mut outbound, name);
+        // 跳过hop-by-hop headers
+        if HOP_BY_HOP_HEADERS.iter().any(|h| h.eq_ignore_ascii_case(name_str)) {
+            continue;
         }
+
+        // 跳过用户配置的remove_headers
+        if upstream.remove_headers.iter().any(|h| h.eq_ignore_ascii_case(name_str)) {
+            continue;
+        }
+
+        // 如果不forward_xff，跳过IP转发头
+        if !upstream.forward_xff && FORWARDED_IP_HEADERS.iter().any(|h| h.eq_ignore_ascii_case(name_str)) {
+            continue;
+        }
+
+        outbound.insert(name.clone(), value.clone());
     }
 
+    // 注入自定义headers
     for header in &upstream.inject_headers {
         upsert_header(&mut outbound, header)?;
     }
 
+    // 设置User-Agent（覆盖原有的）
     if let Some(user_agent) = upstream.user_agent.as_deref() {
         let ua_value = HeaderValue::from_str(user_agent)
             .map_err(|_| ProxyError::InvalidHeaderValue(user_agent.to_string()))?;
         outbound.insert(USER_AGENT, ua_value);
     }
+
+    // 移除HOST头（由reqwest自动设置）
     outbound.remove(HOST);
     Ok(outbound)
 }
 
 pub fn sanitize_response_headers(upstream_headers: &HeaderMap) -> HeaderMap {
-    let mut headers = upstream_headers.clone();
-    for name in HOP_BY_HOP_HEADERS {
-        remove_header_case_insensitive(&mut headers, name);
+    // 按需构建响应头，避免clone整个map再删除的开销
+    let mut headers = HeaderMap::with_capacity(upstream_headers.len());
+
+    for (name, value) in upstream_headers.iter() {
+        let name_str = name.as_str();
+        // 跳过hop-by-hop headers
+        if !HOP_BY_HOP_HEADERS.iter().any(|h| h.eq_ignore_ascii_case(name_str)) {
+            headers.insert(name.clone(), value.clone());
+        }
     }
+
     headers
 }
 
