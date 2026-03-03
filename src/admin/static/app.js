@@ -3342,19 +3342,36 @@ function applyTheme(theme) {
   }
 }
 
-// 更新主题切换按钮UI
+// 循环切换主题
+function cycleTheme() {
+  const currentTheme = localStorage.getItem(THEME_KEY) || 'light';
+  const themeOrder = ['light', 'dark', 'auto'];
+  const currentIndex = themeOrder.indexOf(currentTheme);
+  const nextTheme = themeOrder[(currentIndex + 1) % themeOrder.length];
+  setTheme(nextTheme);
+}
+
+// 更新主题切换按钮UI（单按钮模式，通过CSS显示对应图标）
 function updateThemeToggleUI(theme) {
-  document.querySelectorAll('.theme-toggle-btn').forEach(btn => {
-    btn.classList.toggle('active', btn.dataset.themeValue === theme);
-  });
+  // 单按钮模式下，通过data-theme属性控制图标显示
+  // 这里可以添加额外的tooltip更新逻辑
+  const themeNames = {
+    light: '亮色模式（点击切换）',
+    dark: '暗色模式（点击切换）',
+    auto: '跟随系统（点击切换）'
+  };
+  const btn = document.getElementById('themeToggleBtn');
+  if (btn) {
+    btn.title = themeNames[theme];
+  }
 }
 
 // 更新图表主题（Chart.js）
 function updateChartsTheme(theme) {
   // 设置 Chart.js 全局默认配置
   const isDark = theme === 'dark';
-  const textColor = isDark ? '#cbd5e1' : '#475569';
-  const gridColor = isDark ? '#334155' : '#e2e8f0';
+  const textColor = isDark ? '#8b949e' : '#475569';
+  const gridColor = isDark ? '#30363d' : '#e2e8f0';
 
   // 如果 Chart.js 已加载
   if (typeof Chart !== 'undefined') {
@@ -3362,8 +3379,8 @@ function updateChartsTheme(theme) {
     Chart.defaults.borderColor = gridColor;
     Chart.defaults.backgroundColor = isDark ? '#1e293b' : '#ffffff';
 
-    // 更新所有已存在的图表
-    Chart.instances.forEach(chart => {
+    // 更新所有已存在的图表（Chart.js v4.x: instances 是对象）
+    for (const chart of Object.values(Chart.instances)) {
       if (chart.options.scales) {
         Object.values(chart.options.scales).forEach(scale => {
           if (scale.ticks) scale.ticks.color = textColor;
@@ -3375,7 +3392,7 @@ function updateChartsTheme(theme) {
         chart.options.plugins.legend.labels.color = textColor;
       }
       chart.update('none');
-    });
+    }
   }
 }
 

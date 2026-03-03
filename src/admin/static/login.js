@@ -26,11 +26,28 @@ function applyTheme(theme) {
   document.documentElement.setAttribute('data-theme', theme);
 }
 
-// 更新主题切换按钮UI
+// 循环切换主题
+function cycleTheme() {
+  const currentTheme = localStorage.getItem(THEME_KEY) || 'light';
+  const themeOrder = ['light', 'dark', 'auto'];
+  const currentIndex = themeOrder.indexOf(currentTheme);
+  const nextTheme = themeOrder[(currentIndex + 1) % themeOrder.length];
+  setTheme(nextTheme);
+}
+
+// 更新主题切换按钮UI（单按钮模式）
 function updateThemeToggleUI(theme) {
-  document.querySelectorAll('.theme-toggle-btn').forEach(btn => {
-    btn.classList.toggle('active', btn.dataset.themeValue === theme);
-  });
+  // 单按钮模式下，通过data-theme属性控制图标显示
+  // 这里可以添加额外的tooltip更新逻辑
+  const themeNames = {
+    light: '亮色模式（点击切换）',
+    dark: '暗色模式（点击切换）',
+    auto: '跟随系统（点击切换）'
+  };
+  const btn = document.getElementById('loginThemeBtn');
+  if (btn) {
+    btn.title = themeNames[theme];
+  }
 }
 
 // 监听系统主题变化
