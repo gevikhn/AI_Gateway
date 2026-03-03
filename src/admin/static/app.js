@@ -3299,3 +3299,97 @@ document.addEventListener('click', (e) => {
     });
   }
 });
+
+// ===== 主题管理 =====
+const THEME_KEY = 'ai_gateway_theme';
+
+// 初始化主题
+function initTheme() {
+  const savedTheme = localStorage.getItem(THEME_KEY) || 'light';
+  applyTheme(savedTheme);
+  updateThemeToggleUI(savedTheme);
+}
+
+// 设置主题
+function setTheme(theme) {
+  if (theme !== 'light' && theme !== 'dark' && theme !== 'auto') {
+    theme = 'light';
+  }
+
+  localStorage.setItem(THEME_KEY, theme);
+  applyTheme(theme);
+  updateThemeToggleUI(theme);
+
+  // 显示提示
+  const themeNames = {
+    light: '亮色模式',
+    dark: '暗色模式',
+    auto: '跟随系统'
+  };
+  Toast.show(`已切换到${themeNames[theme]}`, 'success', 2000);
+}
+
+// 应用主题
+function applyTheme(theme) {
+  document.documentElement.setAttribute('data-theme', theme);
+
+  // 如果是自动模式，需要检测系统主题并设置 Chart.js 主题
+  if (theme === 'auto') {
+    const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+    updateChartsTheme(prefersDark ? 'dark' : 'light');
+  } else {
+    updateChartsTheme(theme);
+  }
+}
+
+// 更新主题切换按钮UI
+function updateThemeToggleUI(theme) {
+  document.querySelectorAll('.theme-toggle-btn').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.themeValue === theme);
+  });
+}
+
+// 更新图表主题（Chart.js）
+function updateChartsTheme(theme) {
+  // 设置 Chart.js 全局默认配置
+  const isDark = theme === 'dark';
+  const textColor = isDark ? '#cbd5e1' : '#475569';
+  const gridColor = isDark ? '#334155' : '#e2e8f0';
+
+  // 如果 Chart.js 已加载
+  if (typeof Chart !== 'undefined') {
+    Chart.defaults.color = textColor;
+    Chart.defaults.borderColor = gridColor;
+    Chart.defaults.backgroundColor = isDark ? '#1e293b' : '#ffffff';
+
+    // 更新所有已存在的图表
+    Chart.instances.forEach(chart => {
+      if (chart.options.scales) {
+        Object.values(chart.options.scales).forEach(scale => {
+          if (scale.ticks) scale.ticks.color = textColor;
+          if (scale.grid) scale.grid.color = gridColor;
+        });
+      }
+      if (chart.options.plugins && chart.options.plugins.legend) {
+        chart.options.plugins.legend.labels = chart.options.plugins.legend.labels || {};
+        chart.options.plugins.legend.labels.color = textColor;
+      }
+      chart.update('none');
+    });
+  }
+}
+
+// 监听系统主题变化
+window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', (e) => {
+  const currentTheme = localStorage.getItem(THEME_KEY) || 'light';
+  if (currentTheme === 'auto') {
+    updateChartsTheme(e.matches ? 'dark' : 'light');
+    // 重新渲染图表以适应新主题
+    if (typeof renderMetricsCharts === 'function') {
+      renderMetricsCharts();
+    }
+  }
+});
+
+// 页面加载时初始化主题
+document.addEventListener('DOMContentLoaded', initTheme);

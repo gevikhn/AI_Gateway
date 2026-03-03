@@ -1,5 +1,45 @@
 // ===== 登录逻辑 =====
 const TOKEN_KEY = 'ai_gateway_admin_token';
+const THEME_KEY = 'ai_gateway_theme';
+
+// ===== 主题管理 =====
+// 初始化主题
+function initTheme() {
+  const savedTheme = localStorage.getItem(THEME_KEY) || 'light';
+  applyTheme(savedTheme);
+  updateThemeToggleUI(savedTheme);
+}
+
+// 设置主题
+function setTheme(theme) {
+  if (theme !== 'light' && theme !== 'dark' && theme !== 'auto') {
+    theme = 'light';
+  }
+
+  localStorage.setItem(THEME_KEY, theme);
+  applyTheme(theme);
+  updateThemeToggleUI(theme);
+}
+
+// 应用主题
+function applyTheme(theme) {
+  document.documentElement.setAttribute('data-theme', theme);
+}
+
+// 更新主题切换按钮UI
+function updateThemeToggleUI(theme) {
+  document.querySelectorAll('.theme-toggle-btn').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.themeValue === theme);
+  });
+}
+
+// 监听系统主题变化
+window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
+  const currentTheme = localStorage.getItem(THEME_KEY) || 'light';
+  if (currentTheme === 'auto') {
+    applyTheme('auto');
+  }
+});
 
 // 检查是否已登录
 function checkAuth() {
@@ -77,7 +117,11 @@ function showError(message) {
 
 // 页面加载时检查
 if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', checkAuth);
+  document.addEventListener('DOMContentLoaded', () => {
+    initTheme();
+    checkAuth();
+  });
 } else {
+  initTheme();
   checkAuth();
 }
