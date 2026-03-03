@@ -15,6 +15,7 @@ pub fn register_admin_routes(router: Router<AppState>, prefix: &str) -> Router<A
     router
         .route(&format!("{prefix}/ui"), get(admin_ui_handler))
         .route(&format!("{prefix}/login"), get(admin_login_handler))
+        .route(&format!("{prefix}/favicon.ico"), get(admin_favicon_handler))
         .route(
             &format!("{prefix}/api/config"),
             get(admin_config_get_handler).put(admin_config_apply_handler),
@@ -439,6 +440,27 @@ async fn admin_login_handler(State(state): State<AppState>) -> Response<Body> {
     response.headers_mut().insert(
         CONTENT_TYPE,
         http::HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    response
+}
+
+/// Favicon ICO 处理函数
+/// 返回 admin-logo SVG 图标
+async fn admin_favicon_handler() -> Response<Body> {
+    // 使用与 admin-logo 相同的 SVG 图标
+    // 使用 rgb() 格式避免 # 字符问题
+    const FAVICON_SVG: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="rgb(20,184,166)" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>"#;
+
+    let mut response = Response::new(Body::from(FAVICON_SVG));
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        http::HeaderValue::from_static("image/svg+xml"),
+    );
+    // 缓存 1 天
+    response.headers_mut().insert(
+        http::header::CACHE_CONTROL,
+        http::HeaderValue::from_static("public, max-age=86400"),
     );
     response
 }
