@@ -157,7 +157,14 @@ impl ApiKeyManager {
             }
         }
 
-        if let Some(allowed_route) = &info.resolved.route_id {
+        // 检查路由权限（优先使用 route_ids，兼容 route_id）
+        if let Some(allowed_routes) = &info.resolved.route_ids {
+            // 使用新的 route_ids 字段（多路由）
+            if !allowed_routes.is_empty() && !allowed_routes.contains(&route_id.to_string()) {
+                return Err(ApiKeyError::RouteNotAllowed);
+            }
+        } else if let Some(allowed_route) = &info.resolved.route_id {
+            // 兼容旧的 route_id 字段（单路由）
             if allowed_route != route_id {
                 return Err(ApiKeyError::RouteNotAllowed);
             }

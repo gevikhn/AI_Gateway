@@ -511,7 +511,6 @@ mod tests {
         AppConfig {
             listen: "127.0.0.1:8080".to_string(),
             gateway_auth: GatewayAuthConfig {
-                api_keys: vec!["gw_token".to_string()],
                 token_sources: vec![TokenSourceConfig::AuthorizationBearer],
             },
             routes: vec![RouteConfig {
@@ -554,6 +553,7 @@ mod tests {
             .map(|(key, concurrency)| ApiKeyConfig {
                 id: format!("ak-{key}"),
                 route_id: None,
+                route_ids: None,
                 key: key.to_string(),
                 enabled: true,
                 remark: String::new(),
@@ -567,7 +567,6 @@ mod tests {
         AppConfig {
             listen: "127.0.0.1:8080".to_string(),
             gateway_auth: GatewayAuthConfig {
-                api_keys: vec!["gw_token".to_string()],
                 token_sources: vec![TokenSourceConfig::AuthorizationBearer],
             },
             routes: vec![RouteConfig {

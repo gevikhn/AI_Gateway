@@ -250,23 +250,6 @@ impl AppConfig {
             }
         }
 
-        // 2. 处理 gateway_auth.api_keys（简写格式，向后兼容）
-        for key in &self.gateway_auth.api_keys {
-            if seen_keys.insert(key.clone()) {
-                resolved.push(ResolvedApiKey {
-                    id: generate_key_id(key),
-                    key: key.clone(),
-                    route_ids: None, // 所有路由
-                    enabled: true,
-                    remark: String::new(),
-                    rate_limit: None,
-                    concurrency: None,
-                    ban_rules: Vec::new(),
-                    ban_status: None,
-                });
-            }
-        }
-
         resolved
     }
 }
@@ -797,7 +780,6 @@ BanLogEntry（持久化）
 ## 8. 关键设计决策
 
 1. **统一 API Key 管理**：所有 API Key 统一通过 `api_keys.keys` 配置，不再支持路由级 `route.api_keys`
-2. **向后兼容策略**：保留 `gateway_auth.api_keys` 简写格式，通过 `resolved_api_keys()` 统一转换为新格式
 3. **路由权限**：使用 `route_id: Option<String>` 控制，None 表示所有路由
 4. **封禁状态持久化**：`ban_status` 存储在配置中，重启后保持
 5. **封禁日志独立**：使用单独的 SQLite 数据库，避免影响主配置

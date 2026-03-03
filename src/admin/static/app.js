@@ -241,10 +241,7 @@ const TABS = [
   { id: 'banrules', label: '封禁规则' },
   { id: 'banlogs', label: '封禁日志' },
   { id: 'metrics', label: '监控' },
-  { id: 'auth', label: '认证' },
-  { id: 'cors', label: 'CORS' },
-  { id: 'ratelimit', label: '限流' },
-  { id: 'concurrency', label: '并发控制' },
+  { id: 'gateway', label: '网关配置' },
   { id: 'advanced', label: '高级', badge: '需重启' }
 ];
 
@@ -275,10 +272,9 @@ function loadApiKeysFromConfig() {
   }
 
   return cfg.api_keys.keys.map(keyConfig => {
-    // 处理 route_id（后端是 Option<String>，前端用数组便于处理）
-    const routeId = keyConfig.route_id || null;
-    const routeIds = routeId ? [routeId] : [];
-    const routeName = routeId ? (cfg.routes?.find(r => r.id === routeId)?.name || routeId) : null;
+    // 处理 route_ids（优先使用，兼容 route_id）
+    const routeIds = keyConfig.route_ids || (keyConfig.route_id ? [keyConfig.route_id] : []);
+    const routeNames = routeIds.map(rid => cfg.routes?.find(r => r.id === rid)?.name || rid);
 
     // 封禁状态处理
     const banStatus = keyConfig.ban_status || {};
@@ -286,10 +282,8 @@ function loadApiKeysFromConfig() {
     return {
       id: keyConfig.id,
       key: keyConfig.key,
-      route_id: routeId,
       route_ids: routeIds,
-      route_name: routeName,
-      route_names: routeName ? [routeName] : [],
+      route_names: routeNames,
       enabled: keyConfig.enabled,
       remark: keyConfig.remark || '',
       // 限流配置
@@ -315,12 +309,12 @@ function loadApiKeysFromConfig() {
 
 // 将前端 API Key 数据转换为后端配置格式（架构设计 v2）
 function convertApiKeyToConfig(apiKey) {
-  // 如果 route_ids 有多个，取第一个（后端当前只支持单路由）
-  const routeId = apiKey.route_ids?.length > 0 ? apiKey.route_ids[0] : null;
+  // 支持多路由：route_ids 数组
+  const routeIds = apiKey.route_ids?.length > 0 ? apiKey.route_ids : null;
 
   return {
     id: apiKey.id,
-    route_id: routeId,
+    route_ids: routeIds,
     key: apiKey.key,
     enabled: apiKey.enabled,
     remark: apiKey.remark || '',
@@ -575,10 +569,7 @@ function renderAll() {
   renderBanRules();
   renderBanLogs();
   renderMetrics();
-  renderAuth();
-  renderCors();
-  renderRateLimit();
-  renderConcurrency();
+  renderGateway();
   renderAdvanced();
 }
 
@@ -974,7 +965,7 @@ function openApiKeyModal(id) {
   modal.id = 'apikey-modal';
 
   // 准备路由选择数据（支持多选）
-  const selectedRoutes = key?.route_ids || (key?.route_id ? [key.route_id] : []);
+  const selectedRoutes = key?.route_ids || [];
   const isAllRoutes = selectedRoutes.length === 0;
 
   modal.innerHTML = `
@@ -1022,7 +1013,7 @@ function openApiKeyModal(id) {
                     </div>
                     ${routes.map(r => {
                       const isSel = selectedRoutes.includes(r.id);
-                      return `<div class="multi-select-option ${isSel ? 'selected' : ''} ${isAllRoutes ? 'disabled' : ''}" data-value="${esc(r.id)}" onclick="selectRouteOption(this)">
+                      return `<div class="multi-select-option ${isSel ? 'selected' : ''}" data-value="${esc(r.id)}" onclick="selectRouteOption(this)">
                         <div class="multi-select-checkbox"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg></div>
                         <span>${esc(r.id)}${r.prefix ? ` (${esc(r.prefix)})` : ''}</span>
                       </div>`;
@@ -1030,7 +1021,7 @@ function openApiKeyModal(id) {
                   </div>
                 </div>
               </div>
-              <input type="hidden" id="apikey-routes" value='${JSON.stringify(selectedRoutes)}'>
+              <input type="hidden" id="apikey-routes" class="apikey-routes-input" value='${JSON.stringify(selectedRoutes)}'>
               <div class="field-help">选择"所有路由"可访问全部路由；选择具体路由则只能访问指定路由</div>
             </div>
             <div class="field">
@@ -1167,25 +1158,22 @@ function saveApiKeyV2(id) {
   const perMinute = parseInt(document.getElementById('apikey-per-minute').value) || 120;
   const maxInflight = parseInt(document.getElementById('apikey-max-inflight').value) || null;
 
-  // 收集选中的路由（多选，但后端当前只支持单路由，取第一个）
+  // 收集选中的路由（支持多路由）
   const routeInput = document.getElementById('apikey-routes');
   const selectedRoutes = routeInput ? JSON.parse(routeInput.value || '[]') : [];
-  const routeId = selectedRoutes.length > 0 ? selectedRoutes[0] : null;
 
   // 查找路由名称
-  const routeName = routeId ? (cfg?.routes?.find(r => r.id === routeId)?.name || routeId) : null;
+  const routeNames = selectedRoutes.map(r => {
+    const rt = cfg?.routes?.find(rt => rt.id === r);
+    return rt ? (rt.name || rt.id) : r;
+  });
 
   // 构建 API Key 数据对象
   const keyData = {
     id: id || 'key_' + Date.now(),
-    key: value || generateApiKey(routeId || 'global'),
-    route_id: routeId,
-    route_ids: selectedRoutes, // 保存所有选中的路由，为将来后端支持多路由做准备
-    route_name: routeName,
-    route_names: selectedRoutes.map(r => {
-      const rt = cfg?.routes?.find(rt => rt.id === r);
-      return rt ? (rt.name || rt.id) : r;
-    }),
+    key: value || generateApiKey(selectedRoutes[0] || 'global'),
+    route_ids: selectedRoutes,
+    route_names: routeNames,
     enabled: true,
     remark: remark || '',
     per_minute: perMinute,
@@ -1280,12 +1268,12 @@ function saveApiKey(id) {
   const route = cfg?.routes?.find(r => r.id === routeId);
   const routeName = route ? (route.name || routeId) : routeId;
 
-  // 构建 API Key 数据对象
+  // 构建 API Key 数据对象（使用 route_ids 数组格式）
   const keyData = {
     id: id || Date.now().toString(),
     key: value || generateApiKey(routeId),
-    route_id: routeId,
-    route_name: routeName,
+    route_ids: routeId ? [routeId] : [],
+    route_names: routeName ? [routeName] : [],
     enabled: true,
     banned: false,
     remark: remark || '',
@@ -1512,7 +1500,7 @@ function openBanRuleModal(idx) {
   const condType = cond.type || 'error_rate';
 
   modal.innerHTML = `
-    <div class="modal" role="dialog" aria-modal="true">
+    <div class="modal banrule-modal" role="dialog" aria-modal="true">
       <div class="modal-header">
         <h3 class="modal-title">${isEdit ? '编辑封禁规则' : '添加封禁规则'}</h3>
         <button class="btn btn-ghost btn-sm" onclick="closeBanRuleModal()">
@@ -2193,65 +2181,158 @@ function addRoute() {
   Toast.show('新路由已添加', 'info');
 }
 
-// -- Auth --
-function renderAuth() {
-  const panel = document.getElementById('tab-auth');
-  if (!panel) return;
-
-  const auth = cfg.gateway_auth || { tokens: [], token_sources: [] };
-
-  let tokensHtml = (auth.tokens || []).map((t, i) => `
-    <div class="token-row">
-      <input class="input" type="password" value="${esc(t)}" onchange="cfg.gateway_auth.tokens[${i}]=this.value" />
-      <button class="btn btn-danger btn-sm" onclick="cfg.gateway_auth.tokens.splice(${i},1);renderAuth();Toast.show('Token已删除','success')">删除</button>
-    </div>
-  `).join('');
-
-  let srcHtml = (auth.token_sources || []).map((s, i) => {
-    if (s.type === 'authorization_bearer') {
-      return `<div class="token-row">
-        <input class="input" value="Authorization Bearer" readonly />
-        <button class="btn btn-danger btn-sm" onclick="cfg.gateway_auth.token_sources.splice(${i},1);renderAuth()">删除</button>
-      </div>`;
-    }
-    return `<div class="token-row">
-      <input class="input" value="Header: ${esc(s.name || '')}" onchange="parseTokenSource(${i}, this.value)" />
-      <button class="btn btn-danger btn-sm" onclick="cfg.gateway_auth.token_sources.splice(${i},1);renderAuth()">删除</button>
-    </div>`;
-  }).join('');
-
-  panel.innerHTML = `
-    <div class="field">
-      <label class="field-label">Gateway Tokens</label>
-      <div class="token-list">${tokensHtml}</div>
-      <button class="btn btn-secondary btn-sm" style="margin-top:var(--space-2)" onclick="cfg.gateway_auth.tokens.push('');renderAuth()">+ 添加 Token</button>
-    </div>
-    <div class="field">
-      <label class="field-label">Token Sources</label>
-      <div class="token-list">${srcHtml}</div>
-      <div style="display:flex;gap:var(--space-2);margin-top:var(--space-2)">
-        <button class="btn btn-secondary btn-sm" onclick="cfg.gateway_auth.token_sources.push({type:'authorization_bearer'});renderAuth()">+ Authorization Bearer</button>
-        <button class="btn btn-secondary btn-sm" onclick="cfg.gateway_auth.token_sources.push({type:'header',name:'x-gw-token'});renderAuth()">+ 自定义 Header</button>
-      </div>
-    </div>
-  `;
-}
-
 function parseTokenSource(i, value) {
   if (value.startsWith('Header:') || value.startsWith('header:')) {
     cfg.gateway_auth.token_sources[i] = { type: 'header', name: value.substring(7).trim() };
   }
 }
 
-// -- CORS --
-function renderCors() {
-  const panel = document.getElementById('tab-cors');
+// -- Gateway Config (整合认证、CORS、限流、并发控制) --
+function renderGateway() {
+  const panel = document.getElementById('tab-gateway');
   if (!panel) return;
 
+  // 渲染各个子模块
+  const authHtml = renderGatewayAuthSection();
+  const corsHtml = renderGatewayCorsSection();
+  const rateLimitHtml = renderGatewayRateLimitSection();
+  const concurrencyHtml = renderGatewayConcurrencySection();
+
+  panel.innerHTML = `
+    <div class="gateway-config-layout">
+      <!-- 左侧快速导航 -->
+      <aside class="gateway-nav">
+        <div class="gateway-nav-title">快速导航</div>
+        <nav class="gateway-nav-list">
+          <a href="#section-auth" class="gateway-nav-item active" data-section="auth">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+            </svg>
+            认证配置
+          </a>
+          <a href="#section-cors" class="gateway-nav-item" data-section="cors">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="12" cy="12" r="10"/>
+              <path d="M2 12h20M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>
+            </svg>
+            CORS 配置
+          </a>
+          <a href="#section-ratelimit" class="gateway-nav-item" data-section="ratelimit">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="12" cy="12" r="10"/>
+              <polyline points="12 6 12 12 16 14"/>
+            </svg>
+            限流配置
+          </a>
+          <a href="#section-concurrency" class="gateway-nav-item" data-section="concurrency">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/>
+            </svg>
+            并发控制
+          </a>
+        </nav>
+      </aside>
+
+      <!-- 右侧配置内容 -->
+      <div class="gateway-config-content">
+        <div id="section-auth" class="config-section">
+          <h3 class="section-title">认证配置</h3>
+          ${authHtml}
+        </div>
+        <div id="section-cors" class="config-section">
+          <h3 class="section-title">CORS 配置</h3>
+          ${corsHtml}
+        </div>
+        <div id="section-ratelimit" class="config-section">
+          <h3 class="section-title">限流配置</h3>
+          ${rateLimitHtml}
+        </div>
+        <div id="section-concurrency" class="config-section">
+          <h3 class="section-title">并发控制配置</h3>
+          ${concurrencyHtml}
+        </div>
+      </div>
+    </div>
+  `;
+
+  // 初始化导航交互
+  initGatewayNav();
+}
+
+// 初始化网关配置导航
+function initGatewayNav() {
+  const navItems = document.querySelectorAll('.gateway-nav-item');
+  const sections = document.querySelectorAll('.config-section');
+
+  // 点击导航平滑滚动到对应区块
+  navItems.forEach(item => {
+    item.addEventListener('click', (e) => {
+      e.preventDefault();
+      const targetId = item.getAttribute('href').substring(1);
+      const targetSection = document.getElementById(targetId);
+      if (targetSection) {
+        targetSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        // 更新活跃状态
+        navItems.forEach(n => n.classList.remove('active'));
+        item.classList.add('active');
+      }
+    });
+  });
+
+  // 滚动时自动高亮对应导航项
+  const observerOptions = {
+    root: null,
+    rootMargin: '-20% 0px -60% 0px',
+    threshold: 0
+  };
+
+  const observer = new IntersectionObserver((entries) => {
+    entries.forEach(entry => {
+      if (entry.isIntersecting) {
+        const id = entry.target.id;
+        navItems.forEach(item => {
+          item.classList.toggle('active', item.getAttribute('href') === `#${id}`);
+        });
+      }
+    });
+  }, observerOptions);
+
+  sections.forEach(section => observer.observe(section));
+}
+
+function renderGatewayAuthSection() {
+  const auth = cfg.gateway_auth || { token_sources: [] };
+
+  let srcHtml = (auth.token_sources || []).map((s, i) => {
+    if (s.type === 'authorization_bearer') {
+      return `<div class="token-row">
+        <input class="input" value="Authorization Bearer" readonly />
+        <button class="btn btn-danger btn-sm" onclick="cfg.gateway_auth.token_sources.splice(${i},1);renderGateway()">删除</button>
+      </div>`;
+    }
+    return `<div class="token-row">
+      <input class="input" value="Header: ${esc(s.name || '')}" onchange="parseTokenSource(${i}, this.value)" />
+      <button class="btn btn-danger btn-sm" onclick="cfg.gateway_auth.token_sources.splice(${i},1);renderGateway()">删除</button>
+    </div>`;
+  }).join('');
+
+  return `
+    <div class="field">
+      <label class="field-label">Token Sources</label>
+      <div class="token-list">${srcHtml}</div>
+      <div style="display:flex;gap:var(--space-2);margin-top:var(--space-2)">
+        <button class="btn btn-secondary btn-sm" onclick="cfg.gateway_auth.token_sources.push({type:'authorization_bearer'});renderGateway()">+ Authorization Bearer</button>
+        <button class="btn btn-secondary btn-sm" onclick="cfg.gateway_auth.token_sources.push({type:'header',name:'x-gw-token'});renderGateway()">+ 自定义 Header</button>
+      </div>
+    </div>
+  `;
+}
+
+function renderGatewayCorsSection() {
   const cors = cfg.cors || { enabled: false, allow_origins: [], allow_headers: [], allow_methods: [], expose_headers: [] };
   if (!cfg.cors) cfg.cors = cors;
 
-  panel.innerHTML = `
+  return `
     <div class="field">
       <label class="toggle">
         <input type="checkbox" class="toggle-input" ${cors.enabled ? 'checked' : ''} onchange="cfg.cors.enabled=this.checked" />
@@ -2278,16 +2359,12 @@ function renderCors() {
   `;
 }
 
-// -- Rate Limit --
-function renderRateLimit() {
-  const panel = document.getElementById('tab-ratelimit');
-  if (!panel) return;
-
+function renderGatewayRateLimitSection() {
   const rl = cfg.rate_limit;
   const enabled = !!rl;
   const perMinute = rl ? rl.per_minute : 120;
 
-  panel.innerHTML = `
+  return `
     <div class="field">
       <label class="toggle">
         <input type="checkbox" class="toggle-input" ${enabled ? 'checked' : ''} onchange="toggleRateLimit(this.checked)" />
@@ -2302,26 +2379,13 @@ function renderRateLimit() {
   `;
 }
 
-function toggleRateLimit(enabled) {
-  if (enabled) {
-    cfg.rate_limit = { per_minute: 120 };
-  } else {
-    cfg.rate_limit = null;
-  }
-  renderRateLimit();
-}
-
-// -- Concurrency --
-function renderConcurrency() {
-  const panel = document.getElementById('tab-concurrency');
-  if (!panel) return;
-
+function renderGatewayConcurrencySection() {
   const cc = cfg.concurrency;
   const enabled = !!cc;
   const ds = cc ? cc.downstream_max_inflight : null;
   const us = cc ? cc.upstream_per_key_max_inflight : null;
 
-  panel.innerHTML = `
+  return `
     <div class="field">
       <label class="toggle">
         <input type="checkbox" class="toggle-input" ${enabled ? 'checked' : ''} onchange="toggleConcurrency(this.checked)" />
@@ -2340,13 +2404,23 @@ function renderConcurrency() {
   `;
 }
 
+
+function toggleRateLimit(enabled) {
+  if (enabled) {
+    cfg.rate_limit = { per_minute: 120 };
+  } else {
+    cfg.rate_limit = null;
+  }
+  renderGateway();
+}
+
 function toggleConcurrency(enabled) {
   if (enabled) {
     cfg.concurrency = { downstream_max_inflight: null, upstream_per_key_max_inflight: null };
   } else {
     cfg.concurrency = null;
   }
-  renderConcurrency();
+  renderGateway();
 }
 
 // -- Advanced --
@@ -3111,33 +3185,35 @@ function filterRouteOptions(input) {
 
 // 选择/取消选择路由选项
 function selectRouteOption(option) {
+  if (!option) return;
   const value = option.dataset.value;
   const multiSelect = option.closest('.multi-select');
+  if (!multiSelect) return;
   const isSpecial = option.classList.contains('special');
-  const hiddenInput = multiSelect.querySelector('#apikey-routes');
+  const hiddenInput = multiSelect.parentElement.querySelector('.apikey-routes-input');
+  if (!hiddenInput) return;
   let selectedRoutes = JSON.parse(hiddenInput.value || '[]');
+  const allRoutesOption = multiSelect.querySelector('.multi-select-option.special');
 
   if (isSpecial) {
-    // 选择"所有路由" - 清空其他选择
+    // 点击"所有路由"
     if (option.classList.contains('selected')) {
-      // 取消选择"所有路由" - 保持为空（表示所有路由）
+      // 已选中，取消选择（变成空选，表示所有路由）
       option.classList.remove('selected');
       selectedRoutes = [];
     } else {
-      // 选择"所有路由" - 清空其他具体路由
+      // 未选中，选择"所有路由"，清空所有具体路由
       option.classList.add('selected');
       multiSelect.querySelectorAll('.multi-select-option:not(.special)').forEach(opt => {
         opt.classList.remove('selected');
-        opt.classList.add('disabled');
       });
       selectedRoutes = [];
     }
   } else {
-    // 选择具体路由
-    if (option.classList.contains('disabled')) return; // 禁用状态下不可选
-
-    const allRoutesOption = multiSelect.querySelector('.multi-select-option.special');
-    allRoutesOption.classList.remove('selected');
+    // 点击具体路由，自动取消"所有路由"
+    if (allRoutesOption) {
+      allRoutesOption.classList.remove('selected');
+    }
 
     if (option.classList.contains('selected')) {
       // 取消选择
@@ -3161,10 +3237,14 @@ function selectRouteOption(option) {
 
 // 移除已选标签
 function removeRouteTag(removeBtn) {
+  if (!removeBtn) return;
   const tag = removeBtn.closest('.multi-select-tag');
+  if (!tag) return;
   const value = tag.dataset.value;
   const multiSelect = tag.closest('.multi-select');
-  const hiddenInput = multiSelect.querySelector('#apikey-routes');
+  if (!multiSelect) return;
+  const hiddenInput = multiSelect.parentElement.querySelector('.apikey-routes-input');
+  if (!hiddenInput) return;
   let selectedRoutes = JSON.parse(hiddenInput.value || '[]');
 
   selectedRoutes = selectedRoutes.filter(r => r !== value);
@@ -3184,6 +3264,7 @@ function updateMultiSelectDisplay(multiSelect, selectedRoutes) {
   const valuesContainer = multiSelect.querySelector('.multi-select-values');
   const routes = cfg?.routes || [];
 
+  // 根据实际选择渲染标签
   if (selectedRoutes.length === 0) {
     valuesContainer.innerHTML = '<span class="multi-select-tag all-routes">所有路由</span>';
   } else {
@@ -3193,17 +3274,20 @@ function updateMultiSelectDisplay(multiSelect, selectedRoutes) {
     }).join('');
   }
 
-  // 更新"所有路由"选项状态和禁用状态
+  // 同步选项的选中状态
   const allRoutesOption = multiSelect.querySelector('.multi-select-option.special');
   const otherOptions = multiSelect.querySelectorAll('.multi-select-option:not(.special)');
 
-  if (selectedRoutes.length === 0) {
-    allRoutesOption.classList.add('selected');
-    otherOptions.forEach(opt => opt.classList.add('disabled'));
-  } else {
-    allRoutesOption.classList.remove('selected');
-    otherOptions.forEach(opt => opt.classList.remove('disabled'));
+  if (allRoutesOption) {
+    // 没有选择具体路由时，"所有路由"视为选中
+    allRoutesOption.classList.toggle('selected', selectedRoutes.length === 0);
   }
+
+  // 同步具体路由选项的选中状态
+  otherOptions.forEach(opt => {
+    const routeValue = opt.dataset.value;
+    opt.classList.toggle('selected', selectedRoutes.includes(routeValue));
+  });
 }
 
 // 点击外部关闭下拉框

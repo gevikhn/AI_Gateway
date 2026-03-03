@@ -1729,7 +1729,6 @@ mod tests {
         AppConfig {
             listen: "127.0.0.1:8080".to_string(),
             gateway_auth: GatewayAuthConfig {
-                api_keys: vec!["gw_token".to_string()],
                 token_sources: vec![TokenSourceConfig::AuthorizationBearer],
             },
             routes: vec![RouteConfig {

@@ -1,6 +1,6 @@
 use ai_gw_lite::config::{
-    AppConfig, GatewayAuthConfig, HeaderInjection, InboundTlsConfig, RouteConfig,
-    TokenSourceConfig, UpstreamConfig,
+    ApiKeyConfig, ApiKeysGlobalConfig, AppConfig, GatewayAuthConfig, HeaderInjection,
+    InboundTlsConfig, RouteConfig, TokenSourceConfig, UpstreamConfig,
 };
 use ai_gw_lite::server::run_server;
 use std::net::{SocketAddr, TcpListener};
@@ -18,7 +18,6 @@ async fn https_listener_auto_generates_self_signed_cert() {
     let config = AppConfig {
         listen: listen_addr.to_string(),
         gateway_auth: GatewayAuthConfig {
-            api_keys: vec!["gw_token".to_string()],
             token_sources: vec![TokenSourceConfig::AuthorizationBearer],
         },
         routes: vec![RouteConfig {
@@ -40,7 +39,22 @@ async fn https_listener_auto_generates_self_signed_cert() {
                 user_agent: None,
             },
         }],
-        api_keys: None,
+        api_keys: Some(ApiKeysGlobalConfig {
+            keys: vec![ApiKeyConfig {
+                id: "default".to_string(),
+                route_id: None,
+                route_ids: None,
+                key: "gw_token".to_string(),
+                enabled: true,
+                remark: String::new(),
+                rate_limit: None,
+                concurrency: None,
+                ban_rules: Vec::new(),
+                ban_status: None,
+            }],
+            ban_rules: Vec::new(),
+            sqlite: None,
+        }),
         inbound_tls: Some(InboundTlsConfig {
             cert_path: None,
             key_path: None,

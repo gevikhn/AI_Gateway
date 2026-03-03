@@ -1,7 +1,8 @@
 use ai_gw_lite::config::{
-    AppConfig, ConcurrencyConfig, CorsConfig, GatewayAuthConfig, HeaderInjection, LogFormat,
-    LoggingConfig, MetricsConfig, ObservabilityConfig, ProxyProtocol, RateLimitConfig, RouteConfig,
-    TokenSourceConfig, TracingConfig, UpstreamConfig, UpstreamProxyConfig,
+    ApiKeyConfig, ApiKeysGlobalConfig, AppConfig, ConcurrencyConfig, CorsConfig, GatewayAuthConfig,
+    HeaderInjection, LogFormat, LoggingConfig, MetricsConfig, ObservabilityConfig, ProxyProtocol,
+    RateLimitConfig, RouteConfig, TokenSourceConfig, TracingConfig, UpstreamConfig,
+    UpstreamProxyConfig,
 };
 use ai_gw_lite::observability;
 use ai_gw_lite::server::build_app;
@@ -953,7 +954,6 @@ fn gateway_config(upstream_addr: String, request_timeout_ms: u64) -> AppConfig {
     AppConfig {
         listen: "127.0.0.1:8080".to_string(),
         gateway_auth: GatewayAuthConfig {
-            api_keys: vec!["gw_token".to_string()],
             token_sources: vec![TokenSourceConfig::AuthorizationBearer],
         },
         routes: vec![RouteConfig {
@@ -981,7 +981,22 @@ fn gateway_config(upstream_addr: String, request_timeout_ms: u64) -> AppConfig {
                 user_agent: None,
             },
         }],
-        api_keys: None,
+        api_keys: Some(ApiKeysGlobalConfig {
+            keys: vec![ApiKeyConfig {
+                id: "default".to_string(),
+                route_id: None,
+                route_ids: None,
+                key: "gw_token".to_string(),
+                enabled: true,
+                remark: String::new(),
+                rate_limit: None,
+                concurrency: None,
+                ban_rules: Vec::new(),
+                ban_status: None,
+            }],
+            ban_rules: Vec::new(),
+            sqlite: None,
+        }),
         inbound_tls: None,
         cors: None,
         rate_limit: None,

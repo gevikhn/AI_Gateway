@@ -30,8 +30,6 @@ pub struct AppConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GatewayAuthConfig {
-    #[serde(alias = "tokens")]
-    pub api_keys: Vec<String>,
     #[serde(default = "default_token_sources")]
     pub token_sources: Vec<TokenSourceConfig>,
 }
@@ -286,8 +284,12 @@ pub struct ApiKeyConfig {
     /// 唯一标识符
     pub id: String,
     /// 关联的路由ID（None 表示所有路由）
+    /// 注意：route_ids 优先级高于 route_id
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route_id: Option<String>,
+    /// 关联的多个路由ID（None 表示所有路由）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_ids: Option<Vec<String>>,
     /// API Key 值
     pub key: String,
     /// 是否启用
@@ -393,6 +395,7 @@ pub struct ResolvedApiKey {
     pub id: String,
     pub key: String,
     pub route_id: Option<String>,
+    pub route_ids: Option<Vec<String>>,
     pub enabled: bool,
     pub remark: String,
     pub rate_limit: Option<RateLimitConfig>,
@@ -457,6 +460,7 @@ impl ResolvedApiKey {
             id: config.id.clone(),
             key: config.key.clone(),
             route_id: config.route_id.clone(),
+            route_ids: config.route_ids.clone(),
             enabled: config.enabled,
             remark: config.remark.clone(),
             rate_limit: config.rate_limit.clone(),
@@ -472,6 +476,7 @@ impl ResolvedApiKey {
             id: generate_key_id(key),
             key: key.to_string(),
             route_id: None,
+            route_ids: None,
             enabled: true,
             remark: String::new(),
             rate_limit: None,
@@ -483,24 +488,17 @@ impl ResolvedApiKey {
 }
 
 impl AppConfig {
-    /// 获取所有解析后的 API Key 配置（合并所有来源）
+    /// 获取所有解析后的 API Key 配置
     pub fn resolved_api_keys(&self) -> Vec<ResolvedApiKey> {
         let mut resolved = Vec::new();
         let mut seen_keys = HashSet::new();
 
-        // 1. 处理 api_keys.keys（新的全局配置，优先级最高）
+        // 处理 api_keys.keys（全局配置）
         if let Some(global) = &self.api_keys {
             for config in &global.keys {
                 if seen_keys.insert(config.key.clone()) {
                     resolved.push(ResolvedApiKey::from_config(config));
                 }
-            }
-        }
-
-        // 2. 处理 gateway_auth.api_keys（简写格式，向后兼容）
-        for key in &self.gateway_auth.api_keys {
-            if seen_keys.insert(key.clone()) {
-                resolved.push(ResolvedApiKey::from_key_string(key));
             }
         }
 
@@ -565,34 +563,20 @@ impl AppConfig {
             ));
         }
 
-        // 检查至少有一个 API Key 来源
-        let has_gateway_keys = !self.gateway_auth.api_keys.is_empty();
+        // 检查至少配置了一个 API Key
         let has_global_api_keys = self
             .api_keys
             .as_ref()
             .map(|g| !g.keys.is_empty())
             .unwrap_or(false);
 
-        if !has_gateway_keys && !has_global_api_keys {
+        if !has_global_api_keys {
             return Err(ConfigError::Validation(
-                "must configure at least one API key in `gateway_auth.api_keys` or `api_keys.keys`"
-                    .to_string(),
+                "must configure at least one API key in `api_keys.keys`".to_string(),
             ));
         }
 
-        // 验证 gateway_auth.api_keys（简写格式）
-        if self
-            .gateway_auth
-            .api_keys
-            .iter()
-            .any(|key| key.trim().is_empty())
-        {
-            return Err(ConfigError::Validation(
-                "`gateway_auth.api_keys` must not contain empty values".to_string(),
-            ));
-        }
-
-        // 验证 api_keys.keys（完整格式）
+        // 验证 api_keys.keys
         if let Some(global) = &self.api_keys {
             let mut ids = HashSet::new();
             for key_config in &global.keys {
@@ -1112,8 +1096,12 @@ mod tests {
         let yaml = r#"
 listen: "127.0.0.1:8080"
 gateway_auth:
-  api_keys:
-    - "gw_token"
+  token_sources:
+    - type: "authorization_bearer"
+api_keys:
+  keys:
+    - id: "default"
+      key: "gw_token"
 routes:
   - id: "openai"
     prefix: "/openai"
@@ -1133,8 +1121,12 @@ routes:
         let yaml = r#"
 listen: "127.0.0.1:8080"
 gateway_auth:
-  api_keys:
-    - '${PATH}'
+  token_sources:
+    - type: "authorization_bearer"
+api_keys:
+  keys:
+    - id: "default"
+      key: '${PATH}'
 routes:
   - id: "openai"
     prefix: "/openai"
@@ -1143,7 +1135,7 @@ routes:
 "#;
 
         let config = AppConfig::from_yaml_str(yaml).expect("config should parse");
-        assert!(!config.gateway_auth.api_keys[0].is_empty());
+        assert!(!config.api_keys.as_ref().unwrap().keys[0].key.is_empty());
     }
 
     #[test]
@@ -1151,8 +1143,12 @@ routes:
         let yaml = r#"
 listen: "127.0.0.1:8080"
 gateway_auth:
-  api_keys:
-    - "gw_token"
+  token_sources:
+    - type: "authorization_bearer"
+api_keys:
+  keys:
+    - id: "default"
+      key: "gw_token"
 routes:
   - id: "openai"
     prefix: "/openai"
@@ -1182,8 +1178,12 @@ routes:
         let yaml = r#"
 listen: "127.0.0.1:8080"
 gateway_auth:
-  api_keys:
-    - "gw_token"
+  token_sources:
+    - type: "authorization_bearer"
+api_keys:
+  keys:
+    - id: "default"
+      key: "gw_token"
 routes:
   - id: "openai"
     prefix: "/openai"
@@ -1208,8 +1208,12 @@ routes:
         let yaml = r#"
 listen: "127.0.0.1:8080"
 gateway_auth:
-  api_keys:
-    - "gw_token"
+  token_sources:
+    - type: "authorization_bearer"
+api_keys:
+  keys:
+    - id: "default"
+      key: "gw_token"
 routes:
   - id: "openai"
     prefix: "/openai"
@@ -1231,8 +1235,12 @@ routes:
         let yaml = r#"
 listen: "127.0.0.1:8443"
 gateway_auth:
-  api_keys:
-    - "gw_token"
+  token_sources:
+    - type: "authorization_bearer"
+api_keys:
+  keys:
+    - id: "default"
+      key: "gw_token"
 routes:
   - id: "openai"
     prefix: "/openai"
@@ -1259,8 +1267,12 @@ inbound_tls:
         let yaml = r#"
 listen: "127.0.0.1:8443"
 gateway_auth:
-  api_keys:
-    - "gw_token"
+  token_sources:
+    - type: "authorization_bearer"
+api_keys:
+  keys:
+    - id: "default"
+      key: "gw_token"
 routes:
   - id: "openai"
     prefix: "/openai"
@@ -1283,8 +1295,12 @@ inbound_tls:
         let yaml = r#"
 listen: "127.0.0.1:8080"
 gateway_auth:
-  api_keys:
-    - "gw_token"
+  token_sources:
+    - type: "authorization_bearer"
+api_keys:
+  keys:
+    - id: "default"
+      key: "gw_token"
 routes:
   - id: "openai"
     prefix: "/openai"
@@ -1317,8 +1333,12 @@ concurrency:
         let yaml = r#"
 listen: "127.0.0.1:8080"
 gateway_auth:
-  api_keys:
-    - "gw_token"
+  token_sources:
+    - type: "authorization_bearer"
+api_keys:
+  keys:
+    - id: "default"
+      key: "gw_token"
 routes:
   - id: "openai"
     prefix: "/openai"
@@ -1384,8 +1404,12 @@ observability:
         let yaml = r#"
 listen: "127.0.0.1:8080"
 gateway_auth:
-  api_keys:
-    - "gw_token"
+  token_sources:
+    - type: "authorization_bearer"
+api_keys:
+  keys:
+    - id: "default"
+      key: "gw_token"
 routes:
   - id: "openai"
     prefix: "/openai"
@@ -1411,8 +1435,12 @@ observability:
         let yaml = r#"
 listen: "127.0.0.1:8080"
 gateway_auth:
-  api_keys:
-    - "gw_token"
+  token_sources:
+    - type: "authorization_bearer"
+api_keys:
+  keys:
+    - id: "default"
+      key: "gw_token"
 routes:
   - id: "openai"
     prefix: "/openai"
@@ -1437,8 +1465,12 @@ observability:
         let yaml = r#"
 listen: "127.0.0.1:8080"
 gateway_auth:
-  api_keys:
-    - "gw_token"
+  token_sources:
+    - type: "authorization_bearer"
+api_keys:
+  keys:
+    - id: "default"
+      key: "gw_token"
 routes:
   - id: "openai"
     prefix: "/openai"
@@ -1464,8 +1496,12 @@ observability:
         let yaml = r#"
 listen: "127.0.0.1:8080"
 gateway_auth:
-  api_keys:
-    - "gw_token"
+  token_sources:
+    - type: "authorization_bearer"
+api_keys:
+  keys:
+    - id: "default"
+      key: "gw_token"
 routes:
   - id: "openai"
     prefix: "/openai"
@@ -1497,8 +1533,12 @@ observability:
         let yaml = r#"
 listen: "127.0.0.1:8080"
 gateway_auth:
-  api_keys:
-    - "gw_token"
+  token_sources:
+    - type: "authorization_bearer"
+api_keys:
+  keys:
+    - id: "default"
+      key: "gw_token"
 routes:
   - id: "openai"
     prefix: "/openai"
@@ -1521,8 +1561,12 @@ rate_limit:
         let yaml = r#"
 listen: "127.0.0.1:8080"
 gateway_auth:
-  api_keys:
-    - "gw_token"
+  token_sources:
+    - type: "authorization_bearer"
+api_keys:
+  keys:
+    - id: "default"
+      key: "gw_token"
 routes:
   - id: "openai"
     prefix: "/openai"
@@ -1547,8 +1591,12 @@ concurrency:
         let yaml = r#"
 listen: "127.0.0.1:8080"
 gateway_auth:
-  api_keys:
-    - "gw_token"
+  token_sources:
+    - type: "authorization_bearer"
+api_keys:
+  keys:
+    - id: "default"
+      key: "gw_token"
 routes:
   - id: "openai"
     prefix: "/openai"
@@ -1571,8 +1619,12 @@ concurrency:
         let yaml = r#"
 listen: "127.0.0.1:8080"
 gateway_auth:
-  api_keys:
-    - "gw_token"
+  token_sources:
+    - type: "authorization_bearer"
+api_keys:
+  keys:
+    - id: "default"
+      key: "gw_token"
 routes:
   - id: "openai"
     prefix: "/openai"
