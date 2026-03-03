@@ -1,4 +1,4 @@
-use crate::api_keys::ban::{BanRuleEngine, BanStatus, BanMetricsSnapshot};
+use crate::api_keys::ban::{BanRuleEngine, BanStatus, BanMetricsSnapshot, BanRule};
 use crate::api_keys::ban_log::{BanLogEntry, BanLogStore};
 use crate::api_keys::current_epoch_seconds;
 use crate::config::ResolvedApiKey;
@@ -57,6 +57,10 @@ pub struct ApiKeyManager {
     keys: RwLock<HashMap<String, ApiKeyRuntimeInfo>>,
     id_index: RwLock<HashMap<String, String>>,
     ban_log_store: Option<Arc<dyn BanLogStore>>,
+    /// 全局封禁规则（对所有 API Key 生效）
+    ban_rules: Vec<BanRule>,
+    /// 封禁引擎的最大时间窗口（用于初始化每个 key 的计数器）
+    ban_max_window_secs: u64,
 }
 
 #[derive(Debug)]
@@ -64,13 +68,37 @@ pub struct ApiKeyRuntimeInfo {
     pub resolved: ResolvedApiKey,
     pub rate_limiter: Option<Arc<RateLimiter>>,
     pub concurrency_semaphore: Option<Arc<Semaphore>>,
-    pub ban_engine: Option<BanRuleEngine>,
+    /// 封禁规则引擎（使用全局规则，但每个 key 有自己的计数器）
+    pub ban_engine: BanRuleEngine,
 }
 
 impl ApiKeyManager {
-    pub fn new(resolved_keys: Vec<ResolvedApiKey>, ban_log_store: Option<Arc<dyn BanLogStore>>) -> Self {
+    pub fn new(
+        resolved_keys: Vec<ResolvedApiKey>,
+        ban_log_store: Option<Arc<dyn BanLogStore>>,
+        global_ban_rules: Vec<BanRule>,
+    ) -> Self {
         let mut keys = HashMap::new();
         let mut id_index = HashMap::new();
+
+        // 计算全局封禁规则的最大时间窗口
+        let ban_max_window_secs = if !global_ban_rules.is_empty() {
+            global_ban_rules
+                .iter()
+                .filter_map(|r| match &r.condition {
+                    crate::api_keys::ban::BanCondition::ErrorRate { window_secs, .. } => {
+                        Some(*window_secs)
+                    }
+                    crate::api_keys::ban::BanCondition::RequestCount { window_secs, .. } => {
+                        Some(*window_secs)
+                    }
+                    _ => Some(3600),
+                })
+                .max()
+                .unwrap_or(3600)
+        } else {
+            3600
+        };
 
         for resolved in resolved_keys {
             let key_value = resolved.key.clone();
@@ -84,20 +112,8 @@ impl ApiKeyManager {
                 .and_then(|cfg| cfg.downstream_max_inflight)
                 .map(|limit| Arc::new(Semaphore::new(limit)));
 
-            let ban_engine = if !resolved.ban_rules.is_empty() {
-                let max_window = resolved.ban_rules.iter()
-                    .filter_map(|r| match &r.condition {
-                        crate::api_keys::ban::BanCondition::ErrorRate { window_secs, .. } => Some(window_secs),
-                        crate::api_keys::ban::BanCondition::RequestCount { window_secs, .. } => Some(window_secs),
-                        _ => Some(&3600),
-                    })
-                    .copied()
-                    .max()
-                    .unwrap_or(3600);
-                Some(BanRuleEngine::new(max_window))
-            } else {
-                None
-            };
+            // 为每个 key 创建封禁引擎（使用全局最大窗口）
+            let ban_engine = BanRuleEngine::new(ban_max_window_secs);
 
             let runtime_info = ApiKeyRuntimeInfo {
                 resolved,
@@ -114,6 +130,8 @@ impl ApiKeyManager {
             keys: RwLock::new(keys),
             id_index: RwLock::new(id_index),
             ban_log_store,
+            ban_rules: global_ban_rules,
+            ban_max_window_secs,
         }
     }
 
@@ -181,14 +199,22 @@ impl ApiKeyManager {
         }
     }
 
-    pub async fn report_request_result(&self, key_value: &str, result: RequestResult) -> Option<BanStatus> {
+    pub async fn report_request_result(
+        &self,
+        key_value: &str,
+        result: RequestResult,
+    ) -> Option<BanStatus> {
         let mut keys = self.keys.write().await;
         let info = keys.get_mut(key_value)?;
 
-        if let Some(engine) = info.ban_engine.as_mut() {
+        // 使用全局封禁规则检查
+        if !self.ban_rules.is_empty() {
             let now = current_epoch_seconds();
 
-            if let Some(triggered) = engine.check_rules(&info.resolved.ban_rules, now, result.success) {
+            if let Some(triggered) = info
+                .ban_engine
+                .check_rules(&self.ban_rules, now, result.success)
+            {
                 let ban_until = now + triggered.ban_duration_secs;
                 let new_status = BanStatus {
                     is_banned: true,
@@ -196,7 +222,10 @@ impl ApiKeyManager {
                     banned_until: Some(ban_until),
                     triggered_rule_id: Some(triggered.rule_id.clone()),
                     reason: Some(triggered.reason.clone()),
-                    ban_count: info.resolved.ban_status.as_ref()
+                    ban_count: info
+                        .resolved
+                        .ban_status
+                        .as_ref()
                         .map(|s| s.ban_count + 1)
                         .unwrap_or(1),
                 };
@@ -207,20 +236,30 @@ impl ApiKeyManager {
                     let entry = BanLogEntry {
                         id: format!("ban_{}_{}", key_value, now),
                         api_key_id: info.resolved.id.clone(),
-                        rule_id: triggered.rule_id,
-                        reason: triggered.reason,
+                        rule_id: triggered.rule_id.clone(),
+                        reason: triggered.reason.clone(),
                         banned_at: now,
                         banned_until: ban_until,
                         unbanned_at: None,
-                        metrics_snapshot: triggered.metrics_snapshot,
+                        metrics_snapshot: triggered.metrics_snapshot.clone(),
                     };
+
+                    tracing::info!(
+                        "Inserting ban log for key {} (rule: {}, until: {})",
+                        info.resolved.id,
+                        triggered.rule_id,
+                        ban_until
+                    );
 
                     let store = Arc::clone(store);
                     tokio::spawn(async move {
-                        if let Err(e) = store.insert(entry).await {
-                            tracing::error!("Failed to insert ban log: {}", e);
+                        match store.insert(entry).await {
+                            Ok(()) => tracing::info!("Ban log inserted successfully"),
+                            Err(e) => tracing::error!("Failed to insert ban log: {}", e),
                         }
                     });
+                } else {
+                    tracing::warn!("Ban log store not available, skipping ban log insertion");
                 }
 
                 return Some(new_status);
@@ -266,12 +305,21 @@ impl ApiKeyManager {
                 },
             };
 
+            tracing::info!(
+                "Inserting manual ban log for key {} (until: {})",
+                info.resolved.id,
+                ban_until
+            );
+
             let store = Arc::clone(store);
             tokio::spawn(async move {
-                if let Err(e) = store.insert(entry).await {
-                    tracing::error!("Failed to insert ban log: {}", e);
+                match store.insert(entry).await {
+                    Ok(()) => tracing::info!("Manual ban log inserted successfully"),
+                    Err(e) => tracing::error!("Failed to insert manual ban log: {}", e),
                 }
             });
+        } else {
+            tracing::warn!("Ban log store not available, skipping manual ban log insertion");
         }
 
         Ok(new_status)
@@ -283,17 +331,36 @@ impl ApiKeyManager {
 
         if let Some(status) = &mut info.resolved.ban_status {
             let now = current_epoch_seconds();
+            let was_banned = status.is_banned;
             status.is_banned = false;
 
-            if let Some(store) = &self.ban_log_store {
-                if let Some(_rule_id) = &status.triggered_rule_id {
-                    let entry_id = format!("ban_{}_{}", key_value, status.banned_at.unwrap_or(0));
-                    let store = Arc::clone(store);
-                    tokio::spawn(async move {
-                        if let Err(e) = store.mark_unbanned(&entry_id, now).await {
-                            tracing::error!("Failed to mark ban as unbanned: {}", e);
-                        }
-                    });
+            // 如果之前是封禁状态，尝试更新封禁日志的解封时间
+            if was_banned {
+                if let Some(store) = &self.ban_log_store {
+                    if let Some(banned_at) = status.banned_at {
+                        // 尝试两种可能的 entry_id 格式：
+                        // 1. 自动封禁: ban_{key_value}_{banned_at}
+                        // 2. 手动封禁: ban_manual_{key_id}_{banned_at}
+                        let entry_ids = if let Some(_rule_id) = &status.triggered_rule_id {
+                            // 自动封禁：只有一个可能的 ID
+                            vec![format!("ban_{}_{}", key_value, banned_at)]
+                        } else {
+                            // 手动封禁：只有一个可能的 ID
+                            vec![format!("ban_manual_{}_{}", info.resolved.id, banned_at)]
+                        };
+
+                        let store = Arc::clone(store);
+                        let key_value_owned = key_value.to_string();
+                        tokio::spawn(async move {
+                            for entry_id in entry_ids {
+                                if let Ok(()) = store.mark_unbanned(&entry_id, now).await {
+                                    tracing::debug!("Marked ban log as unbanned: {}", entry_id);
+                                    return;
+                                }
+                            }
+                            tracing::warn!("Failed to find ban log entry to mark as unbanned for key: {}", key_value_owned);
+                        });
+                    }
                 }
             }
         }
@@ -321,16 +388,110 @@ impl ApiKeyManager {
     pub fn ban_log_store(&self) -> Option<Arc<dyn BanLogStore>> {
         self.ban_log_store.clone()
     }
+
+    /// 恢复封禁状态（用于配置热更新时迁移状态）
+    pub async fn restore_ban_status(
+        &self,
+        key_value: &str,
+        ban_status: BanStatus,
+    ) -> Result<(), ApiKeyError> {
+        let mut keys = self.keys.write().await;
+        let info = keys.get_mut(key_value).ok_or(ApiKeyError::KeyNotFound)?;
+        info.resolved.ban_status = Some(ban_status);
+        Ok(())
+    }
 }
 
-pub fn create_api_key_manager(
+pub async fn create_api_key_manager(
     config: &crate::config::AppConfig,
-    ban_log_store: Option<Arc<dyn BanLogStore>>,
+    old_manager: Option<&ApiKeyManager>,
 ) -> Option<ApiKeyManager> {
     let resolved_keys = config.resolved_api_keys();
     if resolved_keys.is_empty() {
         None
     } else {
-        Some(ApiKeyManager::new(resolved_keys, ban_log_store))
+        // 提取全局封禁规则
+        let global_ban_rules = config
+            .api_keys
+            .as_ref()
+            .map(|ak| ak.ban_rules.clone())
+            .unwrap_or_default();
+
+        // 创建封禁日志存储（使用配置路径或默认路径）
+        let db_path = config
+            .api_keys
+            .as_ref()
+            .and_then(|ak| ak.sqlite.as_ref())
+            .map(|s| s.path.as_str())
+            .unwrap_or("./data/ban_logs.db");
+        let ban_log_store = match create_ban_log_store(db_path).await {
+            Some(store) => Some(store),
+            None => {
+                tracing::warn!("Failed to create ban log store, ban logging will be disabled");
+                None
+            }
+        };
+
+        let new_manager = ApiKeyManager::new(resolved_keys, ban_log_store, global_ban_rules);
+
+        // 如果有旧的 manager，迁移封禁状态
+        if let Some(old) = old_manager {
+            migrate_ban_status(&new_manager, old).await;
+        }
+
+        Some(new_manager)
+    }
+}
+
+/// 从旧的 ApiKeyManager 迁移封禁状态到新的 Manager
+async fn migrate_ban_status(new_manager: &ApiKeyManager, old_manager: &ApiKeyManager) {
+    // 获取旧 manager 中的所有 key 及其封禁状态
+    let old_keys = old_manager.get_all_keys().await;
+
+    for old_key in old_keys {
+        if let Some(ban_status) = &old_key.ban_status {
+            // 只迁移处于封禁状态且未过期的
+            if ban_status.is_banned {
+                if let Some(until) = ban_status.banned_until {
+                    let now = crate::api_keys::current_epoch_seconds();
+                    if now < until {
+                        // 封禁仍然有效，迁移状态
+                        if let Err(e) = new_manager
+                            .restore_ban_status(&old_key.key, ban_status.clone())
+                            .await
+                        {
+                            tracing::warn!(
+                                "Failed to migrate ban status for key {}: {}",
+                                old_key.id,
+                                e
+                            );
+                        } else {
+                            tracing::info!(
+                                "Migrated ban status for key {} (banned until {})",
+                                old_key.id,
+                                until
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// 创建封禁日志存储（SQLite）
+async fn create_ban_log_store(db_path: &str) -> Option<Arc<dyn BanLogStore>> {
+    use crate::api_keys::ban_log::SqliteBanLogStore;
+
+    tracing::info!("Creating ban log store at: {}", db_path);
+    match SqliteBanLogStore::new(db_path).await {
+        Ok(store) => {
+            tracing::info!("Ban log store created successfully");
+            Some(Arc::new(store))
+        }
+        Err(e) => {
+            tracing::error!("Failed to create SQLite ban log store: {}", e);
+            None
+        }
     }
 }

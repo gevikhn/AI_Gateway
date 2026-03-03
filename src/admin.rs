@@ -31,17 +31,19 @@ pub fn register_admin_routes(router: Router<AppState>, prefix: &str) -> Router<A
         // API Key 管理路由
         .route(&format!("{prefix}/api/keys"), get(admin_list_api_keys))
         .route(
-            &format!("{prefix}/api/keys/:id/ban"),
+            &format!("{prefix}/api/keys/{{id}}/ban"),
             post(admin_ban_api_key),
         )
         .route(
-            &format!("{prefix}/api/keys/:id/unban"),
+            &format!("{prefix}/api/keys/{{id}}/unban"),
             post(admin_unban_api_key),
         )
         .route(
-            &format!("{prefix}/api/keys/:id/ban-logs"),
+            &format!("{prefix}/api/keys/{{id}}/ban-logs"),
             get(admin_get_ban_logs),
         )
+        // 获取所有封禁日志（不指定 API Key）
+        .route(&format!("{prefix}/api/ban-logs"), get(admin_get_all_ban_logs))
 }
 
 fn is_admin_authorized(state: &AppState, headers: &HeaderMap) -> bool {
@@ -191,7 +193,9 @@ async fn admin_config_apply_handler(
     }
 
     let new_config = Arc::new(new_config);
-    let new_runtime = match build_runtime_state(new_config.clone()) {
+    // 获取当前 runtime 用于迁移封禁状态
+    let old_runtime = state.runtime.load();
+    let new_runtime = match build_runtime_state(new_config.clone(), Some(&old_runtime)).await {
         Ok(runtime) => runtime,
         Err(err) => {
             error!(error = %err, "admin: failed to build runtime state");
@@ -451,6 +455,7 @@ fn admin_dashboard_html(prefix: &str) -> String {
     let api_config_url = format!("{prefix}/api/config");
     let api_save_url = format!("{prefix}/api/config/save");
     let api_metrics_url = format!("{prefix}/api/metrics");
+    let api_keys_url = format!("{prefix}/api/keys");
 
     HTML_TEMPLATE
         .replace("{{CSS}}", CSS_STYLES)
@@ -458,6 +463,7 @@ fn admin_dashboard_html(prefix: &str) -> String {
         .replace("{{API_CONFIG_URL}}", &api_config_url)
         .replace("{{API_SAVE_URL}}", &api_save_url)
         .replace("{{API_METRICS_URL}}", &api_metrics_url)
+        .replace("{{API_KEYS_URL}}", &api_keys_url)
         .replace("{{ADMIN_PREFIX}}", prefix)
 }
 
@@ -481,7 +487,9 @@ struct ApiKeyInfo {
     enabled: bool,
     remark: String,
     is_banned: bool,
+    banned_at: Option<u64>,
     ban_expires_at: Option<u64>,
+    triggered_rule_id: Option<String>,
     ban_reason: Option<String>,
     ban_count: u32,
 }
@@ -503,6 +511,7 @@ struct BanLogListResponse {
 #[derive(Debug, Serialize)]
 struct BanLogInfo {
     id: String,
+    api_key_id: String,
     rule_id: String,
     reason: String,
     banned_at: u64,
@@ -532,18 +541,20 @@ async fn admin_list_api_keys(
     let key_infos: Vec<ApiKeyInfo> = keys
         .into_iter()
         .map(|key| {
-            let (is_banned, ban_expires_at, ban_reason, ban_count) = key
+            let (is_banned, banned_at, ban_expires_at, triggered_rule_id, ban_reason, ban_count) = key
                 .ban_status
                 .as_ref()
                 .map(|s| {
                     (
                         s.is_banned,
+                        s.banned_at,
                         s.banned_until,
+                        s.triggered_rule_id.clone(),
                         s.reason.clone(),
                         s.ban_count,
                     )
                 })
-                .unwrap_or((false, None, None, 0));
+                .unwrap_or((false, None, None, None, None, 0));
 
             ApiKeyInfo {
                 id: key.id,
@@ -552,7 +563,9 @@ async fn admin_list_api_keys(
                 enabled: key.enabled,
                 remark: key.remark,
                 is_banned,
+                banned_at,
                 ban_expires_at,
+                triggered_rule_id,
                 ban_reason,
                 ban_count,
             }
@@ -665,6 +678,7 @@ async fn admin_get_ban_logs(
                 .into_iter()
                 .map(|entry| BanLogInfo {
                     id: entry.id,
+                    api_key_id: entry.api_key_id,
                     rule_id: entry.rule_id,
                     reason: entry.reason,
                     banned_at: entry.banned_at,
@@ -679,6 +693,60 @@ async fn admin_get_ban_logs(
         }
         Err(err) => {
             error!("Failed to query ban logs: {}", err);
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "query_failed")
+        }
+    }
+}
+
+/// 获取所有封禁日志
+async fn admin_get_all_ban_logs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<BanLogQuery>,
+) -> Response<Body> {
+    if !is_admin_authorized(&state, &headers) {
+        return json_error(StatusCode::UNAUTHORIZED, "unauthorized");
+    }
+
+    let runtime = state.runtime.load();
+    let api_key_manager = match runtime.api_key_manager.as_ref() {
+        Some(manager) => manager,
+        None => {
+            info!("admin: api_key_manager not available, returning empty ban logs");
+            return json_ok(&BanLogListResponse { logs: vec![] });
+        }
+    };
+
+    let Some(ban_log_store) = api_key_manager.ban_log_store() else {
+        info!("admin: ban_log_store not available, returning empty ban logs");
+        return json_ok(&BanLogListResponse { logs: vec![] });
+    };
+
+    let limit = query.limit.unwrap_or(50).min(100);
+    let offset = query.offset.unwrap_or(0);
+
+    match ban_log_store.query_recent(limit, offset).await {
+        Ok(entries) => {
+            info!("admin: queried {} ban logs", entries.len());
+            let logs: Vec<BanLogInfo> = entries
+                .into_iter()
+                .map(|entry| BanLogInfo {
+                    id: entry.id,
+                    api_key_id: entry.api_key_id,
+                    rule_id: entry.rule_id,
+                    reason: entry.reason,
+                    banned_at: entry.banned_at,
+                    banned_until: entry.banned_until,
+                    unbanned_at: entry.unbanned_at,
+                    metrics_requests: entry.metrics_snapshot.requests,
+                    metrics_errors: entry.metrics_snapshot.errors,
+                    metrics_error_rate: entry.metrics_snapshot.error_rate,
+                })
+                .collect();
+            json_ok(&BanLogListResponse { logs })
+        }
+        Err(err) => {
+            error!("Failed to query all ban logs: {}", err);
             json_error(StatusCode::INTERNAL_SERVER_ERROR, "query_failed")
         }
     }

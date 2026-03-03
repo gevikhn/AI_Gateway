@@ -19,12 +19,6 @@ gateway_auth:
 routes:
   - id: "openai"
     prefix: "/openai"
-    # Route-level API keys for multi-tenant isolation
-    # If specified, only these keys can access this route (global tokens won't work)
-    # If not specified, falls back to global gateway_auth.api_keys
-    api_keys:
-      - "openai_tenant_key_1"
-      - "openai_tenant_key_2"
     upstream:
       base_url: "https://api.openai.com"
       strip_prefix: true

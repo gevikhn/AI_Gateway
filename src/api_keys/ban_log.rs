@@ -1,7 +1,9 @@
 use crate::api_keys::ban::BanMetricsSnapshot;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::{Pool, Row, Sqlite};
+use std::str::FromStr;
 use thiserror::Error;
 
 /// 封禁日志条目
@@ -54,6 +56,13 @@ pub trait BanLogStore: Send + Sync {
         offset: usize,
     ) -> Result<Vec<BanLogEntry>, BanLogError>;
 
+    /// 查询最近的封禁日志（所有 API Keys）
+    async fn query_recent(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<BanLogEntry>, BanLogError>;
+
     /// 查询活跃的封禁（未解封且未过期）
     async fn query_active_bans(
         &self,
@@ -72,17 +81,51 @@ pub struct SqliteBanLogStore {
 impl SqliteBanLogStore {
     /// 创建新的 SQLite 存储实例
     pub async fn new(database_path: &str) -> Result<Self, BanLogError> {
+        tracing::info!("Creating ban log store, database_path: {}", database_path);
+
         // 确保目录存在
         if let Some(parent) = std::path::Path::new(database_path).parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                BanLogError::InvalidData(format!("Failed to create directory: {}", e))
-            })?;
+            tracing::info!("Creating parent directory: {}", parent.display());
+            match std::fs::create_dir_all(parent) {
+                Ok(_) => {
+                    tracing::info!("Parent directory created or already exists");
+                    // 验证目录是否真的存在
+                    if !parent.exists() {
+                        tracing::error!("Parent directory still does not exist after creation attempt");
+                        return Err(BanLogError::InvalidData(
+                            format!("Failed to create directory: {} - still does not exist", parent.display())
+                        ));
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Failed to create directory {}: {}", parent.display(), e);
+                    return Err(BanLogError::InvalidData(format!("Failed to create directory: {}", e)));
+                }
+            }
+        } else {
+            tracing::warn!("No parent directory for database path");
         }
 
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        tracing::info!("Connecting to SQLite database...");
+
+        // 使用 SqliteConnectOptions 并设置 create_if_missing(true)
+        // 这样如果数据库文件不存在会自动创建
+        let options = sqlx::sqlite::SqliteConnectOptions::from_str(database_path)
+            .map_err(|e| {
+                tracing::error!("Invalid SQLite connection string: {}", e);
+                BanLogError::InvalidData(format!("Invalid connection string: {}", e))
+            })?
+            .create_if_missing(true);
+
+        let pool = SqlitePoolOptions::new()
             .max_connections(5)
-            .connect(database_path)
-            .await?;
+            .connect_with(options)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to connect to SQLite database {}: {}", database_path, e);
+                BanLogError::Database(e)
+            })?;
+        tracing::info!("SQLite connection established");
 
         let store = Self { pool };
         store.init_tables().await?;
@@ -248,6 +291,28 @@ impl BanLogStore for SqliteBanLogStore {
             .collect::<Result<Vec<_>, _>>()
     }
 
+    async fn query_recent(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<BanLogEntry>, BanLogError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT * FROM ban_logs
+            ORDER BY banned_at DESC
+            LIMIT ? OFFSET ?
+            "#,
+        )
+        .bind(limit as i64)
+        .bind(offset as i64)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.iter()
+            .map(|row| Self::row_to_entry(row))
+            .collect::<Result<Vec<_>, _>>()
+    }
+
     async fn query_active_bans(
         &self,
         before: u64,
@@ -327,6 +392,18 @@ impl BanLogStore for InMemoryBanLogStore {
             .collect();
 
         Ok(filtered.into_iter().skip(offset).take(limit).collect())
+    }
+
+    async fn query_recent(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<BanLogEntry>, BanLogError> {
+        let entries = self.entries.lock().unwrap();
+        // 按 banned_at 降序排序
+        let mut sorted: Vec<_> = entries.iter().cloned().collect();
+        sorted.sort_by(|a, b| b.banned_at.cmp(&a.banned_at));
+        Ok(sorted.into_iter().skip(offset).take(limit).collect())
     }
 
     async fn query_active_bans(

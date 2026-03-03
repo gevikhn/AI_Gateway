@@ -47,16 +47,22 @@ pub struct AppState {
     pub admin_path_prefix: Option<String>,
 }
 
-pub fn build_runtime_state(config: Arc<AppConfig>) -> Result<RuntimeState, String> {
+pub async fn build_runtime_state(
+    config: Arc<AppConfig>,
+    old_runtime: Option<&RuntimeState>,
+) -> Result<RuntimeState, String> {
     let upstream_clients = build_upstream_clients(&config)?;
     let rate_limiter = config
         .rate_limit
         .as_ref()
         .map(|rate_limit| Arc::new(RateLimiter::new(rate_limit.per_minute)));
     let concurrency = ConcurrencyController::new(&config).map(Arc::new);
+    // 获取旧的 api_key_manager（如果存在）
+    let old_manager = old_runtime.and_then(|r| r.api_key_manager.clone());
     // 创建 API Key 管理器（支持 API Key 级别的限流和并发控制）
-    // TODO: 传入 ban_log_store 以支持封禁日志持久化
-    let api_key_manager = create_api_key_manager(&config, None).map(Arc::new);
+    let api_key_manager = create_api_key_manager(&config, old_manager.as_deref())
+        .await
+        .map(Arc::new);
     Ok(RuntimeState {
         config,
         upstream_clients,
@@ -67,7 +73,7 @@ pub fn build_runtime_state(config: Arc<AppConfig>) -> Result<RuntimeState, Strin
 }
 
 pub async fn build_app(config: Arc<AppConfig>, config_path: Option<PathBuf>) -> Result<Router, String> {
-    let runtime_state = build_runtime_state(config.clone())?;
+    let runtime_state = build_runtime_state(config.clone(), None).await?;
     let observability = Arc::new(
         observability::ObservabilityRuntime::from_config(config.observability.as_ref()).await?,
     );
@@ -501,9 +507,8 @@ async fn proxy_handler(
         );
     }
 
-    let Some(token) =
-        auth::extract_authorized_token(request.headers(), &runtime.config.gateway_auth, route.api_keys.as_deref())
-    else {
+    // Extract token from headers using configured token sources
+    let Some(token) = auth::extract_token(request.headers(), &runtime.config.gateway_auth.token_sources) else {
         return finalize_observed_proxy_response(
             json_error(StatusCode::UNAUTHORIZED, "unauthorized"),
             cors_config,
@@ -521,38 +526,50 @@ async fn proxy_handler(
     };
     let token_label = observability::token_label(&token);
 
-    // 优先使用 API Key 管理器进行验证（检查启用状态、路由权限等）
-    if let Some(api_key_manager) = &runtime.api_key_manager {
-        if let Err(e) = api_key_manager.validate_key(&token, &route.id).await {
-            let error_code = match e {
-                crate::api_keys::ApiKeyError::KeyDisabled => "api_key_disabled",
-                crate::api_keys::ApiKeyError::RouteNotAllowed => "api_key_route_not_allowed",
-                _ => "unauthorized",
-            };
-            return finalize_observed_proxy_response(
-                json_error(StatusCode::FORBIDDEN, error_code),
-                cors_config,
-                request_origin.as_deref(),
-                request_observation_with_token(
-                    metrics.as_ref(),
-                    route.id.as_str(),
-                    &method,
-                    &path,
-                    Some(token_label.as_str()),
-                    &request_id,
-                    request_started_at,
-                ),
-                error_code,
-            );
-        }
+    // API Key Manager is required for authentication
+    let Some(api_key_manager) = &runtime.api_key_manager else {
+        return finalize_observed_proxy_response(
+            json_error(StatusCode::UNAUTHORIZED, "unauthorized"),
+            cors_config,
+            request_origin.as_deref(),
+            request_observation(
+                metrics.as_ref(),
+                route.id.as_str(),
+                &method,
+                &path,
+                &request_id,
+                request_started_at,
+            ),
+            "unauthorized",
+        );
+    };
+
+    // Validate the API key using ApiKeyManager
+    if let Err(e) = api_key_manager.validate_key(&token, &route.id).await {
+        let error_code = match e {
+            crate::api_keys::ApiKeyError::KeyDisabled => "api_key_disabled",
+            crate::api_keys::ApiKeyError::RouteNotAllowed => "api_key_route_not_allowed",
+            _ => "unauthorized",
+        };
+        return finalize_observed_proxy_response(
+            json_error(StatusCode::UNAUTHORIZED, error_code),
+            cors_config,
+            request_origin.as_deref(),
+            request_observation_with_token(
+                metrics.as_ref(),
+                route.id.as_str(),
+                &method,
+                &path,
+                Some(token_label.as_str()),
+                &request_id,
+                request_started_at,
+            ),
+            error_code,
+        );
     }
 
-    // 限流检查：优先使用 API Key 级别，其次使用全局级别
-    let api_key_info = if let Some(manager) = &runtime.api_key_manager {
-        manager.get_key_info(&token).await
-    } else {
-        None
-    };
+    // Rate limiting: prefer API Key level, fallback to global level
+    let api_key_info = api_key_manager.get_key_info(&token).await;
 
     let api_key_has_rate_limit = api_key_info
         .as_ref()
@@ -560,32 +577,30 @@ async fn proxy_handler(
         .is_some();
 
     if api_key_has_rate_limit {
-        // 使用 API Key 级别的限流
-        if let Some(api_key_manager) = &runtime.api_key_manager {
-            if let Err(e) = api_key_manager.check_rate_limit(&token, &route.id).await {
-                if let crate::api_keys::ApiKeyError::RateLimitExceeded { retry_after_secs } = e {
-                    let mut response = json_error(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
-                    set_header(
-                        response.headers_mut(),
-                        "retry-after",
-                        &retry_after_secs.to_string(),
-                    );
-                    return finalize_observed_proxy_response(
-                        response,
-                        cors_config,
-                        request_origin.as_deref(),
-                        request_observation_with_token(
-                            metrics.as_ref(),
-                            route.id.as_str(),
-                            &method,
-                            &path,
-                            Some(token_label.as_str()),
-                            &request_id,
-                            request_started_at,
-                        ),
-                        "rate_limited",
-                    );
-                }
+        // Use API Key level rate limiting
+        if let Err(e) = api_key_manager.check_rate_limit(&token, &route.id).await {
+            if let crate::api_keys::ApiKeyError::RateLimitExceeded { retry_after_secs } = e {
+                let mut response = json_error(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
+                set_header(
+                    response.headers_mut(),
+                    "retry-after",
+                    &retry_after_secs.to_string(),
+                );
+                return finalize_observed_proxy_response(
+                    response,
+                    cors_config,
+                    request_origin.as_deref(),
+                    request_observation_with_token(
+                        metrics.as_ref(),
+                        route.id.as_str(),
+                        &method,
+                        &path,
+                        Some(token_label.as_str()),
+                        &request_id,
+                        request_started_at,
+                    ),
+                    "rate_limited",
+                );
             }
         }
     } else if let Some(rate_limiter) = &runtime.rate_limiter {
@@ -627,63 +642,59 @@ async fn proxy_handler(
         .is_some();
 
     let downstream_permit = if api_key_has_concurrency {
-        // 使用 API Key 级别的并发控制
-        if let Some(api_key_manager) = &runtime.api_key_manager {
-            match api_key_manager.acquire_concurrency_permit(&token).await {
-                Ok(permit) => permit,
-                Err(crate::api_keys::ApiKeyError::ConcurrencyLimitExceeded) => {
-                    return finalize_observed_proxy_response(
-                        json_error(
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            "api_key_concurrency_exceeded",
-                        ),
-                        cors_config,
-                        request_origin.as_deref(),
-                        request_observation_with_token(
-                            metrics.as_ref(),
-                            route.id.as_str(),
-                            &method,
-                            &path,
-                            Some(token_label.as_str()),
-                            &request_id,
-                            request_started_at,
-                        ),
-                        "concurrency",
-                    );
-                }
-                Err(_) => {
-                    // 其他错误（如 key 不存在），回退到全局并发控制
-                    if let Some(concurrency) = &runtime.concurrency {
-                        match concurrency.acquire_downstream() {
-                            Ok(permit) => permit,
-                            Err(_) => {
-                                return finalize_observed_proxy_response(
-                                    json_error(
-                                        StatusCode::SERVICE_UNAVAILABLE,
-                                        "downstream_concurrency_exceeded",
-                                    ),
-                                    cors_config,
-                                    request_origin.as_deref(),
-                                    request_observation_with_token(
-                                        metrics.as_ref(),
-                                        route.id.as_str(),
-                                        &method,
-                                        &path,
-                                        Some(token_label.as_str()),
-                                        &request_id,
-                                        request_started_at,
-                                    ),
-                                    "concurrency",
-                                );
-                            }
+        // Use API Key level concurrency control
+        match api_key_manager.acquire_concurrency_permit(&token).await {
+            Ok(permit) => permit,
+            Err(crate::api_keys::ApiKeyError::ConcurrencyLimitExceeded) => {
+                return finalize_observed_proxy_response(
+                    json_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "api_key_concurrency_exceeded",
+                    ),
+                    cors_config,
+                    request_origin.as_deref(),
+                    request_observation_with_token(
+                        metrics.as_ref(),
+                        route.id.as_str(),
+                        &method,
+                        &path,
+                        Some(token_label.as_str()),
+                        &request_id,
+                        request_started_at,
+                    ),
+                    "concurrency",
+                );
+            }
+            Err(_) => {
+                // Other errors (e.g., key not found), fallback to global concurrency control
+                if let Some(concurrency) = &runtime.concurrency {
+                    match concurrency.acquire_downstream() {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            return finalize_observed_proxy_response(
+                                json_error(
+                                    StatusCode::SERVICE_UNAVAILABLE,
+                                    "downstream_concurrency_exceeded",
+                                ),
+                                cors_config,
+                                request_origin.as_deref(),
+                                request_observation_with_token(
+                                    metrics.as_ref(),
+                                    route.id.as_str(),
+                                    &method,
+                                    &path,
+                                    Some(token_label.as_str()),
+                                    &request_id,
+                                    request_started_at,
+                                ),
+                                "concurrency",
+                            );
                         }
-                    } else {
-                        None
                     }
+                } else {
+                    None
                 }
             }
-        } else {
-            None
         }
     } else if let Some(concurrency) = &runtime.concurrency {
         // 使用全局并发控制
@@ -848,6 +859,8 @@ async fn proxy_handler(
                 bytes_sent: bytes_sent.clone(),
                 track_inflight: metrics.is_some(),
                 track_sse: is_sse,
+                api_key_manager: Some(Arc::clone(api_key_manager)),
+                token: Some(token.clone()),
             };
             let response_guards = ResponseGuards {
                 downstream_permit,
@@ -863,6 +876,26 @@ async fn proxy_handler(
             if let Some(metrics) = &metrics {
                 metrics.dec_inflight(route.id.as_str());
             }
+
+            // 上报请求失败给封禁规则引擎
+            {
+                let latency_ms = request_started_at.elapsed().as_millis() as u64;
+                let token_clone = token.clone();
+                let manager = Arc::clone(api_key_manager);
+                tokio::spawn(async move {
+                    manager
+                        .report_request_result(
+                            &token_clone,
+                            crate::api_keys::RequestResult {
+                                success: false,
+                                latency_ms,
+                                response_status: 0,
+                            },
+                        )
+                        .await;
+                });
+            }
+
             finalize_observed_proxy_response(
                 error_response(error),
                 cors_config,
@@ -1132,6 +1165,8 @@ struct ResponseCompletionGuard {
     bytes_sent: Arc<AtomicU64>,
     track_inflight: bool,
     track_sse: bool,
+    api_key_manager: Option<Arc<ApiKeyManager>>,
+    token: Option<String>,
 }
 
 impl Drop for ResponseCompletionGuard {
@@ -1159,6 +1194,30 @@ impl Drop for ResponseCompletionGuard {
             self.status,
             bytes_sent,
         );
+
+        // 上报请求结果给封禁规则引擎
+        if let Some(manager) = &self.api_key_manager {
+            if let Some(token) = &self.token {
+                let success = self.outcome == "success";
+                let latency_ms = self.request_started_at.elapsed().as_millis() as u64;
+                let status = self.status.as_u16();
+                let token = token.clone();
+                let manager = Arc::clone(manager);
+
+                tokio::spawn(async move {
+                    manager
+                        .report_request_result(
+                            &token,
+                            crate::api_keys::RequestResult {
+                                success,
+                                latency_ms,
+                                response_status: status,
+                            },
+                        )
+                        .await;
+                });
+            }
+        }
     }
 }
 
@@ -1624,7 +1683,6 @@ mod tests {
         config.routes.push(RouteConfig {
             id: "anthropic".to_string(),
             prefix: "/claude".to_string(),
-            api_keys: None,
             upstream: UpstreamConfig {
                 base_url: "https://api.anthropic.com".to_string(),
                 strip_prefix: true,
@@ -1677,7 +1735,6 @@ mod tests {
             routes: vec![RouteConfig {
                 id: "openai".to_string(),
                 prefix: "/openai".to_string(),
-                api_keys: None,
                 upstream: UpstreamConfig {
                     base_url: "https://api.openai.com".to_string(),
                     strip_prefix: true,

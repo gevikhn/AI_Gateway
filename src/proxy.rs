@@ -202,13 +202,11 @@ mod tests {
             RouteConfig {
                 id: "root".to_string(),
                 prefix: "/openai".to_string(),
-                api_keys: None,
                 upstream: minimal_upstream(),
             },
             RouteConfig {
                 id: "nested".to_string(),
                 prefix: "/openai/v1".to_string(),
-                api_keys: None,
                 upstream: minimal_upstream(),
             },
         ];
@@ -222,7 +220,6 @@ mod tests {
         let route = RouteConfig {
             id: "openai".to_string(),
             prefix: "/openai".to_string(),
-            api_keys: None,
             upstream: minimal_upstream(),
         };
 

@@ -239,53 +239,31 @@ impl AppConfig {
     /// 获取所有有效的 API Key 配置（合并简写格式和完整格式）
     pub fn resolved_api_keys(&self) -> Vec<ResolvedApiKey> {
         let mut resolved = Vec::new();
+        let mut seen_keys = HashSet::new();
 
-        // 1. 处理 gateway_auth.api_keys（简写格式）
-        for key in &self.gateway_auth.api_keys {
-            resolved.push(ResolvedApiKey {
-                id: generate_key_id(key),
-                key: key.clone(),
-                route_ids: None, // 所有路由
-                enabled: true,
-                remark: String::new(),
-                rate_limit: None,
-                concurrency: None,
-                ban_rules: Vec::new(),
-                ban_status: None,
-            });
-        }
-
-        // 2. 处理 gateway_auth.api_key_configs（完整格式）
-        for config in &self.gateway_auth.api_key_configs {
-            resolved.push(ResolvedApiKey::from_config(config));
-        }
-
-        // 3. 处理 api_keys.keys（新的全局配置）
+        // 1. 处理 api_keys.keys（新的全局配置，优先级最高）
         if let Some(global) = &self.api_keys {
             for config in &global.keys {
-                resolved.push(ResolvedApiKey::from_config(config));
+                if seen_keys.insert(config.key.clone()) {
+                    resolved.push(ResolvedApiKey::from_config(config));
+                }
             }
         }
 
-        // 4. 处理 route.api_keys（路由级白名单，转换为限制路由的key）
-        for route in &self.routes {
-            if let Some(route_keys) = &route.api_keys {
-                for key in route_keys {
-                    // 检查是否已存在
-                    if !resolved.iter().any(|r| r.key == *key) {
-                        resolved.push(ResolvedApiKey {
-                            id: generate_key_id(key),
-                            key: key.clone(),
-                            route_ids: Some(vec![route.id.clone()]),
-                            enabled: true,
-                            remark: format!("Migrated from route {}", route.id),
-                            rate_limit: None,
-                            concurrency: None,
-                            ban_rules: Vec::new(),
-                            ban_status: None,
-                        });
-                    }
-                }
+        // 2. 处理 gateway_auth.api_keys（简写格式，向后兼容）
+        for key in &self.gateway_auth.api_keys {
+            if seen_keys.insert(key.clone()) {
+                resolved.push(ResolvedApiKey {
+                    id: generate_key_id(key),
+                    key: key.clone(),
+                    route_ids: None, // 所有路由
+                    enabled: true,
+                    remark: String::new(),
+                    rate_limit: None,
+                    concurrency: None,
+                    ban_rules: Vec::new(),
+                    ban_status: None,
+                });
             }
         }
 
@@ -696,27 +674,6 @@ api_keys:
         per_minute: 600
       concurrency:
         max_inflight: 10
-      ban_rules:
-        - id: "rule_001"
-          name: "高错误率封禁"
-          condition:
-            type: "error_rate"
-            window_secs: 300
-            threshold: 0.5
-            min_requests: 10
-          ban_duration_secs: 3600
-          enabled: true
-        - id: "rule_002"
-          name: "请求过多封禁"
-          condition:
-            type: "request_count"
-            window_secs: 60
-            max_requests: 10000
-          ban_duration_secs: 1800
-          enabled: true
-      ban_status:  # 运行时会自动更新
-        is_banned: false
-        ban_count: 0
 
     - id: "key_002"
       key: "sk_test_xyz789"
@@ -725,7 +682,29 @@ api_keys:
       # route_ids 不设置 = 可以访问所有路由
       rate_limit:
         per_minute: 60
-      ban_rules: []
+
+  # 全局封禁规则（对所有 API Key 生效）
+  ban_rules:
+    - id: "rule_001"
+      name: "高错误率封禁"
+      condition:
+        type: "error_rate"
+        window_secs: 300
+        threshold: 0.5
+        min_requests: 10
+      ban_duration_secs: 3600
+      trigger_count_threshold: 3      # 触发 3 次才封禁（防止偶发波动）
+      trigger_window_secs: 3600       # 触发计数窗口 1 小时
+      enabled: true
+    - id: "rule_002"
+      name: "请求过多封禁"
+      condition:
+        type: "request_count"
+        window_secs: 60
+        max_requests: 10000
+      ban_duration_secs: 1800
+      trigger_count_threshold: 1      # 立即封禁
+      enabled: true
 
   ban_log:
     path: "./data/ban_logs.db"
@@ -764,28 +743,31 @@ AppConfig
 ├── api_keys: ApiKeysGlobalConfig           # 新的独立配置（推荐）
 │   ├── keys: Vec<ApiKeyConfig>
 │   │   ├── id: String
-│   │   ├── route_ids: Option<Vec<String>>
+│   │   ├── route_id: Option<String>        # None 表示所有路由
 │   │   ├── key: String
 │   │   ├── enabled: bool
 │   │   ├── remark: String
 │   │   ├── rate_limit: Option<RateLimitConfig>
 │   │   ├── concurrency: Option<ApiKeyConcurrencyConfig>
-│   │   ├── ban_rules: Vec<BanRule>
-│   │   │   ├── id: String
-│   │   │   ├── name: String
-│   │   │   ├── condition: BanCondition
-│   │   │   │   ├── ErrorRate { window_secs, threshold, min_requests }
-│   │   │   │   ├── RequestCount { window_secs, max_requests }
-│   │   │   │   └── ConsecutiveErrors { count }
-│   │   │   ├── ban_duration_secs: u64
-│   │   │   └── enabled: bool
-│   │   └── ban_status: Option<BanStatus>
+│   │   └── ban_status: Option<BanStatus>   # 当前封禁状态
 │   │       ├── is_banned: bool
 │   │       ├── banned_at: Option<u64>
 │   │       ├── banned_until: Option<u64>
 │   │       ├── triggered_rule_id: Option<String>
 │   │       ├── reason: Option<String>
 │   │       └── ban_count: u32
+│   │
+│   ├── ban_rules: Vec<BanRule>              # 全局封禁规则（对所有 Key 生效）
+│   │   ├── id: String
+│   │   ├── name: String
+│   │   ├── condition: BanCondition
+│   │   │   ├── ErrorRate { window_secs, threshold, min_requests }
+│   │   │   ├── RequestCount { window_secs, max_requests }
+│   │   │   └── ConsecutiveErrors { count }
+│   │   ├── ban_duration_secs: u64
+│   │   ├── trigger_count_threshold: u32    # 触发次数阈值（默认 1）
+│   │   ├── trigger_window_secs: u64        # 触发计数窗口（默认 3600）
+│   │   └── enabled: bool
 │   │
 │   └── ban_log: Option<BanLogConfig>
 │       ├── path: String
@@ -794,7 +776,6 @@ AppConfig
 └── routes: Vec<RouteConfig>
     ├── id: String
     ├── prefix: String
-    ├── api_keys: Option<Vec<String>>       # 向后兼容
     └── upstream: UpstreamConfig
 
 BanLogEntry（持久化）
@@ -815,9 +796,12 @@ BanLogEntry（持久化）
 
 ## 8. 关键设计决策
 
-1. **向后兼容策略**：保留旧字段，通过 `resolved_api_keys()` 统一转换为新格式
-2. **配置位置**：支持 `gateway_auth.api_key_configs` 和独立的 `api_keys` 两种位置
-3. **路由权限**：使用 `route_ids: Option<Vec<String>>` 控制，None 表示所有路由
+1. **统一 API Key 管理**：所有 API Key 统一通过 `api_keys.keys` 配置，不再支持路由级 `route.api_keys`
+2. **向后兼容策略**：保留 `gateway_auth.api_keys` 简写格式，通过 `resolved_api_keys()` 统一转换为新格式
+3. **路由权限**：使用 `route_id: Option<String>` 控制，None 表示所有路由
 4. **封禁状态持久化**：`ban_status` 存储在配置中，重启后保持
 5. **封禁日志独立**：使用单独的 SQLite 数据库，避免影响主配置
 6. **配置继承**：api_key级 > 路由级 > 全局级，便于灵活配置
+7. **强制 ApiKeyManager**：鉴权完全通过 ApiKeyManager 进行，不再支持简单的白名单模式
+8. **全局封禁规则**：所有封禁规则统一在 `api_keys.ban_rules` 配置，对所有 API Key 生效，每个 Key 的统计独立
+9. **多次触发才封禁**：通过 `trigger_count_threshold` 和 `trigger_window_secs` 配置，防止偶发波动导致误封

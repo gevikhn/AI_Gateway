@@ -959,7 +959,6 @@ fn gateway_config(upstream_addr: String, request_timeout_ms: u64) -> AppConfig {
         routes: vec![RouteConfig {
             id: "openai".to_string(),
             prefix: "/openai".to_string(),
-            api_keys: None,
             upstream: UpstreamConfig {
                 base_url: format!("http://{upstream_addr}"),
                 strip_prefix: true,

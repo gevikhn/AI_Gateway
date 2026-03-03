@@ -325,7 +325,6 @@ mod tests {
         config.routes.push(RouteConfig {
             id: "anthropic".to_string(),
             prefix: "/claude".to_string(),
-            api_keys: None,
             upstream: UpstreamConfig {
                 base_url: "https://api.anthropic.com".to_string(),
                 strip_prefix: true,
@@ -518,7 +517,6 @@ mod tests {
             routes: vec![RouteConfig {
                 id: "openai".to_string(),
                 prefix: "/openai".to_string(),
-                api_keys: None,
                 upstream: UpstreamConfig {
                     base_url: "https://api.openai.com".to_string(),
                     strip_prefix: true,
@@ -575,7 +573,6 @@ mod tests {
             routes: vec![RouteConfig {
                 id: "openai".to_string(),
                 prefix: "/openai".to_string(),
-                api_keys: None,
                 upstream: UpstreamConfig {
                     base_url: "https://api.openai.com".to_string(),
                     strip_prefix: true,
@@ -591,6 +588,8 @@ mod tests {
             }],
             api_keys: Some(ApiKeysGlobalConfig {
                 keys: api_key_configs,
+                ban_rules: vec![],
+                sqlite: None,
             }),
             inbound_tls: None,
             cors: None,

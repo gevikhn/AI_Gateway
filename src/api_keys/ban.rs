@@ -93,16 +93,28 @@ pub struct WindowStats {
     pub consecutive_errors: u32,
 }
 
+/// 规则触发记录
+#[derive(Debug)]
+pub struct RuleTrigger {
+    /// 规则ID
+    pub rule_id: String,
+    /// 触发时间戳
+    pub triggered_at: u64,
+}
+
 /// 封禁规则引擎
 #[derive(Debug)]
 pub struct BanRuleEngine {
     counter: ViolationCounter,
+    /// 记录每个规则的触发历史（用于多次触发才封禁）
+    rule_triggers: Vec<RuleTrigger>,
 }
 
 impl BanRuleEngine {
     pub fn new(max_window_secs: u64) -> Self {
         Self {
             counter: ViolationCounter::new(max_window_secs),
+            rule_triggers: Vec::new(),
         }
     }
 
@@ -116,14 +128,55 @@ impl BanRuleEngine {
         // 记录请求
         self.counter.record(now, success);
 
+        // 清理过期的触发记录
+        self.cleanup_old_triggers(now, rules);
+
         // 检查每个启用的规则
         for rule in rules.iter().filter(|r| r.enabled) {
             if let Some(triggered) = self.check_single_rule(rule, now) {
-                return Some(triggered);
+                // 记录这次触发
+                self.rule_triggers.push(RuleTrigger {
+                    rule_id: rule.id.clone(),
+                    triggered_at: now,
+                });
+
+                // 检查是否达到触发次数阈值
+                let trigger_count = self.count_triggers_in_window(&rule.id, now, rule.trigger_window_secs);
+                if trigger_count >= rule.trigger_count_threshold {
+                    // 达到阈值，执行封禁，并清除该规则的触发记录
+                    self.clear_triggers_for_rule(&rule.id);
+                    return Some(triggered);
+                }
             }
         }
 
         None
+    }
+
+    /// 清理过期的触发记录
+    fn cleanup_old_triggers(&mut self, now: u64, rules: &[BanRule]) {
+        // 找到最大的触发窗口
+        let max_window = rules.iter()
+            .map(|r| r.trigger_window_secs)
+            .max()
+            .unwrap_or(3600);
+
+        let cutoff = now.saturating_sub(max_window);
+        self.rule_triggers.retain(|t| t.triggered_at >= cutoff);
+    }
+
+    /// 统计指定规则在窗口期内的触发次数
+    fn count_triggers_in_window(&self, rule_id: &str, now: u64, window_secs: u64) -> u32 {
+        let cutoff = now.saturating_sub(window_secs);
+        self.rule_triggers
+            .iter()
+            .filter(|t| t.rule_id == rule_id && t.triggered_at >= cutoff)
+            .count() as u32
+    }
+
+    /// 清除指定规则的所有触发记录
+    fn clear_triggers_for_rule(&mut self, rule_id: &str) {
+        self.rule_triggers.retain(|t| t.rule_id != rule_id);
     }
 
     /// 检查单个规则
@@ -228,6 +281,8 @@ mod tests {
             },
             ban_duration_secs: 3600,
             enabled: true,
+            trigger_count_threshold: 1, // 立即触发
+            trigger_window_secs: 3600,
         }];
 
         // 记录10个请求，6个错误（60%错误率）
@@ -260,6 +315,8 @@ mod tests {
             },
             ban_duration_secs: 1800,
             enabled: true,
+            trigger_count_threshold: 1, // 立即触发
+            trigger_window_secs: 3600,
         }];
 
         // 记录5个请求，第5个应该触发
@@ -287,6 +344,8 @@ mod tests {
             condition: BanCondition::ConsecutiveErrors { count: 3 },
             ban_duration_secs: 900,
             enabled: true,
+            trigger_count_threshold: 1, // 立即触发
+            trigger_window_secs: 3600,
         }];
 
         // 记录3个连续错误
@@ -317,6 +376,8 @@ mod tests {
             },
             ban_duration_secs: 3600,
             enabled: false, // 禁用
+            trigger_count_threshold: 1,
+            trigger_window_secs: 3600,
         }];
 
         // 即使超过阈值，禁用的规则也不会触发
@@ -338,6 +399,8 @@ mod tests {
             },
             ban_duration_secs: 3600,
             enabled: true,
+            trigger_count_threshold: 1,
+            trigger_window_secs: 3600,
         }];
 
         // 记录5个请求
@@ -348,5 +411,50 @@ mod tests {
         // 70秒后，之前的记录应该过期
         let result = engine.check_rules(&rules, now + 70, true);
         assert!(result.is_none(), "Old records should be cleaned up");
+    }
+
+    #[test]
+    fn test_trigger_count_threshold() {
+        let mut engine = BanRuleEngine::new(300);
+        let now = 1000;
+
+        let rules = vec![BanRule {
+            id: "rule_004".to_string(),
+            name: "Multiple triggers required".to_string(),
+            condition: BanCondition::RequestCount {
+                window_secs: 60,
+                max_requests: 5,
+            },
+            ban_duration_secs: 1800,
+            enabled: true,
+            trigger_count_threshold: 3, // 需要触发3次才封禁
+            trigger_window_secs: 3600,
+        }];
+
+        // 第一次满足条件，记录触发但不封禁
+        for i in 0..5 {
+            let result = engine.check_rules(&rules, now + i, true);
+            assert!(result.is_none(), "Should not ban on first trigger");
+        }
+
+        // 等待一段时间后，第二次满足条件
+        let now2 = now + 100;
+        for i in 0..5 {
+            let result = engine.check_rules(&rules, now2 + i, true);
+            assert!(result.is_none(), "Should not ban on second trigger");
+        }
+
+        // 第三次满足条件，应该封禁
+        let now3 = now + 200;
+        for i in 0..5 {
+            let result = engine.check_rules(&rules, now3 + i, true);
+            if i < 4 {
+                assert!(result.is_none());
+            } else {
+                assert!(result.is_some(), "Should ban on third trigger");
+                let triggered = result.unwrap();
+                assert_eq!(triggered.rule_id, "rule_004");
+            }
+        }
     }
 }

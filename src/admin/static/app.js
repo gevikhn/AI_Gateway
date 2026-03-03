@@ -238,6 +238,7 @@ function checkAuth() {
 const TABS = [
   { id: 'routes', label: '路由配置' },
   { id: 'apikeys', label: 'API Keys' },
+  { id: 'banrules', label: '封禁规则' },
   { id: 'banlogs', label: '封禁日志' },
   { id: 'metrics', label: '监控' },
   { id: 'auth', label: '认证' },
@@ -333,327 +334,154 @@ function convertApiKeyToConfig(apiKey) {
   };
 }
 
-// 模拟数据 - 用于测试 UI（匹配架构设计 v2）
-function initMockData() {
-  // 模拟 API Keys - 匹配后端 ApiKeyConfig 结构 v2
-  apiKeysData = [
-    {
-      id: 'key_001',
-      key: 'sk_prod_abc123def456ghi789',
-      route_id: 'openai',
-      route_ids: ['openai'],
-      route_name: 'OpenAI API',
-      route_names: ['OpenAI API'],
-      enabled: true,
-      remark: '生产环境主密钥',
-      per_minute: 600,
-      max_inflight: 10,
-      ban_status: {
-        is_banned: false,
-        banned_at: null,
-        banned_until: null,
-        triggered_rule_id: null,
-        reason: null,
-        ban_count: 0
-      },
-      ban_rules: [
-        {
-          id: 'rule_001',
-          name: '高错误率封禁',
-          condition: {
-            type: 'error_rate',
-            window_secs: 300,
-            threshold: 0.5,
-            min_requests: 10
-          },
-          ban_duration_secs: 3600,
-          enabled: true
-        },
-        {
-          id: 'rule_002',
-          name: '请求过多封禁',
-          condition: {
-            type: 'request_count',
-            window_secs: 60,
-            max_requests: 10000
-          },
-          ban_duration_secs: 1800,
-          enabled: true
-        }
-      ],
-      created_at: '2024-01-15T08:00:00Z',
-      updated_at: '2024-01-20T10:30:00Z'
-    },
-    {
-      id: 'key_002',
-      key: 'sk_test_xyz789test123456',
-      route_id: 'openai',
-      route_ids: ['openai'],
-      route_name: 'OpenAI API',
-      route_names: ['OpenAI API'],
-      enabled: true,
-      remark: '测试环境密钥',
-      per_minute: 60,
-      max_inflight: 5,
-      ban_status: {
-        is_banned: true,
-        banned_at: 1709452800,
-        banned_until: 1709456400,
-        triggered_rule_id: 'rule_003',
-        reason: '错误率超过阈值',
-        ban_count: 3
-      },
-      ban_rules: [
-        {
-          id: 'rule_003',
-          name: '连续错误封禁',
-          condition: {
-            type: 'consecutive_errors',
-            count: 5
-          },
-          ban_duration_secs: 300,
-          enabled: true
-        }
-      ],
-      created_at: '2024-01-16T09:00:00Z',
-      updated_at: '2024-03-03T10:00:00Z'
-    },
-    {
-      id: 'key_003',
-      key: 'sk-anthropic-claude987654321',
-      route_id: 'anthropic',
-      route_ids: ['anthropic'],
-      route_name: 'Anthropic Claude',
-      route_names: ['Anthropic Claude'],
-      enabled: false,
-      remark: '已停用 - 迁移到新版',
-      per_minute: 100,
-      max_inflight: 8,
-      ban_status: {
-        is_banned: false,
-        banned_at: null,
-        banned_until: null,
-        triggered_rule_id: null,
-        reason: null,
-        ban_count: 0
-      },
-      ban_rules: [],
-      created_at: '2024-01-18T14:00:00Z',
-      updated_at: '2024-02-01T16:00:00Z'
-    },
-    {
-      id: 'key_004',
-      key: 'sk-azure-openai-123456789abc',
-      route_id: 'azure-openai',
-      route_ids: ['azure-openai'],
-      route_name: 'Azure OpenAI',
-      route_names: ['Azure OpenAI'],
-      enabled: true,
-      remark: 'Azure 中国区',
-      per_minute: 200,
-      max_inflight: 20,
-      ban_status: {
-        is_banned: false,
-        banned_at: null,
-        banned_until: null,
-        triggered_rule_id: null,
-        reason: null,
-        ban_count: 2
-      },
-      ban_rules: [
-        {
-          id: 'rule_004',
-          name: '请求数封禁',
-          condition: {
-            type: 'request_count',
-            window_secs: 60,
-            max_requests: 200
-          },
-          ban_duration_secs: 600,
-          enabled: true
-        }
-      ],
-      created_at: '2024-02-01T10:00:00Z',
-      updated_at: '2024-02-10T12:00:00Z'
-    },
-    {
-      id: 'key_005',
-      key: 'sk-gemini-pro-abcdef123456789',
-      route_id: null,
-      route_ids: [],
-      route_name: null,
-      route_names: [],
-      enabled: true,
-      remark: 'Gemini Pro 密钥 - 所有路由',
-      per_minute: 80,
-      max_inflight: 8,
-      ban_status: {
-        is_banned: false,
-        banned_at: null,
-        banned_until: null,
-        triggered_rule_id: null,
-        reason: null,
-        ban_count: 1
-      },
-      ban_rules: [
-        {
-          id: 'rule_005',
-          name: '高错误率封禁',
-          condition: {
-            type: 'error_rate',
-            window_secs: 300,
-            threshold: 0.5,
-            min_requests: 10
-          },
-          ban_duration_secs: 3600,
-          enabled: true
-        }
-      ],
-      created_at: '2024-02-15T08:30:00Z',
-      updated_at: '2024-02-20T09:00:00Z'
-    }
-  ];
+// 从服务器加载 API Keys（包含运行时封禁状态）
+async function fetchApiKeysFromServer() {
+  const token = getToken();
+  if (!token || !window.CONFIG.keysUrl) return null;
 
-  // 模拟封禁日志（架构设计 v2 - 使用 Unix 时间戳和 api_key_id）
-  banLogsData = [
-    {
-      id: 'log_001',
-      api_key_id: 'key_002',
-      rule_id: 'rule_003',
-      reason: '连续错误数超过阈值: 5次',
-      banned_at: 1709452800,
-      banned_until: 1709456400,
-      unbanned_at: null,
-      metrics_snapshot: { requests: 20, errors: 5, error_rate: 0.25 }
-    },
-    {
-      id: 'log_002',
-      api_key_id: 'key_001',
-      rule_id: 'rule_001',
-      reason: '错误率超过阈值: 55%',
-      banned_at: 1709366400,
-      banned_until: 1709370000,
-      unbanned_at: 1709370000,
-      metrics_snapshot: { requests: 100, errors: 55, error_rate: 0.55 }
-    },
-    {
-      id: 'log_003',
-      api_key_id: 'key_002',
-      rule_id: 'rule_003',
-      reason: '连续错误数超过阈值: 5次',
-      banned_at: 1709280000,
-      banned_until: 1709283600,
-      unbanned_at: 1709283600,
-      metrics_snapshot: { requests: 15, errors: 5, error_rate: 0.33 }
-    },
-    {
-      id: 'log_004',
-      api_key_id: 'key_004',
-      rule_id: 'manual',
-      reason: '手动封禁 - 密钥泄露',
-      banned_at: 1709107200,
-      banned_until: 1709193600,
-      unbanned_at: 1709193600,
-      metrics_snapshot: { requests: 0, errors: 0, error_rate: 0.0 }
-    },
-    {
-      id: 'log_005',
-      api_key_id: 'key_002',
-      rule_id: 'rule_003',
-      reason: '连续错误数超过阈值: 5次',
-      banned_at: 1709020800,
-      banned_until: 1709024400,
-      unbanned_at: 1709024400,
-      metrics_snapshot: { requests: 30, errors: 5, error_rate: 0.17 }
-    },
-    {
-      id: 'log_006',
-      api_key_id: 'key_002',
-      rule_id: 'rule_003',
-      reason: '连续错误数超过阈值: 5次',
-      banned_at: 1708934400,
-      banned_until: 1708938000,
-      unbanned_at: 1708938000,
-      metrics_snapshot: { requests: 25, errors: 5, error_rate: 0.20 }
-    },
-    {
-      id: 'log_007',
-      api_key_id: 'key_002',
-      rule_id: 'rule_003',
-      reason: '连续错误数超过阈值: 5次',
-      reason: '超过限流阈值: 60秒内请求8次，阈值5',
-      ban_duration_seconds: 300,
-      created_at: '2024-02-25T11:10:00Z',
-      operator: 'system'
-    },
-    {
-      id: '8',
-      api_key: 'sk-openai-test987654321xyz',
-      route_id: 'openai',
-      action_type: 'unban',
-      reason: '自动解封',
-      created_at: '2024-02-25T11:15:00Z',
-      operator: 'system'
-    },
-    {
-      id: '9',
-      api_key: 'sk-anthropic-claude987654321',
-      banned_at: 1709020800,
-      banned_until: 1709107200,
-      unbanned_at: 1709107200,
-      metrics_snapshot: { requests: 0, errors: 0, error_rate: 0.0 }
-    },
-    {
-      id: 'log_008',
-      api_key_id: 'key_001',
-      rule_id: 'rule_002',
-      reason: '请求数超过阈值: 10000次/60秒',
-      banned_at: 1708934400,
-      banned_until: 1708936200,
-      unbanned_at: 1708936200,
-      metrics_snapshot: { requests: 10000, errors: 0, error_rate: 0.0 }
-    },
-    {
-      id: 'log_009',
-      api_key_id: 'key_001',
-      rule_id: 'rule_001',
-      reason: '错误率超过阈值: 52%',
-      banned_at: 1708848000,
-      banned_until: 1708851600,
-      unbanned_at: 1708851600,
-      metrics_snapshot: { requests: 50, errors: 26, error_rate: 0.52 }
-    },
-    {
-      id: 'log_010',
-      api_key_id: 'key_004',
-      rule_id: 'rule_004',
-      reason: '请求数超过阈值: 200次/60秒',
-      banned_at: 1708761600,
-      banned_until: 1708765200,
-      unbanned_at: 1708765200,
-      metrics_snapshot: { requests: 200, errors: 0, error_rate: 0.0 }
-    },
-    {
-      id: 'log_011',
-      api_key_id: 'key_005',
-      rule_id: 'rule_005',
-      reason: '错误率超过阈值: 60%',
-      banned_at: 1708675200,
-      banned_until: 1708678800,
-      unbanned_at: 1708678800,
-      metrics_snapshot: { requests: 30, errors: 18, error_rate: 0.60 }
-    },
-    {
-      id: 'log_012',
-      api_key_id: 'key_004',
-      rule_id: 'rule_004',
-      reason: '请求数超过阈值: 220次/60秒',
-      banned_at: 1708588800,
-      banned_until: 1708592400,
-      unbanned_at: 1708592400,
-      metrics_snapshot: { requests: 220, errors: 0, error_rate: 0.0 }
+  try {
+    const response = await fetch(window.CONFIG.keysUrl, {
+      headers: { 'Authorization': `Bearer ${token}` }
+    });
+
+    if (!response.ok) {
+      if (response.status === 401) {
+        logout();
+        return null;
+      }
+      throw new Error(`HTTP ${response.status}`);
     }
-  ];
+
+    const data = await response.json();
+    console.log('fetchApiKeysFromServer raw response:', data);
+    // 检查第一个 key 的所有字段名（用于调试）
+    if (data.keys && data.keys.length > 0) {
+      console.log('First key field names:', Object.keys(data.keys[0]));
+      console.log('First key ban-related fields:', {
+        is_banned: data.keys[0].is_banned,
+        banned_at: data.keys[0].banned_at,
+        ban_expires_at: data.keys[0].ban_expires_at,
+        ban_reason: data.keys[0].ban_reason,
+        ban_count: data.keys[0].ban_count,
+        triggered_rule_id: data.keys[0].triggered_rule_id
+      });
+    }
+    return data.keys || [];
+  } catch (err) {
+    console.error('Failed to fetch API Keys:', err);
+    return null;
+  }
+}
+
+// 从服务器加载封禁日志
+async function fetchBanLogsFromServer(apiKeyId) {
+  const token = getToken();
+  if (!token) {
+    console.warn('No admin token found');
+    return null;
+  }
+
+  // 使用 adminPrefix 构建封禁日志 URL
+  const prefix = window.CONFIG?.adminPrefix || '/admin';
+  const url = apiKeyId
+    ? `${prefix}/api/keys/${apiKeyId}/ban-logs?limit=100`
+    : `${prefix}/api/ban-logs?limit=100`;
+
+  console.log('Fetching ban logs from:', url);
+
+  try {
+    const response = await fetch(url, {
+      headers: { 'Authorization': `Bearer ${token}` }
+    });
+
+    if (!response.ok) {
+      if (response.status === 401) {
+        logout();
+        return null;
+      }
+      throw new Error(`HTTP ${response.status}`);
+    }
+
+    const data = await response.json();
+    console.log('Ban logs response:', data);
+    return data.logs || [];
+  } catch (err) {
+    console.error('Failed to fetch ban logs:', err);
+    return null;
+  }
+}
+
+// 合并 API Key 数据（配置数据 + 服务器运行时数据）
+async function loadApiKeys() {
+  // 先从配置加载基础数据
+  const configKeys = loadApiKeysFromConfig();
+
+  // 从服务器获取运行时数据（包含封禁状态）
+  const serverKeys = await fetchApiKeysFromServer();
+
+  if (serverKeys && serverKeys.length > 0) {
+    // 使用服务器数据，但需要补充配置中的额外字段
+    apiKeysData = serverKeys.map(serverKey => {
+      // 查找对应的配置数据
+      const configKey = configKeys.find(k => k.id === serverKey.id);
+
+      // 调试：输出服务器返回的原始数据
+      console.log('Server key raw data:', serverKey.id, {
+        is_banned: serverKey.is_banned,
+        banned_at: serverKey.banned_at,
+        ban_expires_at: serverKey.ban_expires_at,
+        ban_reason: serverKey.ban_reason,
+        ban_count: serverKey.ban_count
+      });
+
+      // 后端返回扁平结构，转换为前端嵌套结构
+      // 确保数值类型正确转换
+      const banStatus = {
+        is_banned: serverKey.is_banned || false,
+        banned_at: serverKey.banned_at ? parseInt(serverKey.banned_at) : null,
+        banned_until: serverKey.ban_expires_at ? parseInt(serverKey.ban_expires_at) : null,
+        triggered_rule_id: serverKey.triggered_rule_id || null,
+        reason: serverKey.ban_reason || null,
+        ban_count: parseInt(serverKey.ban_count) || 0
+      };
+
+      // 调试：输出转换后的数据
+      console.log('Converted ban status:', serverKey.id, banStatus);
+
+      return {
+        ...serverKey,
+        // 使用配置中的路由信息（如果服务器没有返回）
+        route_ids: serverKey.route_ids || configKey?.route_ids || [],
+        route_names: serverKey.route_names || configKey?.route_names || [],
+        // 合并封禁状态
+        ban_status: banStatus,
+        // 保留配置中的其他字段
+        per_minute: serverKey.per_minute || configKey?.per_minute || 120,
+        max_inflight: serverKey.max_inflight || configKey?.max_inflight || null,
+        created_at: serverKey.created_at || configKey?.created_at || new Date().toISOString(),
+        updated_at: serverKey.updated_at || configKey?.updated_at || new Date().toISOString()
+      };
+    });
+  } else {
+    // 服务器不可用，使用配置数据
+    apiKeysData = configKeys;
+  }
+
+  return apiKeysData;
+}
+
+// 加载封禁日志
+async function loadBanLogs() {
+  console.log('Loading ban logs...');
+  const logs = await fetchBanLogsFromServer();
+  console.log('Fetched logs:', logs);
+  if (logs !== null) {
+    banLogsData = logs;
+    console.log('Updated banLogsData:', banLogsData);
+  } else {
+    console.warn('Failed to load ban logs, keeping existing data');
+  }
+  return banLogsData;
 }
 
 function initTabs() {
@@ -679,13 +507,22 @@ function initTabs() {
   });
 }
 
-function switchTab(id) {
+async function switchTab(id) {
   document.querySelectorAll('.tab').forEach(t => {
     t.classList.toggle('active', t.dataset.tab === id);
   });
   document.querySelectorAll('.tab-panel').forEach(p => {
     p.classList.toggle('active', p.id === 'tab-' + id);
   });
+
+  // 切换到特定标签页时加载数据
+  if (id === 'apikeys') {
+    await loadApiKeys();
+    renderApiKeys();
+  } else if (id === 'banlogs') {
+    await loadBanLogs();
+    renderBanLogs();
+  }
 }
 
 // ===== 加载配置 =====
@@ -714,7 +551,14 @@ async function loadConfig() {
     }
 
     cfg = await res.json();
+
+    // 先从服务器加载实时数据（封禁状态等）
+    await loadApiKeys();
+    await loadBanLogs();
+
+    // 渲染所有标签页（使用包含实时数据的合并结果）
     renderAll();
+
     const actionBar = document.getElementById('actionBar');
     if (actionBar) actionBar.style.display = '';
     Toast.show('配置已加载', 'success');
@@ -728,6 +572,7 @@ async function loadConfig() {
 function renderAll() {
   renderRoutes();
   renderApiKeys();
+  renderBanRules();
   renderBanLogs();
   renderMetrics();
   renderAuth();
@@ -742,19 +587,24 @@ function renderApiKeys() {
   const panel = document.getElementById('tab-apikeys');
   if (!panel) return;
 
-  // 从配置加载 API Keys（如果配置中有数据且前端数据为空）
-  if (cfg?.api_keys?.keys && apiKeysData.length === 0) {
-    apiKeysData = loadApiKeysFromConfig();
+  // 如果数据为空，尝试从服务器加载或从配置加载（备用）
+  if (apiKeysData.length === 0) {
+    // 注意：正常情况下 loadConfig() 应该已经调用了 loadApiKeys()
+    // 这里只是作为备用
+    console.warn('apiKeysData is empty, falling back to config data');
+    if (cfg?.api_keys?.keys) {
+      apiKeysData = loadApiKeysFromConfig();
+    }
   }
 
   // 获取所有路由选项
   const routes = cfg?.routes || [];
-  const routeOptions = routes.map(r => `<option value="${esc(r.id)}">${esc(r.id)}</option>`).join('');
+  const routeOptions = routes.map(r => `<option value="${esc(r.id)}" ${apiKeyFilter.route === r.id ? 'selected' : ''}>${esc(r.id)}</option>`).join('');
 
   // 过滤 API Keys（适配新数据结构 v2）
   let filteredKeys = apiKeysData.filter(key => {
-    // 按路由筛选（检查 route_id 或 route_ids）
-    if (apiKeyFilter.route && key.route_id !== apiKeyFilter.route) return false;
+    // 按路由筛选（检查 route_ids 数组）
+    if (apiKeyFilter.route && (!key.route_ids || !key.route_ids.includes(apiKeyFilter.route))) return false;
     // 按状态筛选
     if (apiKeyFilter.status !== 'all') {
       const isBanned = key.ban_status?.is_banned || false;
@@ -774,22 +624,61 @@ function renderApiKeys() {
 
   // 生成表格行
   const tableRows = filteredKeys.map(key => {
-    const isBanned = key.ban_status?.is_banned || false;
+    // 检查封禁状态（考虑时间过期的情况）
+    let isBanned = key.ban_status?.is_banned || false;
+    const bannedUntil = key.ban_status?.banned_until;
+    if (isBanned && bannedUntil) {
+      const now = Math.floor(Date.now() / 1000); // Unix秒
+      if (now >= parseInt(bannedUntil)) {
+        // 封禁时间已过期，视为未封禁
+        isBanned = false;
+      }
+    }
     const status = isBanned ? 'banned' : (key.enabled ? 'enabled' : 'disabled');
     const statusClass = `status-${status}`;
     const statusText = isBanned ? '封禁中' : (key.enabled ? '启用' : '禁用');
     const shortKey = key.key.substring(0, 20) + '...';
 
-    // 路由标签（单路由，后端 route_id: Option<String>）
-    const routeTags = key.route_id
-      ? `<span class="route-tag" title="${esc(key.route_id)}">${esc(key.route_name || key.route_id)}</span>`
-      : '<span class="route-tag all-routes">所有路由</span>';
+    // 路由标签（支持多路由显示）
+    let routeTags;
+    if (!key.route_ids || key.route_ids.length === 0) {
+      routeTags = '<span class="route-tag all-routes">所有路由</span>';
+    } else {
+      routeTags = key.route_ids.slice(0, 2).map((rid, idx) => {
+        const rname = key.route_names?.[idx] || rid;
+        return `<span class="route-tag" title="${esc(rid)}">${esc(rname)}</span>`;
+      }).join('');
+      if (key.route_ids.length > 2) {
+        routeTags += `<span class="route-tag" title="${key.route_ids.slice(2).join(', ')}">+${key.route_ids.length - 2}</span>`;
+      }
+    }
 
     // 封禁状态显示
     let banStatusHtml = '-';
-    if (isBanned && key.ban_status?.banned_until) {
-      const expiresAt = key.ban_status.banned_until * 1000; // Unix秒转毫秒
-      banStatusHtml = `<span class="ban-timer" data-expires="${expiresAt}">计算中...</span>`;
+    // 重新计算 isBanned（可能已经过期）
+    let isCurrentlyBanned = key.ban_status?.is_banned || false;
+    const bannedUntilTs = key.ban_status?.banned_until;
+    if (isCurrentlyBanned && bannedUntilTs) {
+      const now = Math.floor(Date.now() / 1000);
+      if (now >= parseInt(bannedUntilTs)) {
+        isCurrentlyBanned = false;
+      }
+    }
+    console.log('Render ban status:', key.id, {
+      isCurrentlyBanned,
+      banned_until: key.ban_status?.banned_until,
+      type: typeof key.ban_status?.banned_until
+    });
+    if (isCurrentlyBanned && bannedUntilTs) {
+      const bannedUntil = parseInt(bannedUntilTs);
+      console.log('Parsed bannedUntil:', bannedUntil, 'isNaN:', isNaN(bannedUntil));
+      if (!isNaN(bannedUntil) && bannedUntil > 0) {
+        const expiresAtMs = bannedUntil * 1000; // Unix秒转毫秒
+        console.log('Setting data-expires:', expiresAtMs, 'type:', typeof expiresAtMs);
+        banStatusHtml = `<span class="ban-timer" data-expires="${expiresAtMs}">计算中...</span>`;
+      } else {
+        banStatusHtml = '<span class="ban-status-badge banned">已封禁</span>';
+      }
     } else if (key.ban_status?.ban_count > 0) {
       banStatusHtml = `<span class="ban-history">历史封禁 ${key.ban_status.ban_count} 次</span>`;
     }
@@ -847,14 +736,14 @@ function renderApiKeys() {
       <div class="apikeys-toolbar">
         <div class="filter-group">
           <select class="input select filter-select" onchange="setApiKeyFilter('route', this.value)">
-            <option value="">所有路由</option>
+            <option value="" ${apiKeyFilter.route === '' ? 'selected' : ''}>所有路由</option>
             ${routeOptions}
           </select>
           <select class="input select filter-select" onchange="setApiKeyFilter('status', this.value)">
-            <option value="all">所有状态</option>
-            <option value="enabled">启用</option>
-            <option value="disabled">禁用</option>
-            <option value="banned">封禁中</option>
+            <option value="all" ${apiKeyFilter.status === 'all' ? 'selected' : ''}>所有状态</option>
+            <option value="enabled" ${apiKeyFilter.status === 'enabled' ? 'selected' : ''}>启用</option>
+            <option value="disabled" ${apiKeyFilter.status === 'disabled' ? 'selected' : ''}>禁用</option>
+            <option value="banned" ${apiKeyFilter.status === 'banned' ? 'selected' : ''}>封禁中</option>
           </select>
         </div>
         <div class="search-box">
@@ -894,11 +783,19 @@ function renderApiKeys() {
 // 更新封禁倒计时
 function updateBanTimers() {
   const timers = document.querySelectorAll('.ban-timer');
-  timers.forEach(timer => {
-    const expiresAt = new Date(timer.dataset.expires);
+  console.log('updateBanTimers called, found timers:', timers.length);
+  timers.forEach((timer, idx) => {
+    console.log(`Timer ${idx}: dataset.expires =`, timer.dataset.expires);
+    const expiresAt = new Date(parseInt(timer.dataset.expires));
     const now = new Date();
     const diff = expiresAt - now;
+    console.log(`Timer ${idx}: expiresAt =`, expiresAt, 'diff =', diff, 'isNaN:', isNaN(diff));
 
+    if (isNaN(diff)) {
+      timer.textContent = '计算错误';
+      console.error(`Timer ${idx}: Invalid diff calculation`);
+      return;
+    }
     if (diff <= 0) {
       timer.textContent = '即将解封';
       timer.classList.add('expiring');
@@ -906,6 +803,8 @@ function updateBanTimers() {
       const hours = Math.floor(diff / 3600000);
       const minutes = Math.floor((diff % 3600000) / 60000);
       const seconds = Math.floor((diff % 60000) / 1000);
+
+      console.log(`Timer ${idx}: hours=${hours}, minutes=${minutes}, seconds=${seconds}, textContent will be:`, hours > 0 ? `${hours}小时${minutes}分` : minutes > 0 ? `${minutes}分${seconds}秒` : `${seconds}秒`);
 
       if (hours > 0) {
         timer.textContent = `${hours}小时${minutes}分`;
@@ -993,48 +892,58 @@ function editRemark(id, element) {
 }
 
  // 解封 API Key（适配新数据结构 v2）
-function unbanApiKey(id) {
+async function unbanApiKey(id) {
   confirmDelete(
     '解封 API Key',
     '确定要手动解封此 API Key 吗？',
-    () => {
-      const key = apiKeysData.find(k => k.id === id);
-      if (key) {
-        const now = Math.floor(Date.now() / 1000); // Unix秒
+    async () => {
+      const token = getToken();
+      if (!token) {
+        logout();
+        return;
+      }
 
-        // 更新前端数据
-        key.ban_status = {
-          is_banned: false,
-          banned_at: key.ban_status?.banned_at || null,
-          banned_until: null,
-          triggered_rule_id: null,
-          reason: null,
-          ban_count: key.ban_status?.ban_count || 0
-        };
-        key.updated_at = new Date().toISOString();
-
-        // 同步到配置
-        if (cfg.api_keys && cfg.api_keys.keys) {
-          const configKey = cfg.api_keys.keys.find(k => k.id === id);
-          if (configKey) {
-            configKey.ban_status = { ...key.ban_status };
+      try {
+        const response = await fetch(`${window.CONFIG.keysUrl}/${id}/unban`, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${token}`,
+            'Content-Type': 'application/json'
           }
-        }
-
-        // 添加到日志（新结构）
-        banLogsData.unshift({
-          id: 'log_' + Date.now(),
-          api_key_id: key.id,
-          rule_id: key.ban_status?.triggered_rule_id || 'manual',
-          reason: '手动解封',
-          banned_at: key.ban_status?.banned_at || now,
-          banned_until: now,
-          unbanned_at: now
         });
 
+        if (!response.ok) {
+          if (response.status === 401) {
+            logout();
+            return;
+          }
+          const err = await response.json().catch(() => ({}));
+          throw new Error(err.error || `HTTP ${response.status}`);
+        }
+
+        const key = apiKeysData.find(k => k.id === id);
+        if (key) {
+          const now = Math.floor(Date.now() / 1000); // Unix秒
+
+          // 更新前端数据
+          key.ban_status = {
+            is_banned: false,
+            banned_at: key.ban_status?.banned_at || null,
+            banned_until: null,
+            triggered_rule_id: null,
+            reason: null,
+            ban_count: key.ban_status?.ban_count || 0
+          };
+          key.updated_at = new Date().toISOString();
+        }
+
         Toast.show('API Key 已解封', 'success');
+        await loadBanLogs(); // 重新加载封禁日志
         renderApiKeys();
         renderBanLogs();
+      } catch (err) {
+        console.error('Failed to unban API Key:', err);
+        Toast.show(`解封失败: ${err.message}`, 'error');
       }
     }
   );
@@ -1064,65 +973,9 @@ function openApiKeyModal(id) {
   modal.className = 'modal-overlay';
   modal.id = 'apikey-modal';
 
-  // 路由单选（后端当前是 route_id: Option<String>）
-  const routeOptions = routes.map(r => {
-    const isSelected = key?.route_id === r.id;
-    return `<option value="${esc(r.id)}" ${isSelected ? 'selected' : ''}>${esc(r.id)}</option>`;
-  }).join('');
-
-  // 生成封禁规则 HTML（新结构）
-  const banRulesHtml = (key?.ban_rules || []).map((rule, idx) => {
-    const cond = rule.condition || {};
-    const condType = cond.type || 'error_rate';
-
-    // 根据条件类型生成不同的输入字段
-    let conditionFields = '';
-    if (condType === 'error_rate') {
-      conditionFields = `
-        <input type="number" class="input" placeholder="窗口(秒)" value="${cond.window_secs || 300}" min="1" data-field="window_secs">
-        <input type="number" class="input" placeholder="错误率(0-1)" value="${cond.threshold || 0.5}" min="0" max="1" step="0.1" data-field="threshold">
-        <input type="number" class="input" placeholder="最小请求" value="${cond.min_requests || 10}" min="1" data-field="min_requests">
-      `;
-    } else if (condType === 'request_count') {
-      conditionFields = `
-        <input type="number" class="input" placeholder="窗口(秒)" value="${cond.window_secs || 60}" min="1" data-field="window_secs">
-        <input type="number" class="input" placeholder="最大请求" value="${cond.max_requests || 1000}" min="1" data-field="max_requests">
-        <input type="text" class="input" placeholder="-" disabled style="opacity:0.3">
-      `;
-    } else if (condType === 'consecutive_errors') {
-      conditionFields = `
-        <input type="number" class="input" placeholder="连续错误数" value="${cond.count || 5}" min="1" data-field="count">
-        <input type="text" class="input" placeholder="-" disabled style="opacity:0.3">
-        <input type="text" class="input" placeholder="-" disabled style="opacity:0.3">
-      `;
-    }
-
-    return `
-      <div class="ban-rule-item" data-idx="${idx}">
-        <div class="ban-rule-header">
-          <input type="text" class="input rule-name" placeholder="规则名称" value="${esc(rule.name || '')}">
-          <select class="input select rule-type" onchange="updateBanRuleFields(this)">
-            <option value="error_rate" ${condType === 'error_rate' ? 'selected' : ''}>错误率</option>
-            <option value="request_count" ${condType === 'request_count' ? 'selected' : ''}>请求数</option>
-            <option value="consecutive_errors" ${condType === 'consecutive_errors' ? 'selected' : ''}>连续错误</option>
-          </select>
-          <input type="number" class="input" placeholder="封禁(秒)" value="${rule.ban_duration_secs || 3600}" min="1" data-field="ban_duration">
-          <label class="toggle rule-toggle">
-            <input type="checkbox" ${rule.enabled !== false ? 'checked' : ''} data-field="enabled">
-            <span class="toggle-slider"></span>
-          </label>
-          <button type="button" class="btn btn-danger btn-sm" onclick="this.closest('.ban-rule-item').remove(); checkBanRulesEmpty();">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <path d="M18 6 6 18M6 6l12 12"/>
-            </svg>
-          </button>
-        </div>
-        <div class="ban-rule-conditions">
-          ${conditionFields}
-        </div>
-      </div>
-    `;
-  }).join('');
+  // 准备路由选择数据（支持多选）
+  const selectedRoutes = key?.route_ids || (key?.route_id ? [key.route_id] : []);
+  const isAllRoutes = selectedRoutes.length === 0;
 
   modal.innerHTML = `
     <div class="modal apikey-modal" role="dialog" aria-modal="true">
@@ -1148,11 +1001,37 @@ function openApiKeyModal(id) {
             </div>
             <div class="field">
               <label class="field-label">允许访问的路由</label>
-              <select class="input select" id="apikey-route">
-                <option value="">所有路由</option>
-                ${routeOptions}
-              </select>
-              <div class="field-help">不选择 = 可以访问所有路由</div>
+              <div class="multi-select" id="route-multi-select" data-selected='${JSON.stringify(selectedRoutes)}'>
+                <div class="multi-select-trigger" onclick="toggleMultiSelect(this)">
+                  <div class="multi-select-values">
+                    ${isAllRoutes ? '<span class="multi-select-tag all-routes">所有路由</span>' : selectedRoutes.map(r => {
+                      const route = routes.find(rt => rt.id === r);
+                      return `<span class="multi-select-tag" data-value="${esc(r)}">${esc(route?.id || r)}<span class="multi-select-tag-remove" onclick="event.stopPropagation(); removeRouteTag(this)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18M6 6l12 12"/></svg></span></span>`;
+                    }).join('')}
+                  </div>
+                  <svg class="multi-select-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6"/></svg>
+                </div>
+                <div class="multi-select-dropdown" style="display: none;">
+                  <div class="multi-select-search">
+                    <input type="text" placeholder="搜索路由..." oninput="filterRouteOptions(this)">
+                  </div>
+                  <div class="multi-select-options">
+                    <div class="multi-select-option special ${isAllRoutes ? 'selected' : ''}" data-value="" onclick="selectRouteOption(this)">
+                      <div class="multi-select-checkbox"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg></div>
+                      <span>所有路由</span>
+                    </div>
+                    ${routes.map(r => {
+                      const isSel = selectedRoutes.includes(r.id);
+                      return `<div class="multi-select-option ${isSel ? 'selected' : ''} ${isAllRoutes ? 'disabled' : ''}" data-value="${esc(r.id)}" onclick="selectRouteOption(this)">
+                        <div class="multi-select-checkbox"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg></div>
+                        <span>${esc(r.id)}${r.prefix ? ` (${esc(r.prefix)})` : ''}</span>
+                      </div>`;
+                    }).join('')}
+                  </div>
+                </div>
+              </div>
+              <input type="hidden" id="apikey-routes" value='${JSON.stringify(selectedRoutes)}'>
+              <div class="field-help">选择"所有路由"可访问全部路由；选择具体路由则只能访问指定路由</div>
             </div>
             <div class="field">
               <label class="field-label">备注</label>
@@ -1183,13 +1062,14 @@ function openApiKeyModal(id) {
             </div>
           </div>
 
-          <div class="form-section">
-            <h4 class="section-title">
-              封禁规则配置
-              <button type="button" class="btn btn-secondary btn-sm" onclick="addBanRuleV2()">+ 添加规则</button>
-            </h4>
-            <div id="ban-rules-list">
-              ${banRulesHtml || '<div class="ban-rules-empty">暂无规则，点击"添加规则"创建</div>'}
+          <div class="form-section info-section">
+            <div class="info-box">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <circle cx="12" cy="12" r="10"/>
+                <path d="M12 16v-4"/>
+                <path d="M12 8h.01"/>
+              </svg>
+              <p>封禁规则已移至<strong>"封禁规则"</strong>标签页统一管理，对所有 API Key 生效。</p>
             </div>
           </div>
         </form>
@@ -1287,38 +1167,10 @@ function saveApiKeyV2(id) {
   const perMinute = parseInt(document.getElementById('apikey-per-minute').value) || 120;
   const maxInflight = parseInt(document.getElementById('apikey-max-inflight').value) || null;
 
-  // 收集选中的路由（单选）
-  const routeId = document.getElementById('apikey-route').value || null;
-
-  // 收集封禁规则
-  const banRules = [];
-  document.querySelectorAll('.ban-rule-item').forEach(item => {
-    const name = item.querySelector('.rule-name').value || '未命名规则';
-    const type = item.querySelector('.rule-type').value;
-    const banDuration = parseInt(item.querySelector('[data-field="ban_duration"]').value) || 3600;
-    const enabled = item.querySelector('[data-field="enabled"]').checked;
-
-    // 根据类型收集条件字段
-    let condition = { type };
-    if (type === 'error_rate') {
-      condition.window_secs = parseInt(item.querySelector('[data-field="window_secs"]').value) || 300;
-      condition.threshold = parseFloat(item.querySelector('[data-field="threshold"]').value) || 0.5;
-      condition.min_requests = parseInt(item.querySelector('[data-field="min_requests"]').value) || 10;
-    } else if (type === 'request_count') {
-      condition.window_secs = parseInt(item.querySelector('[data-field="window_secs"]').value) || 60;
-      condition.max_requests = parseInt(item.querySelector('[data-field="max_requests"]').value) || 1000;
-    } else if (type === 'consecutive_errors') {
-      condition.count = parseInt(item.querySelector('[data-field="count"]').value) || 5;
-    }
-
-    banRules.push({
-      id: 'rule_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9),
-      name,
-      condition,
-      ban_duration_secs: banDuration,
-      enabled
-    });
-  });
+  // 收集选中的路由（多选，但后端当前只支持单路由，取第一个）
+  const routeInput = document.getElementById('apikey-routes');
+  const selectedRoutes = routeInput ? JSON.parse(routeInput.value || '[]') : [];
+  const routeId = selectedRoutes.length > 0 ? selectedRoutes[0] : null;
 
   // 查找路由名称
   const routeName = routeId ? (cfg?.routes?.find(r => r.id === routeId)?.name || routeId) : null;
@@ -1328,9 +1180,12 @@ function saveApiKeyV2(id) {
     id: id || 'key_' + Date.now(),
     key: value || generateApiKey(routeId || 'global'),
     route_id: routeId,
-    route_ids: routeId ? [routeId] : [],
+    route_ids: selectedRoutes, // 保存所有选中的路由，为将来后端支持多路由做准备
     route_name: routeName,
-    route_names: routeName ? [routeName] : [],
+    route_names: selectedRoutes.map(r => {
+      const rt = cfg?.routes?.find(rt => rt.id === r);
+      return rt ? (rt.name || rt.id) : r;
+    }),
     enabled: true,
     remark: remark || '',
     per_minute: perMinute,
@@ -1343,7 +1198,6 @@ function saveApiKeyV2(id) {
       reason: null,
       ban_count: 0
     },
-    ban_rules: banRules,
     updated_at: new Date().toISOString()
   };
 
@@ -1502,10 +1356,374 @@ function deleteApiKeyById(id) {
   );
 }
 
+// -- 全局封禁规则管理页面 --
+let banRulesData = []; // 全局封禁规则数据
+
+function renderBanRules() {
+  const panel = document.getElementById('tab-banrules');
+  if (!panel) return;
+
+  // 从配置加载全局封禁规则
+  if (cfg?.api_keys?.ban_rules) {
+    banRulesData = cfg.api_keys.ban_rules;
+  } else {
+    banRulesData = [];
+  }
+
+  const rulesHtml = banRulesData.map((rule, idx) => {
+    const cond = rule.condition || {};
+    let conditionText = '';
+    if (cond.type === 'error_rate') {
+      conditionText = `错误率 > ${(cond.threshold * 100).toFixed(0)}% (${cond.window_secs}秒窗口, 最少${cond.min_requests}请求)`;
+    } else if (cond.type === 'request_count') {
+      conditionText = `请求数 > ${cond.max_requests} (${cond.window_secs}秒窗口)`;
+    } else if (cond.type === 'consecutive_errors') {
+      conditionText = `连续错误 > ${cond.count} 次`;
+    }
+
+    const durationText = formatDuration(rule.ban_duration_secs);
+    const triggerThreshold = rule.trigger_count_threshold || 1;
+    const triggerWindow = formatDuration(rule.trigger_window_secs || 3600);
+    const triggerText = triggerThreshold > 1
+      ? `<span class="trigger-badge" title="${triggerThreshold} 次触发 / ${triggerWindow}">${triggerThreshold} 次</span>`
+      : '<span class="trigger-badge immediate">立即</span>';
+
+    return `
+      <tr data-idx="${idx}">
+        <td><span class="rule-name">${esc(rule.name || '未命名规则')}</span></td>
+        <td><span class="condition-badge ${cond.type}">${conditionText}</span></td>
+        <td>${durationText}</td>
+        <td>${triggerText}</td>
+        <td>
+          <label class="toggle">
+            <input type="checkbox" class="toggle-input" ${rule.enabled !== false ? 'checked' : ''} onchange="toggleBanRule(${idx}, this.checked)">
+            <span class="toggle-slider"></span>
+          </label>
+        </td>
+        <td class="actions-cell">
+          <button class="btn btn-secondary btn-sm" onclick="editBanRule(${idx})" title="编辑">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
+              <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
+            </svg>
+          </button>
+          <button class="btn btn-danger btn-sm" onclick="deleteBanRule(${idx})" title="删除">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M3 6h18M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/>
+            </svg>
+          </button>
+        </td>
+      </tr>
+    `;
+  }).join('');
+
+  panel.innerHTML = `
+    <div class="banrules-page">
+      <div class="banrules-header">
+        <div class="header-info">
+          <h2 class="banrules-title">全局封禁规则</h2>
+          <p class="banrules-desc">配置对所有 API Key 生效的自动封禁规则。当某个 API Key 的请求满足规则条件时，将自动被封禁。</p>
+        </div>
+        <button class="btn btn-primary" onclick="openBanRuleModal()">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M12 5v14M5 12h14"/>
+          </svg>
+          添加规则
+        </button>
+      </div>
+
+      <div class="banrules-table-wrapper">
+        <table class="banrules-table">
+          <thead>
+            <tr>
+              <th>规则名称</th>
+              <th>触发条件</th>
+              <th>封禁时长</th>
+              <th>触发阈值</th>
+              <th>启用状态</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${rulesHtml || '<tr><td colspan="6" class="empty-cell">暂无封禁规则</td></tr>'}
+          </tbody>
+        </table>
+      </div>
+
+      <div class="banrules-help">
+        <h4><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="12" cy="12" r="10"/>
+          <path d="M12 16v-4"/>
+          <path d="M12 8h.01"/>
+        </svg> 规则说明</h4>
+        <ul>
+          <li><strong>错误率规则</strong>：在指定时间窗口内，错误率超过阈值且请求数达到最小值时触发</li>
+          <li><strong>请求数规则</strong>：在指定时间窗口内，请求数超过最大值时触发</li>
+          <li><strong>连续错误规则</strong>：连续出现指定次数的错误时触发</li>
+          <li><strong>触发次数阈值</strong>：可以设置规则在多长时间内触发多少次后才真正执行封禁（防止偶发波动）</li>
+          <li>规则对所有 API Key 生效，每个 API Key 的统计是独立的</li>
+        </ul>
+      </div>
+    </div>
+  `;
+}
+
+// 格式化时长显示
+function formatDuration(seconds) {
+  if (seconds < 60) return `${seconds}秒`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}分钟`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)}小时`;
+  return `${Math.floor(seconds / 86400)}天`;
+}
+
+// 切换规则启用状态
+function toggleBanRule(idx, enabled) {
+  if (!cfg.api_keys) cfg.api_keys = {};
+  if (!cfg.api_keys.ban_rules) cfg.api_keys.ban_rules = [];
+
+  if (cfg.api_keys.ban_rules[idx]) {
+    cfg.api_keys.ban_rules[idx].enabled = enabled;
+    Toast.show(enabled ? '规则已启用' : '规则已禁用', 'success');
+    renderBanRules();
+  }
+}
+
+// 删除封禁规则
+function deleteBanRule(idx) {
+  confirmDelete('删除封禁规则', '确定要删除这条封禁规则吗？此操作不可撤销。', () => {
+    if (cfg?.api_keys?.ban_rules) {
+      cfg.api_keys.ban_rules.splice(idx, 1);
+      Toast.show('封禁规则已删除', 'success');
+      renderBanRules();
+    }
+  });
+}
+
+// 打开封禁规则编辑弹窗
+function openBanRuleModal(idx) {
+  const isEdit = idx !== undefined;
+  const rule = isEdit ? cfg?.api_keys?.ban_rules?.[idx] : null;
+
+  const modal = document.createElement('div');
+  modal.className = 'modal-overlay';
+  modal.id = 'banrule-modal';
+
+  const cond = rule?.condition || {};
+  const condType = cond.type || 'error_rate';
+
+  modal.innerHTML = `
+    <div class="modal" role="dialog" aria-modal="true">
+      <div class="modal-header">
+        <h3 class="modal-title">${isEdit ? '编辑封禁规则' : '添加封禁规则'}</h3>
+        <button class="btn btn-ghost btn-sm" onclick="closeBanRuleModal()">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M18 6 6 18M6 6l12 12"/>
+          </svg>
+        </button>
+      </div>
+      <div class="modal-body">
+        <form id="banrule-form">
+          <div class="field">
+            <label class="field-label">规则名称</label>
+            <input type="text" class="input" id="banrule-name" value="${esc(rule?.name || '')}"
+                   placeholder="例如：高频错误封禁">
+          </div>
+
+          <div class="field">
+            <label class="field-label">触发条件类型</label>
+            <select class="input select" id="banrule-type" onchange="updateBanRuleConditionFields()">
+              <option value="error_rate" ${condType === 'error_rate' ? 'selected' : ''}>错误率阈值</option>
+              <option value="request_count" ${condType === 'request_count' ? 'selected' : ''}>请求数阈值</option>
+              <option value="consecutive_errors" ${condType === 'consecutive_errors' ? 'selected' : ''}>连续错误数</option>
+            </select>
+          </div>
+
+          <div id="banrule-condition-fields" class="condition-fields">
+            ${getBanRuleConditionFieldsHtml(condType, cond)}
+          </div>
+
+          <div class="field">
+            <label class="field-label">封禁时长</label>
+            <div class="duration-input-group">
+              <input type="number" class="input" id="banrule-duration" value="${rule?.ban_duration_secs || 3600}"
+                     min="60" step="60">
+              <span class="input-suffix">秒</span>
+            </div>
+            <div class="field-help">建议：1小时=3600秒，1天=86400秒</div>
+          </div>
+
+          <div class="form-section">
+            <h5 class="section-subtitle">多次触发设置</h5>
+            <div class="form-row">
+              <div class="field">
+                <label class="field-label">触发次数阈值</label>
+                <input type="number" class="input" id="banrule-trigger-count"
+                       value="${rule?.trigger_count_threshold || 1}"
+                       min="1" max="100" step="1">
+                <div class="field-help">在计数窗口期内触发多少次后才执行封禁（1=立即封禁）</div>
+              </div>
+              <div class="field">
+                <label class="field-label">触发计数窗口 (秒)</label>
+                <input type="number" class="input" id="banrule-trigger-window"
+                       value="${rule?.trigger_window_secs || 3600}"
+                       min="60" step="60">
+                <div class="field-help">统计触发次数的时间窗口（例如：3600=1小时）</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="field">
+            <label class="toggle-label">
+              <input type="checkbox" id="banrule-enabled" ${rule?.enabled !== false ? 'checked' : ''}>
+              <span>启用此规则</span>
+            </label>
+          </div>
+        </form>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" onclick="closeBanRuleModal()">取消</button>
+        <button type="button" class="btn btn-primary" onclick="saveBanRule(${isEdit ? idx : 'null'})">保存</button>
+      </div>
+    </div>
+  `;
+
+  document.body.appendChild(modal);
+
+  modal.addEventListener('click', (e) => {
+    if (e.target === modal) closeBanRuleModal();
+  });
+}
+
+// 获取封禁规则条件字段 HTML
+function getBanRuleConditionFieldsHtml(type, cond) {
+  if (type === 'error_rate') {
+    return `
+      <div class="form-row">
+        <div class="field">
+          <label class="field-label">错误率阈值 (0-1)</label>
+          <input type="number" class="input" id="cond-threshold" value="${cond.threshold || 0.5}"
+                 min="0" max="1" step="0.1" placeholder="0.5">
+          <div class="field-help">例如：0.5 表示 50% 错误率</div>
+        </div>
+        <div class="field">
+          <label class="field-label">时间窗口 (秒)</label>
+          <input type="number" class="input" id="cond-window" value="${cond.window_secs || 300}"
+                 min="10" step="10" placeholder="300">
+          <div class="field-help">例如：300 = 5分钟</div>
+        </div>
+        <div class="field">
+          <label class="field-label">最小请求数</label>
+          <input type="number" class="input" id="cond-min-requests" value="${cond.min_requests || 10}"
+                 min="1" placeholder="10">
+          <div class="field-help">避免样本过少误触发</div>
+        </div>
+      </div>
+    `;
+  } else if (type === 'request_count') {
+    return `
+      <div class="form-row">
+        <div class="field">
+          <label class="field-label">最大请求数</label>
+          <input type="number" class="input" id="cond-max-requests" value="${cond.max_requests || 1000}"
+                 min="1" placeholder="1000">
+        </div>
+        <div class="field">
+          <label class="field-label">时间窗口 (秒)</label>
+          <input type="number" class="input" id="cond-window" value="${cond.window_secs || 60}"
+                 min="10" step="10" placeholder="60">
+          <div class="field-help">例如：60 = 1分钟</div>
+        </div>
+      </div>
+    `;
+  } else if (type === 'consecutive_errors') {
+    return `
+      <div class="field">
+        <label class="field-label">连续错误数阈值</label>
+        <input type="number" class="input" id="cond-count" value="${cond.count || 5}"
+               min="1" placeholder="5">
+        <div class="field-help">连续出现指定次数的错误时触发封禁</div>
+      </div>
+    `;
+  }
+  return '';
+}
+
+// 更新封禁规则条件字段
+function updateBanRuleConditionFields() {
+  const type = document.getElementById('banrule-type').value;
+  const container = document.getElementById('banrule-condition-fields');
+  container.innerHTML = getBanRuleConditionFieldsHtml(type, {});
+}
+
+// 关闭封禁规则弹窗
+function closeBanRuleModal() {
+  const modal = document.getElementById('banrule-modal');
+  if (modal) modal.remove();
+}
+
+// 保存封禁规则
+function saveBanRule(idx) {
+  const name = document.getElementById('banrule-name').value.trim();
+  const type = document.getElementById('banrule-type').value;
+  const duration = parseInt(document.getElementById('banrule-duration').value) || 3600;
+  const enabled = document.getElementById('banrule-enabled').checked;
+
+  if (!name) {
+    Toast.show('请输入规则名称', 'error');
+    return;
+  }
+
+  // 收集条件字段
+  let condition = { type };
+  if (type === 'error_rate') {
+    condition.threshold = parseFloat(document.getElementById('cond-threshold').value) || 0.5;
+    condition.window_secs = parseInt(document.getElementById('cond-window').value) || 300;
+    condition.min_requests = parseInt(document.getElementById('cond-min-requests').value) || 10;
+  } else if (type === 'request_count') {
+    condition.max_requests = parseInt(document.getElementById('cond-max-requests').value) || 1000;
+    condition.window_secs = parseInt(document.getElementById('cond-window').value) || 60;
+  } else if (type === 'consecutive_errors') {
+    condition.count = parseInt(document.getElementById('cond-count').value) || 5;
+  }
+
+  const rule = {
+    id: idx !== null ? cfg.api_keys.ban_rules[idx]?.id : 'rule_' + Date.now(),
+    name,
+    condition,
+    ban_duration_secs: duration,
+    enabled,
+    trigger_count_threshold: parseInt(document.getElementById('banrule-trigger-count').value) || 1,
+    trigger_window_secs: parseInt(document.getElementById('banrule-trigger-window').value) || 3600
+  };
+
+  if (!cfg.api_keys) cfg.api_keys = {};
+  if (!cfg.api_keys.ban_rules) cfg.api_keys.ban_rules = [];
+
+  if (idx !== null) {
+    cfg.api_keys.ban_rules[idx] = rule;
+    Toast.show('封禁规则已更新', 'success');
+  } else {
+    cfg.api_keys.ban_rules.push(rule);
+    Toast.show('封禁规则已添加', 'success');
+  }
+
+  closeBanRuleModal();
+  renderBanRules();
+}
+
+// 编辑封禁规则
+function editBanRule(idx) {
+  openBanRuleModal(idx);
+}
+
 // -- Ban Logs 封禁日志页面（架构设计 v2）--
 function renderBanLogs() {
+  console.log('Rendering ban logs, banLogsData length:', banLogsData.length);
   const panel = document.getElementById('tab-banlogs');
-  if (!panel) return;
+  if (!panel) {
+    console.warn('Ban logs panel not found');
+    return;
+  }
 
   // 过滤日志（新结构：使用 api_key_id 和 Unix 时间戳）
   let filteredLogs = banLogsData.filter(log => {
@@ -1594,9 +1812,9 @@ function renderBanLogs() {
       <div class="banlogs-toolbar">
         <div class="filter-group">
           <select class="input select filter-select" onchange="setBanLogFilter('actionType', this.value)">
-            <option value="all">所有操作</option>
-            <option value="ban">封禁</option>
-            <option value="unban">解封</option>
+            <option value="all" ${banLogFilter.actionType === 'all' ? 'selected' : ''}>所有操作</option>
+            <option value="ban" ${banLogFilter.actionType === 'ban' ? 'selected' : ''}>封禁</option>
+            <option value="unban" ${banLogFilter.actionType === 'unban' ? 'selected' : ''}>解封</option>
           </select>
           <input type="date" class="input filter-date" placeholder="开始日期"
                  value="${banLogFilter.startDate}" onchange="setBanLogFilter('startDate', this.value)">
@@ -1822,26 +2040,6 @@ function routeDetailHtml(r, i) {
           <input class="input" value="${esc(u.base_url)}" placeholder="https://api.example.com" data-validate="required,url" onchange="cfg.routes[${i}].upstream.base_url=this.value" />
         </div>
 
-        <!-- API Keys 配置 (多租户隔离) -->
-        <div class="field full-width">
-          <div class="apikey-block">
-            <div class="apikey-block-header">
-              <label class="field-label">
-                路由专属 API Keys
-                <span class="field-hint" style="font-weight: normal; color: var(--text-secondary);">(可选，用于多租户隔离)</span>
-              </label>
-              <button class="btn btn-secondary btn-sm" onclick="addApiKey(${i})">+ 新增 API Key</button>
-            </div>
-            <div class="apikey-list" id="apikey-list-${i}">
-              ${renderApiKeyList(i, r.api_keys)}
-            </div>
-            <div class="field-help">
-              配置后，只有启用的 Key 能访问此路由。禁用后 Key 保留但无法使用。
-              <strong>留空则回退到全局 gateway_auth.tokens</strong>
-            </div>
-          </div>
-        </div>
-
         <!-- 超时配置 -->
         <div class="field">
           <label class="field-label">连接超时 (ms)</label>
@@ -1961,121 +2159,6 @@ function generateApiKey(routeId) {
   return `sk-${normalizedRoute}-${randomStr}`;
 }
 
-// 渲染 API Key 列表
-function renderApiKeyList(routeIndex, apiKeys) {
-  if (!apiKeys || apiKeys.length === 0) {
-    return '<div class="apikey-empty">暂无 API Key，点击"新增 API Key"添加</div>';
-  }
-
-  return apiKeys.map((key, idx) => {
-    // 支持旧格式字符串和新格式对象
-    const keyValue = typeof key === 'string' ? key : key.key;
-    const enabled = typeof key === 'string' ? true : (key.enabled !== false);
-
-    return `
-      <div class="apikey-item ${enabled ? '' : 'apikey-disabled'}" data-idx="${idx}">
-        <label class="toggle apikey-toggle">
-          <input type="checkbox" class="toggle-input" ${enabled ? 'checked' : ''} onchange="toggleApiKey(${routeIndex}, ${idx})" />
-          <span class="toggle-slider" aria-hidden="true"></span>
-        </label>
-        <code class="apikey-value" title="${esc(keyValue)}">${esc(keyValue)}</code>
-        <button class="btn btn-danger btn-sm" onclick="deleteApiKey(${routeIndex}, ${idx})" title="删除">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <path d="M3 6h18"/>
-            <path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/>
-            <path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/>
-          </svg>
-        </button>
-      </div>
-    `;
-  }).join('');
-}
-
-// 添加新的 API Key
-function addApiKey(routeIndex) {
-  const route = cfg.routes[routeIndex];
-  if (!route.api_keys) {
-    route.api_keys = [];
-  }
-
-  // 生成新的 API Key
-  const newKey = generateApiKey(route.id || 'route');
-
-  // 添加到列表（新格式：对象包含 key 和 enabled）
-  route.api_keys.push({
-    key: newKey,
-    enabled: true
-  });
-
-  // 重新渲染
-  const listEl = document.getElementById(`apikey-list-${routeIndex}`);
-  if (listEl) {
-    listEl.innerHTML = renderApiKeyList(routeIndex, route.api_keys);
-  }
-
-  Toast.show('API Key 已生成', 'success');
-}
-
-// 删除 API Key
-function deleteApiKey(routeIndex, keyIndex) {
-  const route = cfg.routes[routeIndex];
-  if (!route.api_keys || keyIndex >= route.api_keys.length) return;
-
-  route.api_keys.splice(keyIndex, 1);
-  if (route.api_keys.length === 0) {
-    route.api_keys = null;
-  }
-
-  // 重新渲染
-  const listEl = document.getElementById(`apikey-list-${routeIndex}`);
-  if (listEl) {
-    listEl.innerHTML = renderApiKeyList(routeIndex, route.api_keys);
-  }
-
-  Toast.show('API Key 已删除', 'success');
-}
-
-// 切换 API Key 启用状态
-function toggleApiKey(routeIndex, keyIndex) {
-  const route = cfg.routes[routeIndex];
-  if (!route.api_keys || keyIndex >= route.api_keys.length) return;
-
-  const key = route.api_keys[keyIndex];
-  if (typeof key === 'string') {
-    // 旧格式，转换为新格式
-    route.api_keys[keyIndex] = {
-      key: key,
-      enabled: false // 当前是禁用操作
-    };
-  } else {
-    // 新格式，切换状态
-    key.enabled = !key.enabled;
-  }
-
-  // 重新渲染
-  const listEl = document.getElementById(`apikey-list-${routeIndex}`);
-  if (listEl) {
-    listEl.innerHTML = renderApiKeyList(routeIndex, route.api_keys);
-  }
-}
-
-// 兼容旧格式：转换 api_keys 为后端需要的格式（只返回启用的 key 字符串数组）
-function normalizeApiKeysForSave(apiKeys) {
-  if (!apiKeys || apiKeys.length === 0) return null;
-
-  return apiKeys
-    .filter(k => {
-      if (typeof k === 'string') return true; // 旧格式默认为启用
-      return k.enabled !== false;
-    })
-    .map(k => typeof k === 'string' ? k : k.key);
-}
-
-function parseApiKeys(i, text) {
-  const keys = text.split('\n').map(l => l.trim()).filter(l => l);
-  cfg.routes[i].api_keys = keys.length > 0 ? keys : null;
-}
-
 function setProxyField(i, field, value) {
   if (field === 'protocol' && !value) {
     cfg.routes[i].upstream.proxy = null;
@@ -2092,7 +2175,6 @@ function addRoute() {
   cfg.routes.push({
     id: '',
     prefix: '/',
-    api_keys: null,
     upstream: {
       base_url: '',
       strip_prefix: true,
@@ -2341,20 +2423,8 @@ function renderAdvanced() {
 function prepareConfigForSave(config) {
   const prepared = JSON.parse(JSON.stringify(config));
 
-  if (prepared.routes) {
-    for (const route of prepared.routes) {
-      if (route.api_keys) {
-        // 只保存启用的 key，并转换为字符串数组
-        route.api_keys = route.api_keys
-          .filter(k => typeof k === 'string' || k.enabled !== false)
-          .map(k => typeof k === 'string' ? k : k.key);
-
-        if (route.api_keys.length === 0) {
-          route.api_keys = null;
-        }
-      }
-    }
-  }
+  // Route-level api_keys have been removed - api_keys are now only managed globally
+  // via cfg.api_keys (see API Keys management tab)
 
   return prepared;
 }
@@ -2563,7 +2633,7 @@ function formatBytes(bytes) {
   return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
 }
 
-function formatDuration(ms) {
+function formatDurationMs(ms) {
   if (ms < 1) return '<1ms';
   if (ms < 1000) return Math.round(ms) + 'ms';
   return (ms / 1000).toFixed(2) + 's';
@@ -2604,8 +2674,8 @@ function renderIPMetrics() {
         <td>${formatNumber(ip.errors)}</td>
         <td>${formatBytes(ip.bytes_in)}</td>
         <td>${formatBytes(ip.bytes_out)}</td>
-        <td>${formatDuration(ip.latency_avg_ms)}</td>
-        <td>${formatDuration(ip.latency_p99_ms)}</td>
+        <td>${formatDurationMs(ip.latency_avg_ms)}</td>
+        <td>${formatDurationMs(ip.latency_p99_ms)}</td>
         <td>
           <div class="ip-routes">
             ${(ip.routes || []).slice(0, 3).map(r => `<span class="ip-tag route">${esc(r)}</span>`).join('')}
@@ -2965,7 +3035,7 @@ function formatNumber(n) {
 }
 
 // ===== 初始化 =====
-document.addEventListener('DOMContentLoaded', () => {
+document.addEventListener('DOMContentLoaded', async () => {
   // 检查登录状态
   if (!checkAuth()) {
     return;
@@ -2973,12 +3043,22 @@ document.addEventListener('DOMContentLoaded', () => {
 
   initTabs();
 
-  // 初始化模拟数据
-  initMockData();
-
   // 自动加载配置和监控数据
-  loadConfig();
+  await loadConfig();
   loadMetrics();
+
+  // 根据当前活动的标签页加载数据
+  const activeTab = document.querySelector('.tab.active');
+  if (activeTab) {
+    const tabId = activeTab.dataset.tab;
+    if (tabId === 'apikeys') {
+      await loadApiKeys();
+      renderApiKeys();
+    } else if (tabId === 'banlogs') {
+      await loadBanLogs();
+      renderBanLogs();
+    }
+  }
 
   // 监控页面自动刷新
   setInterval(() => {
@@ -2988,4 +3068,150 @@ document.addEventListener('DOMContentLoaded', () => {
       loadIPMetrics();
     }
   }, 30000); // 30秒刷新一次
+});
+
+// ===== 多选下拉框组件函数 =====
+
+// 切换下拉框展开/收起
+function toggleMultiSelect(trigger) {
+  const multiSelect = trigger.closest('.multi-select');
+  const dropdown = multiSelect.querySelector('.multi-select-dropdown');
+  const isOpen = dropdown.style.display !== 'none';
+
+  // 关闭所有其他下拉框
+  document.querySelectorAll('.multi-select-dropdown').forEach(d => {
+    d.style.display = 'none';
+    d.closest('.multi-select').querySelector('.multi-select-trigger').classList.remove('active');
+  });
+
+  if (!isOpen) {
+    dropdown.style.display = 'flex';
+    trigger.classList.add('active');
+    // 聚焦搜索框
+    setTimeout(() => {
+      const searchInput = dropdown.querySelector('.multi-select-search input');
+      if (searchInput) searchInput.focus();
+    }, 10);
+  } else {
+    dropdown.style.display = 'none';
+    trigger.classList.remove('active');
+  }
+}
+
+// 搜索过滤路由选项
+function filterRouteOptions(input) {
+  const filter = input.value.toLowerCase();
+  const options = input.closest('.multi-select-dropdown').querySelectorAll('.multi-select-option:not(.special)');
+
+  options.forEach(option => {
+    const text = option.textContent.toLowerCase();
+    option.style.display = text.includes(filter) ? 'flex' : 'none';
+  });
+}
+
+// 选择/取消选择路由选项
+function selectRouteOption(option) {
+  const value = option.dataset.value;
+  const multiSelect = option.closest('.multi-select');
+  const isSpecial = option.classList.contains('special');
+  const hiddenInput = multiSelect.querySelector('#apikey-routes');
+  let selectedRoutes = JSON.parse(hiddenInput.value || '[]');
+
+  if (isSpecial) {
+    // 选择"所有路由" - 清空其他选择
+    if (option.classList.contains('selected')) {
+      // 取消选择"所有路由" - 保持为空（表示所有路由）
+      option.classList.remove('selected');
+      selectedRoutes = [];
+    } else {
+      // 选择"所有路由" - 清空其他具体路由
+      option.classList.add('selected');
+      multiSelect.querySelectorAll('.multi-select-option:not(.special)').forEach(opt => {
+        opt.classList.remove('selected');
+        opt.classList.add('disabled');
+      });
+      selectedRoutes = [];
+    }
+  } else {
+    // 选择具体路由
+    if (option.classList.contains('disabled')) return; // 禁用状态下不可选
+
+    const allRoutesOption = multiSelect.querySelector('.multi-select-option.special');
+    allRoutesOption.classList.remove('selected');
+
+    if (option.classList.contains('selected')) {
+      // 取消选择
+      option.classList.remove('selected');
+      selectedRoutes = selectedRoutes.filter(r => r !== value);
+    } else {
+      // 选择
+      option.classList.add('selected');
+      if (!selectedRoutes.includes(value)) {
+        selectedRoutes.push(value);
+      }
+    }
+  }
+
+  // 更新隐藏输入框
+  hiddenInput.value = JSON.stringify(selectedRoutes);
+
+  // 更新触发器显示
+  updateMultiSelectDisplay(multiSelect, selectedRoutes);
+}
+
+// 移除已选标签
+function removeRouteTag(removeBtn) {
+  const tag = removeBtn.closest('.multi-select-tag');
+  const value = tag.dataset.value;
+  const multiSelect = tag.closest('.multi-select');
+  const hiddenInput = multiSelect.querySelector('#apikey-routes');
+  let selectedRoutes = JSON.parse(hiddenInput.value || '[]');
+
+  selectedRoutes = selectedRoutes.filter(r => r !== value);
+  hiddenInput.value = JSON.stringify(selectedRoutes);
+
+  // 更新选项状态
+  const option = multiSelect.querySelector(`.multi-select-option[data-value="${value}"]`);
+  if (option) {
+    option.classList.remove('selected');
+  }
+
+  updateMultiSelectDisplay(multiSelect, selectedRoutes);
+}
+
+// 更新多选框显示
+function updateMultiSelectDisplay(multiSelect, selectedRoutes) {
+  const valuesContainer = multiSelect.querySelector('.multi-select-values');
+  const routes = cfg?.routes || [];
+
+  if (selectedRoutes.length === 0) {
+    valuesContainer.innerHTML = '<span class="multi-select-tag all-routes">所有路由</span>';
+  } else {
+    valuesContainer.innerHTML = selectedRoutes.map(r => {
+      const route = routes.find(rt => rt.id === r);
+      return `<span class="multi-select-tag" data-value="${esc(r)}">${esc(route?.id || r)}<span class="multi-select-tag-remove" onclick="event.stopPropagation(); removeRouteTag(this)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18M6 6l12 12"/></svg></span></span>`;
+    }).join('');
+  }
+
+  // 更新"所有路由"选项状态和禁用状态
+  const allRoutesOption = multiSelect.querySelector('.multi-select-option.special');
+  const otherOptions = multiSelect.querySelectorAll('.multi-select-option:not(.special)');
+
+  if (selectedRoutes.length === 0) {
+    allRoutesOption.classList.add('selected');
+    otherOptions.forEach(opt => opt.classList.add('disabled'));
+  } else {
+    allRoutesOption.classList.remove('selected');
+    otherOptions.forEach(opt => opt.classList.remove('disabled'));
+  }
+}
+
+// 点击外部关闭下拉框
+document.addEventListener('click', (e) => {
+  if (!e.target.closest('.multi-select')) {
+    document.querySelectorAll('.multi-select-dropdown').forEach(d => {
+      d.style.display = 'none';
+      d.closest('.multi-select').querySelector('.multi-select-trigger').classList.remove('active');
+    });
+  }
 });

@@ -6,7 +6,7 @@
 
 当前已实现（Phase 1 + Phase 2 部分能力）：
 - 多路由前缀转发（最长前缀优先 + 路径段边界）
-- 入站 `GW_TOKEN` 鉴权（Bearer 或自定义 Header）
+- 入站 API Key 鉴权（Bearer 或自定义 Header），统一通过 ApiKeyManager 管理
 - 入站 HTTP/HTTPS（TLS 可选）
 - 上游 `inject_headers` 注入/覆盖
 - 敏感头与 hop-by-hop 头移除
@@ -20,7 +20,10 @@
 - **API Key 精细化管理**：
   - 独立管理页面（过滤、搜索、备注）
   - API Key 级别限流与并发控制
-  - 梯度封禁规则（错误率/请求数/连续错误）
+  - **全局封禁规则**（对所有 API Key 生效）：
+    - 支持错误率、请求数、连续错误三种触发条件
+    - 可配置触发次数阈值（如：连续触发 3 次才封禁）
+    - 防止偶发波动导致误封
   - 封禁日志与手动封禁/解封
   - SQLite 持久化存储
 
@@ -232,8 +235,9 @@ observability:
 
 | HTTP 状态码 | Body | 含义 |
 | --- | --- | --- |
-| `401` | `{"error":"unauthorized"}` | token 缺失或不在白名单。 |
-| `403` | `{"error":"api_key_banned"}` | API Key 已被封禁。 |
+| `401` | `{"error":"unauthorized"}` | API Key 缺失、不存在或未授权访问该路由。 |
+| `401` | `{"error":"api_key_disabled"}` | API Key 已被禁用。 |
+| `401` | `{"error":"api_key_route_not_allowed"}` | API Key 无权访问该路由。 |
 | `404` | `{"error":"route_not_found"}` | 未命中任何路由。 |
 | `429` | `{"error":"rate_limited"}` | 下游请求触发限流。 |
 | `503` | `{"error":"downstream_concurrency_exceeded"}` / `{"error":"upstream_concurrency_exceeded"}` | 触发并发保护。 |
@@ -260,17 +264,19 @@ cargo clippy --all-targets --all-features -- -D warnings
 
 ```bash
 curl -X POST "http://127.0.0.1:8080/openai/v1/chat/completions" \
-  -H "Authorization: Bearer <GW_TOKEN>" \
+  -H "Authorization: Bearer <API_KEY>" \
   -H "Content-Type: application/json" \
   -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hello"}]}'
 ```
 
-### 6.2 使用自定义 token header
+### 6.2 使用自定义 API Key header
 
 ```bash
 curl "http://127.0.0.1:8080/openai/v1/models" \
-  -H "x-gw-token: <GW_TOKEN>"
+  -H "x-api-key: <API_KEY>"
 ```
+
+**注意**：`<API_KEY>` 是在 Admin UI 的 API Keys 页面配置的密钥，格式为 `sk-<route>-<随机字符串>`。
 
 ## 7. 部署指南
 
@@ -324,7 +330,8 @@ $env:OPENAI_API_KEY="sk-xxx"
 - 优先通过 `${ENV_VAR}` 注入机密。
 - 默认保持 `forward_xff: false`。
 - 日志中不要输出授权头或密钥内容。
-- `GW_METRICS_TOKEN` 与业务 `GW_TOKEN` 应分离配置、定期轮换。
+- `GW_METRICS_TOKEN` 与业务 `API_KEY` 应分离配置、定期轮换。
+- 所有 API Key 应通过 Admin UI 统一配置，不再在路由中硬编码。
 
 ## 9. 已知限制
 

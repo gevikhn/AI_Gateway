@@ -24,7 +24,6 @@ async fn https_listener_auto_generates_self_signed_cert() {
         routes: vec![RouteConfig {
             id: "openai".to_string(),
             prefix: "/openai".to_string(),
-            api_keys: None,
             upstream: UpstreamConfig {
                 base_url: "https://api.openai.com".to_string(),
                 strip_prefix: true,

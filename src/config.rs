@@ -48,10 +48,6 @@ pub struct RouteConfig {
     pub id: String,
     pub prefix: String,
     pub upstream: UpstreamConfig,
-    /// Route-level API keys for multi-tenant isolation
-    /// If not specified, falls back to global gateway_auth.api_keys
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub api_keys: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -264,6 +260,24 @@ pub struct AdminConfig {
 pub struct ApiKeysGlobalConfig {
     /// API Key 列表
     pub keys: Vec<ApiKeyConfig>,
+    /// 全局封禁规则（对所有 API Key 生效）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ban_rules: Vec<BanRule>,
+    /// 封禁日志存储配置
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sqlite: Option<ApiKeysSqliteConfig>,
+}
+
+/// API Key 封禁日志 SQLite 配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiKeysSqliteConfig {
+    /// 数据库文件路径
+    #[serde(default = "default_ban_log_db_path")]
+    pub path: String,
+}
+
+fn default_ban_log_db_path() -> String {
+    "./data/ban_logs.db".to_string()
 }
 
 /// API Key 配置
@@ -310,6 +324,12 @@ pub struct BanRule {
     /// 是否启用
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// 触发次数阈值：在 trigger_window_secs 内触发多少次后才执行封禁
+    #[serde(default = "default_one")]
+    pub trigger_count_threshold: u32,
+    /// 触发计数窗口（秒）：统计触发次数的时间窗口
+    #[serde(default = "default_trigger_window")]
+    pub trigger_window_secs: u64,
 }
 
 /// 封禁触发条件
@@ -481,20 +501,6 @@ impl AppConfig {
         for key in &self.gateway_auth.api_keys {
             if seen_keys.insert(key.clone()) {
                 resolved.push(ResolvedApiKey::from_key_string(key));
-            }
-        }
-
-        // 3. 处理 route.api_keys（路由级白名单，向后兼容）
-        for route in &self.routes {
-            if let Some(route_keys) = &route.api_keys {
-                for key in route_keys {
-                    if seen_keys.insert(key.clone()) {
-                        let mut resolved_key = ResolvedApiKey::from_key_string(key);
-                        resolved_key.route_id = Some(route.id.clone());
-                        resolved_key.remark = format!("Migrated from route {}", route.id);
-                        resolved.push(resolved_key);
-                    }
-                }
             }
         }
 
@@ -765,21 +771,6 @@ impl AppConfig {
                 }
             }
 
-            // Validate route-level API keys if specified
-            if let Some(api_keys) = &route.api_keys {
-                if api_keys.is_empty() {
-                    return Err(ConfigError::Validation(format!(
-                        "route `{}` api_keys must not be empty when specified",
-                        route.id
-                    )));
-                }
-                if api_keys.iter().any(|key| key.trim().is_empty()) {
-                    return Err(ConfigError::Validation(format!(
-                        "route `{}` api_keys must not contain empty values",
-                        route.id
-                    )));
-                }
-            }
         }
 
         let mut has_global_upstream_key_concurrency = false;
@@ -1002,6 +993,14 @@ fn interpolate_env_vars(input: &str) -> Result<String, ConfigError> {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_one() -> u32 {
+    1
+}
+
+fn default_trigger_window() -> u64 {
+    3600 // 默认1小时
 }
 
 fn default_token_sources() -> Vec<TokenSourceConfig> {
