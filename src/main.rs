@@ -26,14 +26,20 @@ async fn run() -> Result<(), String> {
                 .map_err(|err| format!("install task failed: {err}"))?
                 .map_err(|err| err.to_string())?;
             println!("install completed.");
+            println!("binary: {}", report.bin_path);
+            if report.bin_updated {
+                println!("  - binary updated");
+            }
             println!("service: {}", report.service_path);
+            if report.service_was_running {
+                println!("  - service was running, stopped and restarted");
+            }
             println!("config: {}", report.config_path);
             if report.config_created {
-                println!("default config created at {}", report.config_path);
+                println!("  - default config created");
             } else {
-                println!("existing config kept at {}", report.config_path);
+                println!("  - existing config kept");
             }
-            println!("next: sudo systemctl start ai-gw-lite");
             Ok(())
         }
         CliCommand::Run { config_path } => {

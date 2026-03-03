@@ -8,6 +8,8 @@ const LINUX_CONFIG_PATH: &str = "/etc/ai_gw_lite/conf.yaml";
 const SYSTEMD_SERVICE_NAME: &str = "ai-gw-lite";
 #[cfg(target_os = "linux")]
 const SYSTEMD_SERVICE_PATH: &str = "/etc/systemd/system/ai-gw-lite.service";
+#[cfg(target_os = "linux")]
+const INSTALL_BIN_PATH: &str = "/usr/local/bin/ai-gw-lite";
 
 #[cfg(target_os = "linux")]
 const DEFAULT_CONFIG_TEMPLATE: &str = r#"listen: "0.0.0.0:8080"
@@ -42,7 +44,10 @@ routes:
 pub struct InstallReport {
     pub config_path: &'static str,
     pub service_path: &'static str,
+    pub bin_path: &'static str,
     pub config_created: bool,
+    pub service_was_running: bool,
+    pub bin_updated: bool,
 }
 
 #[derive(Debug)]
@@ -125,6 +130,21 @@ fn run_install_linux() -> Result<InstallReport, InstallError> {
     use std::fs;
     use std::path::{Path, PathBuf};
 
+    // 1. 检查服务是否已存在且正在运行
+    let service_exists = Path::new(SYSTEMD_SERVICE_PATH).exists();
+    let service_was_running =
+        service_exists && is_service_active().map_err(|e| InstallError::CommandIo {
+            command: "systemctl is-active".to_string(),
+            source: std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
+        })?;
+
+    // 2. 如果服务正在运行，先停止服务
+    if service_was_running {
+        println!("检测到服务正在运行，正在停止...");
+        run_command("systemctl", &["stop", SYSTEMD_SERVICE_NAME])?;
+        println!("服务已停止");
+    }
+
     let config_dir = Path::new(LINUX_CONFIG_DIR);
     fs::create_dir_all(config_dir).map_err(|source| InstallError::Io {
         path: config_dir.to_path_buf(),
@@ -142,13 +162,45 @@ fn run_install_linux() -> Result<InstallReport, InstallError> {
         true
     };
 
+    // 3. 获取当前可执行文件路径并复制到安装位置
     let current_exe = std::env::current_exe().map_err(InstallError::CurrentExe)?;
     let exe_path =
         fs::canonicalize(&current_exe).map_err(|source| InstallError::CanonicalizeExe {
             path: current_exe,
             source,
         })?;
-    let service_content = render_service_content(&exe_path);
+
+    // 复制二进制文件到安装路径
+    let bin_path = Path::new(INSTALL_BIN_PATH);
+    let bin_updated = if exe_path != bin_path {
+        println!("正在更新二进制文件...");
+        fs::copy(&exe_path, bin_path).map_err(|source| InstallError::Io {
+            path: bin_path.to_path_buf(),
+            source,
+        })?;
+        // 设置可执行权限
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(bin_path).map_err(|source| InstallError::Io {
+                path: bin_path.to_path_buf(),
+                source,
+            })?.permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(bin_path, perms).map_err(|source| InstallError::Io {
+                path: bin_path.to_path_buf(),
+                source,
+            })?;
+        }
+        println!("二进制文件已更新到: {}", INSTALL_BIN_PATH);
+        true
+    } else {
+        println!("当前已在安装路径运行，跳过二进制复制");
+        false
+    };
+
+    // 4. 使用固定的安装路径渲染服务文件
+    let service_content = render_service_content(Path::new(INSTALL_BIN_PATH));
 
     let service_path = PathBuf::from(SYSTEMD_SERVICE_PATH);
     fs::write(&service_path, service_content).map_err(|source| InstallError::Io {
@@ -156,14 +208,37 @@ fn run_install_linux() -> Result<InstallReport, InstallError> {
         source,
     })?;
 
+    // 5. 重新加载 systemd 配置
     run_command("systemctl", &["daemon-reload"])?;
+
+    // 6. 启用服务
     run_command("systemctl", &["enable", SYSTEMD_SERVICE_NAME])?;
+
+    // 7. 启动服务
+    println!("正在启动服务...");
+    run_command("systemctl", &["start", SYSTEMD_SERVICE_NAME])?;
+    println!("服务已启动");
 
     Ok(InstallReport {
         config_path: LINUX_CONFIG_PATH,
         service_path: SYSTEMD_SERVICE_PATH,
+        bin_path: INSTALL_BIN_PATH,
         config_created,
+        service_was_running,
+        bin_updated,
     })
+}
+
+#[cfg(target_os = "linux")]
+fn is_service_active() -> Result<bool, std::io::Error> {
+    use std::process::Command;
+
+    let output = Command::new("systemctl")
+        .args(["is-active", SYSTEMD_SERVICE_NAME])
+        .output()?;
+
+    // systemctl is-active 返回 0 表示服务正在运行
+    Ok(output.status.success())
 }
 
 #[cfg(target_os = "linux")]
@@ -234,10 +309,10 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn service_content_points_to_fixed_config_path() {
-        let rendered = render_service_content(std::path::Path::new("/opt/ai-gw-lite/ai-gw-lite"));
+        let rendered = render_service_content(std::path::Path::new("/usr/local/bin/ai-gw-lite"));
         assert!(
             rendered.contains(
-                "ExecStart=/opt/ai-gw-lite/ai-gw-lite --config /etc/ai_gw_lite/conf.yaml"
+                "ExecStart=/usr/local/bin/ai-gw-lite --config /etc/ai_gw_lite/conf.yaml"
             )
         );
         assert!(rendered.contains("WorkingDirectory=/etc/ai_gw_lite"));
