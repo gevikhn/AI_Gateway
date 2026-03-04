@@ -13,6 +13,9 @@ pub struct AppConfig {
     /// 数据目录路径，用于存放分散的配置文件（routes、apikeys、ban_rules）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data_dir: Option<String>,
+    /// Config DB 路径，用于存放动态配置数据库
+    #[serde(default = "default_config_db_path")]
+    pub config_db_path: String,
     /// Route 配置列表
     /// 当使用分散配置时，可以从 data/routes/ 目录加载
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -33,6 +36,9 @@ pub struct AppConfig {
     pub observability: Option<ObservabilityConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub admin: Option<AdminConfig>,
+    /// Token 统计配置
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_stats: Option<TokenStatsConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -285,6 +291,10 @@ fn default_ban_log_db_path() -> String {
     "./data/ban_logs.db".to_string()
 }
 
+fn default_config_db_path() -> String {
+    "./data/config.db".to_string()
+}
+
 /// API Key 配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiKeyConfig {
@@ -311,6 +321,9 @@ pub struct ApiKeyConfig {
     /// 并发配置（覆盖全局/路由级）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub concurrency: Option<ApiKeyConcurrencyConfig>,
+    /// Token 配额配置
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_quota: Option<TokenQuotaConfig>,
     /// 封禁规则
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ban_rules: Vec<BanRule>,
@@ -396,6 +409,71 @@ pub struct ApiKeyConcurrencyConfig {
     pub upstream_per_key_max_inflight: Option<usize>,
 }
 
+/// Token 配额配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenQuotaConfig {
+    /// 每日总token上限（input + output）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daily_total_limit: Option<u64>,
+    /// 每日input token上限
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daily_input_limit: Option<u64>,
+    /// 每日output token上限
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daily_output_limit: Option<u64>,
+    /// 每周总token上限
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weekly_total_limit: Option<u64>,
+    /// 每周input token上限
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weekly_input_limit: Option<u64>,
+    /// 每周output token上限
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weekly_output_limit: Option<u64>,
+}
+
+/// Token 统计存储配置
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TokenStatsConfig {
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub enabled: bool,
+    /// SQLite 配置
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sqlite: Option<TokenStatsSqliteConfig>,
+}
+
+/// Token 统计 SQLite 配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenStatsSqliteConfig {
+    #[serde(default = "default_token_stats_db_path")]
+    pub path: String,
+    /// 批量写入间隔（秒）
+    #[serde(default = "default_token_stats_flush_interval")]
+    pub flush_interval_secs: u64,
+    /// 批量大小
+    #[serde(default = "default_token_stats_batch_size")]
+    pub batch_size: usize,
+    /// 明细数据保留天数
+    #[serde(default = "default_token_stats_retention_days")]
+    pub retention_days: u32,
+}
+
+fn default_token_stats_db_path() -> String {
+    "./data/token_stats.db".to_string()
+}
+
+fn default_token_stats_flush_interval() -> u64 {
+    60
+}
+
+fn default_token_stats_batch_size() -> usize {
+    1000
+}
+
+fn default_token_stats_retention_days() -> u32 {
+    30
+}
+
 /// 运行时解析后的 API Key 配置
 #[derive(Debug, Clone)]
 pub struct ResolvedApiKey {
@@ -407,6 +485,7 @@ pub struct ResolvedApiKey {
     pub remark: String,
     pub rate_limit: Option<RateLimitConfig>,
     pub concurrency: Option<ApiKeyConcurrencyConfig>,
+    pub token_quota: Option<TokenQuotaConfig>,
     pub ban_rules: Vec<BanRule>,
     pub ban_status: Option<BanStatus>,
 }
@@ -472,6 +551,7 @@ impl ResolvedApiKey {
             remark: config.remark.clone(),
             rate_limit: config.rate_limit.clone(),
             concurrency: config.concurrency.clone(),
+            token_quota: config.token_quota.clone(),
             ban_rules: config.ban_rules.clone(),
             ban_status: config.ban_status.clone(),
         }
@@ -488,6 +568,7 @@ impl ResolvedApiKey {
             remark: String::new(),
             rate_limit: None,
             concurrency: None,
+            token_quota: None,
             ban_rules: Vec::new(),
             ban_status: None,
         }

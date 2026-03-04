@@ -4,10 +4,14 @@ use crate::concurrency::ConcurrencyController;
 use crate::config::{
     AppConfig, CorsConfig, ProxyProtocol, RouteConfig, UpstreamConfig, UpstreamProxyConfig,
 };
+use crate::config_storage::ConfigStorage;
 use crate::observability;
 use crate::proxy;
 use crate::ratelimit::{RateLimitDecision, RateLimiter};
 use crate::tls;
+use crate::token_extractor::TokenExtractor;
+use crate::token_quota::TokenQuotaChecker;
+use crate::token_stats::TokenStatsCollector;
 use arc_swap::ArcSwap;
 use axum::body::{Body, Bytes};
 use axum::extract::{ConnectInfo, State};
@@ -36,6 +40,8 @@ pub struct RuntimeState {
     pub concurrency: Option<Arc<ConcurrencyController>>,
     /// API Key 管理器（支持 API Key 级别的限流和并发控制）
     pub api_key_manager: Option<Arc<ApiKeyManager>>,
+    /// Token配额检查器（存储在ApiKeyManager中，这里仅用于热重载传递）
+    pub _token_quota_checker: Option<Arc<TokenQuotaChecker>>,
 }
 
 #[derive(Clone)]
@@ -45,11 +51,28 @@ pub struct AppState {
     pub config_path: Option<PathBuf>,
     pub admin_token: Option<String>,
     pub admin_path_prefix: Option<String>,
+    pub config_storage: Arc<ConfigStorage>,
+}
+
+impl AppState {
+    /// 获取Token统计收集器
+    pub fn token_stats(&self) -> Option<Arc<TokenStatsCollector>> {
+        self.observability.token_stats.clone()
+    }
+
+    /// 获取Token配额检查器
+    pub fn token_quota_checker(&self) -> Option<Arc<TokenQuotaChecker>> {
+        self.observability
+            .token_quota_manager
+            .as_ref()
+            .map(|m| Arc::new(TokenQuotaChecker::new(m.clone())))
+    }
 }
 
 pub async fn build_runtime_state(
     config: Arc<AppConfig>,
     old_runtime: Option<&RuntimeState>,
+    token_quota_checker: Option<Arc<TokenQuotaChecker>>,
 ) -> Result<RuntimeState, String> {
     let upstream_clients = build_upstream_clients(&config)?;
     let rate_limiter = config
@@ -65,7 +88,7 @@ pub async fn build_runtime_state(
             let mut interval = tokio::time::interval(Duration::from_secs(60));
             loop {
                 interval.tick().await;
-                ctrl_clone.cleanup_unused_semaphores().await;
+                ctrl_clone.cleanup_unused_semaphores();
             }
         });
     }
@@ -73,7 +96,7 @@ pub async fn build_runtime_state(
     // 获取旧的 api_key_manager（如果存在）
     let old_manager = old_runtime.and_then(|r| r.api_key_manager.clone());
     // 创建 API Key 管理器（支持 API Key 级别的限流和并发控制）
-    let api_key_manager = create_api_key_manager(&config, old_manager.as_deref())
+    let api_key_manager = create_api_key_manager(&config, old_manager.as_deref(), token_quota_checker)
         .await
         .map(Arc::new);
     Ok(RuntimeState {
@@ -82,14 +105,37 @@ pub async fn build_runtime_state(
         rate_limiter,
         concurrency,
         api_key_manager,
+        _token_quota_checker: None, // quota_checker is owned by api_key_manager
     })
 }
 
 pub async fn build_app(config: Arc<AppConfig>, config_path: Option<PathBuf>) -> Result<Router, String> {
-    let runtime_state = build_runtime_state(config.clone(), None).await?;
+    // Get config_db_path from config (use default if not set)
+    let config_db_path = &config.config_db_path;
+
+    // Create ConfigStorage first (before GatewayMetrics)
+    let config_storage = Arc::new(ConfigStorage::new(config_db_path).await?);
+
+    // Sync config to database
+    config_storage.sync_config(&config).await?;
+
+    // First, create observability runtime to get token_quota_checker
+    let resolved_keys = config.resolved_api_keys();
     let observability = Arc::new(
-        observability::ObservabilityRuntime::from_config(config.observability.as_ref()).await?,
+        observability::ObservabilityRuntime::from_config(
+            config.observability.as_ref(),
+            config.token_stats.as_ref(),
+            Some(&resolved_keys),
+            Some(config_storage.clone()),
+        ).await?,
     );
+
+    // Get token quota checker from observability
+    let token_quota_checker = observability.token_quota_manager.as_ref().map(|qm| {
+        Arc::new(crate::token_quota::TokenQuotaChecker::new(qm.clone()))
+    });
+
+    let runtime_state = build_runtime_state(config.clone(), None, token_quota_checker).await?;
 
     let admin_token = config
         .admin
@@ -108,6 +154,7 @@ pub async fn build_app(config: Arc<AppConfig>, config_path: Option<PathBuf>) -> 
         config_path,
         admin_token,
         admin_path_prefix: admin_path_prefix.clone(),
+        config_storage,
     };
 
     let mut router = Router::new().route("/healthz", get(healthz_handler));
@@ -583,6 +630,37 @@ async fn proxy_handler(
 
     // Rate limiting: prefer API Key level, fallback to global level
     let api_key_info = api_key_manager.get_key_info(&token).await;
+    let api_key_id = api_key_info.as_ref().map(|k| k.id.clone());
+
+    // Token配额检查
+    if let Some(key_id) = &api_key_id {
+        if let Err(e) = api_key_manager.check_token_quota_by_id(key_id) {
+            if let crate::api_keys::ApiKeyError::TokenQuotaExceeded { quota_type, limit: _, used: _ } = e {
+                let outcome = match quota_type.as_str() {
+                    "daily_total" => "token_quota_exceeded_daily_total",
+                    "daily_input" => "token_quota_exceeded_daily_input",
+                    "daily_output" => "token_quota_exceeded_daily_output",
+                    "weekly_total" => "token_quota_exceeded_weekly_total",
+                    _ => "token_quota_exceeded",
+                };
+                return finalize_observed_proxy_response(
+                    json_error(StatusCode::TOO_MANY_REQUESTS, "token_quota_exceeded"),
+                    cors_config,
+                    request_origin.as_deref(),
+                    request_observation_with_token(
+                        metrics.as_ref(),
+                        route.id.as_str(),
+                        &method,
+                        &path,
+                        Some(token_label.as_str()),
+                        &request_id,
+                        request_started_at,
+                    ),
+                    outcome,
+                );
+            }
+        }
+    }
 
     let api_key_has_rate_limit = api_key_info
         .as_ref()
@@ -798,7 +876,7 @@ async fn proxy_handler(
     };
 
     let upstream_permit = if let Some(concurrency) = &runtime.concurrency {
-        match concurrency.acquire_upstream(route).await {
+        match concurrency.acquire_upstream(route) {
             Ok(permit) => permit,
             Err(_) => {
                 return finalize_observed_proxy_response(
@@ -859,6 +937,9 @@ async fn proxy_handler(
             }
 
             let bytes_sent = Arc::new(AtomicU64::new(0));
+            let input_tokens = Arc::new(AtomicU64::new(0));
+            let output_tokens = Arc::new(AtomicU64::new(0));
+
             let completion_guard = ResponseCompletionGuard {
                 metrics: metrics.clone(),
                 route_id: route.id.clone(),
@@ -874,12 +955,30 @@ async fn proxy_handler(
                 track_sse: is_sse,
                 api_key_manager: Some(Arc::clone(api_key_manager)),
                 token: Some(token.clone()),
+                token_stats: state.token_stats(),
+                api_key_id: api_key_id.clone(),
+                input_tokens: input_tokens.clone(),
+                output_tokens: output_tokens.clone(),
             };
+
+            // 创建响应guard（包含token提取功能）
+            // 对非SSE和SSE响应都尝试提取token（SSE的最后一条消息可能包含usage）
+            let should_extract_tokens = state.token_stats().is_some();
+            tracing::info!(
+                "Setting up token extraction: is_sse={}, token_stats_exists={}, will_extract={}",
+                is_sse,
+                state.token_stats().is_some(),
+                should_extract_tokens
+            );
             let response_guards = ResponseGuards {
                 downstream_permit,
                 upstream_permit,
                 completion_guard: Some(completion_guard),
                 bytes_sent: Some(bytes_sent),
+                input_tokens: Some(input_tokens),
+                output_tokens: Some(output_tokens),
+                extract_tokens: should_extract_tokens,
+                is_sse,
             };
             let mut response = attach_response_guards(response, response_guards);
             observability::insert_request_id_header(response.headers_mut(), &request_id);
@@ -1180,11 +1279,27 @@ struct ResponseCompletionGuard {
     track_sse: bool,
     api_key_manager: Option<Arc<ApiKeyManager>>,
     token: Option<String>,
+    /// Token统计收集器
+    token_stats: Option<Arc<TokenStatsCollector>>,
+    /// API Key ID（用于token统计）
+    api_key_id: Option<String>,
+    /// 输入token数量（从响应解析获得）
+    input_tokens: Arc<AtomicU64>,
+    /// 输出token数量（从响应解析获得）
+    output_tokens: Arc<AtomicU64>,
 }
 
 impl Drop for ResponseCompletionGuard {
     fn drop(&mut self) {
         let bytes_sent = self.bytes_sent.load(Ordering::Relaxed);
+        let input_tokens = self.input_tokens.load(Ordering::Relaxed);
+        let output_tokens = self.output_tokens.load(Ordering::Relaxed);
+
+        tracing::info!(
+            "ResponseCompletionGuard dropping: route_id={}, api_key_id={:?}, input_tokens={}, output_tokens={}, bytes_sent={}",
+            self.route_id, self.api_key_id, input_tokens, output_tokens, bytes_sent
+        );
+
         if let Some(metrics) = &self.metrics {
             if self.track_inflight {
                 metrics.dec_inflight(self.route_id.as_str());
@@ -1231,6 +1346,36 @@ impl Drop for ResponseCompletionGuard {
                 });
             }
         }
+
+        // 记录Token使用统计
+        if let (Some(token_stats), Some(api_key_id)) = (&self.token_stats,
+            self.api_key_id.clone()
+        ) {
+            let route_id = self.route_id.clone();
+            let request_id = self.request_id.clone();
+            let stats = Arc::clone(token_stats);
+
+            tracing::info!(
+                "Preparing to record token usage: api_key_id={}, route_id={}, input_tokens={}, output_tokens={}",
+                api_key_id, route_id, input_tokens, output_tokens
+            );
+
+            tokio::spawn(async move {
+                stats.record_usage(
+                    &api_key_id,
+                    &route_id,
+                    input_tokens,
+                    output_tokens,
+                    Some(request_id),
+                );
+            });
+        } else {
+            tracing::debug!(
+                "Token stats not recorded: token_stats_exists={}, api_key_id_exists={}",
+                self.token_stats.is_some(),
+                self.api_key_id.is_some()
+            );
+        }
     }
 }
 
@@ -1239,6 +1384,10 @@ struct ResponseGuards {
     upstream_permit: Option<OwnedSemaphorePermit>,
     completion_guard: Option<ResponseCompletionGuard>,
     bytes_sent: Option<Arc<AtomicU64>>,
+    input_tokens: Option<Arc<AtomicU64>>,
+    output_tokens: Option<Arc<AtomicU64>>,
+    extract_tokens: bool,
+    is_sse: bool,
 }
 
 impl ResponseGuards {
@@ -1246,6 +1395,76 @@ impl ResponseGuards {
         self.downstream_permit.is_none()
             && self.upstream_permit.is_none()
             && self.completion_guard.is_none()
+            && !self.extract_tokens
+    }
+}
+
+/// 用于捕获响应体、解析token使用信息并统计字节数的流
+struct TokenCapturingStreamWithGuards<S> {
+    inner: S,
+    buffer: Vec<u8>,
+    input_tokens: Arc<AtomicU64>,
+    output_tokens: Arc<AtomicU64>,
+    bytes_sent: Option<Arc<AtomicU64>>,
+    // 使用Box确保流是Unpin
+    _completion_guard: Option<Box<ResponseCompletionGuard>>,
+    is_sse: bool,
+}
+
+impl<S, E> Stream for TokenCapturingStreamWithGuards<S>
+where
+    S: Stream<Item = Result<Bytes, E>> + Unpin,
+    E: std::fmt::Debug,
+{
+    type Item = Result<Bytes, E>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<Self::Item>> {
+        match Pin::new(&mut self.inner).poll_next(cx) {
+            std::task::Poll::Ready(Some(Ok(chunk))) => {
+                // 累积响应体数据
+                let chunk_len = chunk.len();
+                self.buffer.extend_from_slice(&chunk);
+                // 统计字节数
+                if let Some(bytes_sent) = &self.bytes_sent {
+                    bytes_sent.fetch_add(chunk_len as u64, Ordering::Relaxed);
+                }
+                tracing::info!("Received chunk: {} bytes, total buffer: {} bytes", chunk_len, self.buffer.len());
+                std::task::Poll::Ready(Some(Ok(chunk)))
+            }
+            std::task::Poll::Ready(None) => {
+                // 流结束，解析token usage
+                let buffer_size = self.buffer.len();
+                let body_sample = String::from_utf8_lossy(&self.buffer[..self.buffer.len().min(200)]);
+                tracing::info!(
+                    "Stream ended, buffer size: {}, is_sse: {}, body sample: {}",
+                    buffer_size,
+                    self.is_sse,
+                    body_sample
+                );
+
+                let usage = if self.is_sse {
+                    // 对于SSE流，从SSE格式中提取最后一条data消息
+                    TokenExtractor::extract_from_sse_body(&Bytes::from(std::mem::take(&mut self.buffer)))
+                } else {
+                    // 对于非SSE流，直接解析JSON
+                    TokenExtractor::extract_from_body(&Bytes::from(std::mem::take(&mut self.buffer)))
+                };
+
+                if let Some(usage) = usage {
+                    self.input_tokens.store(usage.input_tokens, Ordering::Relaxed);
+                    self.output_tokens.store(usage.output_tokens, Ordering::Relaxed);
+                    tracing::info!(
+                        "Extracted token usage: input={}, output={}",
+                        usage.input_tokens, usage.output_tokens
+                    );
+                } else {
+                    tracing::warn!("No token usage found in response body");
+                }
+                std::task::Poll::Ready(None)
+            }
+            std::task::Poll::Ready(Some(Err(e))) => std::task::Poll::Ready(Some(Err(e))),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
     }
 }
 
@@ -1275,18 +1494,48 @@ fn response_from_upstream(
 
 fn attach_response_guards(response: Response<Body>, guards: ResponseGuards) -> Response<Body> {
     if guards.is_empty() {
+        tracing::debug!("Response guards are empty, returning response as-is");
         return response;
     }
 
     let (parts, body) = response.into_parts();
+
+    tracing::info!(
+        "Attaching response guards: extract_tokens={}, has_input_tokens={}, has_output_tokens={}",
+        guards.extract_tokens,
+        guards.input_tokens.is_some(),
+        guards.output_tokens.is_some()
+    );
+
+    // 如果需要提取token，使用TokenCapturingStream
+    if guards.extract_tokens && guards.input_tokens.is_some() && guards.output_tokens.is_some() {
+        tracing::info!("Using TokenCapturingStreamWithGuards for token extraction");
+        let input_tokens = guards.input_tokens.clone().unwrap();
+        let output_tokens = guards.output_tokens.clone().unwrap();
+        let bytes_sent = guards.bytes_sent.clone();
+
+        let captured_stream = TokenCapturingStreamWithGuards {
+            inner: body.into_data_stream(),
+            buffer: Vec::new(),
+            input_tokens,
+            output_tokens,
+            bytes_sent,
+            _completion_guard: guards.completion_guard.map(Box::new), // 保持completion_guard存活
+            is_sse: guards.is_sse,
+        };
+
+        return Response::from_parts(parts, Body::from_stream(captured_stream));
+    }
+
+    // 否则使用普通包装
+    let bytes_sent = guards.bytes_sent.clone();
     let stream = body
         .into_data_stream()
         .map_err(|err| io::Error::other(err.to_string()))
         .map(move |item| {
-            if let (Some(bytes_sent), Ok(chunk)) = (&guards.bytes_sent, &item) {
+            if let (Some(bytes_sent), Ok(chunk)) = (&bytes_sent, &item) {
                 bytes_sent.fetch_add(chunk.len() as u64, Ordering::Relaxed);
             }
-            let _ = &guards;
             item
         });
     Response::from_parts(parts, Body::from_stream(stream))
@@ -1816,6 +2065,8 @@ mod tests {
             concurrency: None,
             observability: None,
             admin: None,
+            config_db_path: "./data/config.db".to_string(),
+            token_stats: None,
         }
     }
 }

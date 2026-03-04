@@ -1,11 +1,13 @@
 use crate::config::{ApiKeyConcurrencyConfig, AppConfig, RouteConfig};
+use dashmap::DashMap;
 use http::header::AUTHORIZATION;
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, TryAcquireError};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
 #[derive(Debug)]
 pub enum ConcurrencyError {
@@ -16,7 +18,7 @@ pub enum ConcurrencyError {
 /// 信号量缓存条目，包含信号量和最后访问时间
 struct SemaphoreEntry {
     semaphore: Arc<Semaphore>,
-    last_accessed: Instant,
+    last_accessed: Mutex<Instant>,
 }
 
 /// 并发控制器，支持 API Key 级别的并发限制
@@ -25,8 +27,8 @@ pub struct ConcurrencyController {
     downstream_semaphore: Option<Arc<Semaphore>>,
     /// 全局上游默认限制
     upstream_default_limit: Option<usize>,
-    /// 上游并发信号量（按 key），带访问时间戳
-    upstream_semaphores: Mutex<HashMap<String, SemaphoreEntry>>,
+    /// 上游并发信号量（按 key），带访问时间戳，使用 DashMap 实现细粒度锁
+    upstream_semaphores: DashMap<String, SemaphoreEntry>,
     /// API Key 级别的并发配置
     api_key_configs: HashMap<String, ApiKeyConcurrencyConfig>,
 }
@@ -78,7 +80,7 @@ impl ConcurrencyController {
         Some(Self {
             downstream_semaphore: downstream_limit.map(|limit| Arc::new(Semaphore::new(limit))),
             upstream_default_limit,
-            upstream_semaphores: Mutex::new(HashMap::new()),
+            upstream_semaphores: DashMap::new(),
             api_key_configs,
         })
     }
@@ -131,24 +133,27 @@ impl ConcurrencyController {
     }
 
     /// 获取下游并发许可（支持 API Key 级别限制）
-    pub async fn acquire_downstream_for_key(
+    pub fn acquire_downstream_for_key(
         &self,
         api_key: &str,
     ) -> Result<Option<OwnedSemaphorePermit>, ConcurrencyError> {
         // 优先使用 API Key 级别的限制
         if let Some(limit) = self.get_api_key_downstream_limit(api_key) {
             let semaphore_key = format!("downstream:{api_key}");
-            let semaphore = {
-                let mut semaphores = self.upstream_semaphores.lock().await;
-                let entry = semaphores.entry(semaphore_key).or_insert_with(|| SemaphoreEntry {
+            let semaphore = self
+                .upstream_semaphores
+                .entry(semaphore_key)
+                .or_insert_with(|| SemaphoreEntry {
                     semaphore: Arc::new(Semaphore::new(limit)),
-                    last_accessed: Instant::now(),
+                    last_accessed: Mutex::new(Instant::now()),
                 });
-                entry.last_accessed = Instant::now();
-                entry.semaphore.clone()
-            };
+            if let Ok(mut last) = semaphore.last_accessed.lock() {
+                *last = Instant::now();
+            }
 
             return semaphore
+                .semaphore
+                .clone()
                 .try_acquire_owned()
                 .map(Some)
                 .map_err(map_acquire_error_to_downstream);
@@ -158,7 +163,7 @@ impl ConcurrencyController {
         self.acquire_downstream()
     }
 
-    pub async fn acquire_upstream(
+    pub fn acquire_upstream(
         &self,
         route: &RouteConfig,
     ) -> Result<Option<OwnedSemaphorePermit>, ConcurrencyError> {
@@ -175,24 +180,27 @@ impl ConcurrencyController {
         let key_fingerprint = fingerprint(&key_material);
         let semaphore_key = format!("{}:{key_fingerprint:016x}", route.id);
 
-        let semaphore = {
-            let mut semaphores = self.upstream_semaphores.lock().await;
-            let entry = semaphores.entry(semaphore_key).or_insert_with(|| SemaphoreEntry {
+        let semaphore = self
+            .upstream_semaphores
+            .entry(semaphore_key)
+            .or_insert_with(|| SemaphoreEntry {
                 semaphore: Arc::new(Semaphore::new(limit)),
-                last_accessed: Instant::now(),
+                last_accessed: Mutex::new(Instant::now()),
             });
-            entry.last_accessed = Instant::now();
-            entry.semaphore.clone()
-        };
+        if let Ok(mut last) = semaphore.last_accessed.lock() {
+            *last = Instant::now();
+        }
 
         semaphore
+            .semaphore
+            .clone()
             .try_acquire_owned()
             .map(Some)
             .map_err(map_acquire_error_to_upstream)
     }
 
     /// 获取上游并发许可（支持 API Key 级别限制）
-    pub async fn acquire_upstream_for_key(
+    pub fn acquire_upstream_for_key(
         &self,
         api_key: &str,
         route: &RouteConfig,
@@ -215,31 +223,40 @@ impl ConcurrencyController {
         let key_fingerprint = fingerprint(&key_material);
         let semaphore_key = format!("{}:{}:{key_fingerprint:016x}", route.id, api_key);
 
-        let semaphore = {
-            let mut semaphores = self.upstream_semaphores.lock().await;
-            let entry = semaphores.entry(semaphore_key).or_insert_with(|| SemaphoreEntry {
+        let semaphore = self
+            .upstream_semaphores
+            .entry(semaphore_key)
+            .or_insert_with(|| SemaphoreEntry {
                 semaphore: Arc::new(Semaphore::new(limit)),
-                last_accessed: Instant::now(),
+                last_accessed: Mutex::new(Instant::now()),
             });
-            entry.last_accessed = Instant::now();
-            entry.semaphore.clone()
-        };
+        if let Ok(mut last) = semaphore.last_accessed.lock() {
+            *last = Instant::now();
+        }
 
         semaphore
+            .semaphore
+            .clone()
             .try_acquire_owned()
             .map(Some)
             .map_err(map_acquire_error_to_upstream)
     }
 
     /// 清理长时间未使用的信号量（5分钟未使用）
-    pub async fn cleanup_unused_semaphores(&self) {
-        let mut semaphores = self.upstream_semaphores.lock().await;
+    pub fn cleanup_unused_semaphores(&self) {
         let now = Instant::now();
         let timeout = Duration::from_secs(300); // 5分钟
 
-        let before_count = semaphores.len();
-        semaphores.retain(|_, entry| now.duration_since(entry.last_accessed) < timeout);
-        let after_count = semaphores.len();
+        let before_count = self.upstream_semaphores.len();
+        self.upstream_semaphores
+            .retain(|_, entry| {
+                entry
+                    .last_accessed
+                    .lock()
+                    .map(|last| now.duration_since(*last) < timeout)
+                    .unwrap_or(false)
+            });
+        let after_count = self.upstream_semaphores.len();
 
         if before_count != after_count {
             tracing::debug!(
@@ -345,8 +362,8 @@ mod tests {
         drop(first);
     }
 
-    #[tokio::test]
-    async fn upstream_limit_is_per_key() {
+    #[test]
+    fn upstream_limit_is_per_key() {
         let mut config = config_with_limits(
             None,
             Some(1),
@@ -382,11 +399,10 @@ mod tests {
 
         let first = controller
             .acquire_upstream(&route_a)
-            .await
             .expect("first key-a permit should succeed")
             .expect("permit should exist");
 
-        let second_same_key = controller.acquire_upstream(&route_a).await;
+        let second_same_key = controller.acquire_upstream(&route_a);
         assert!(matches!(
             second_same_key,
             Err(ConcurrencyError::UpstreamLimitExceeded)
@@ -394,7 +410,6 @@ mod tests {
 
         let second_different_key = controller
             .acquire_upstream(&route_b)
-            .await
             .expect("key-b permit should succeed")
             .expect("permit should exist");
 
@@ -402,8 +417,8 @@ mod tests {
         drop(second_different_key);
     }
 
-    #[tokio::test]
-    async fn route_override_limit_works_without_global_upstream_limit() {
+    #[test]
+    fn route_override_limit_works_without_global_upstream_limit() {
         let mut config = config_with_limits(
             None,
             None,
@@ -418,10 +433,9 @@ mod tests {
 
         let first = controller
             .acquire_upstream(&route)
-            .await
             .expect("first permit should succeed")
             .expect("permit should exist");
-        let second = controller.acquire_upstream(&route).await;
+        let second = controller.acquire_upstream(&route);
         assert!(matches!(
             second,
             Err(ConcurrencyError::UpstreamLimitExceeded)
@@ -429,9 +443,9 @@ mod tests {
         drop(first);
     }
 
-    #[tokio::test]
-    async fn api_key_level_downstream_limit() {
-        let mut config = config_with_api_key_limits(
+    #[test]
+    fn api_key_level_downstream_limit() {
+        let config = config_with_api_key_limits(
             None,
             None,
             vec![HeaderInjection {
@@ -452,25 +466,24 @@ mod tests {
         // api-key-1 有 1 个并发限制
         let first = controller
             .acquire_downstream_for_key("api-key-1")
-            .await
             .expect("first permit should succeed")
             .expect("permit should exist");
 
-        let second = controller.acquire_downstream_for_key("api-key-1").await;
+        let second = controller.acquire_downstream_for_key("api-key-1");
         assert!(matches!(
             second,
             Err(ConcurrencyError::DownstreamLimitExceeded)
         ));
 
         // 其他 key 不受限制
-        let other = controller.acquire_downstream_for_key("other-key").await;
+        let other = controller.acquire_downstream_for_key("other-key");
         assert!(other.is_ok());
 
         drop(first);
     }
 
-    #[tokio::test]
-    async fn api_key_level_upstream_limit() {
+    #[test]
+    fn api_key_level_upstream_limit() {
         let mut config = config_with_api_key_limits(
             None,
             None,
@@ -493,13 +506,11 @@ mod tests {
         // api-key-1 有 1 个上游并发限制
         let first = controller
             .acquire_upstream_for_key("api-key-1", &route)
-            .await
             .expect("first permit should succeed")
             .expect("permit should exist");
 
         let second = controller
-            .acquire_upstream_for_key("api-key-1", &route)
-            .await;
+            .acquire_upstream_for_key("api-key-1", &route);
         assert!(matches!(second, Err(ConcurrencyError::UpstreamLimitExceeded)));
 
         drop(first);
@@ -575,6 +586,8 @@ mod tests {
             }),
             observability: None,
             admin: None,
+            config_db_path: "./data/config.db".to_string(),
+            token_stats: None,
         }
     }
 
@@ -595,6 +608,7 @@ mod tests {
                 remark: String::new(),
                 rate_limit: None,
                 concurrency: Some(concurrency),
+                token_quota: None,
                 ban_rules: Vec::new(),
                 ban_status: None,
             })
@@ -636,6 +650,8 @@ mod tests {
             }),
             observability: None,
             admin: None,
+            config_db_path: "./data/config.db".to_string(),
+            token_stats: None,
         }
     }
 }

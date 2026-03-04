@@ -1,8 +1,13 @@
 use crate::config::{
     LogFileConfig, LogFormat, LogRotation, LoggingConfig, MetricsSqliteConfig, ObservabilityConfig,
-    TracingConfig,
+    TokenStatsConfig, TracingConfig,
 };
+use crate::config_storage::{ConfigStorage, ConfigValidationResult};
+use crate::token_quota::{TokenQuotaManager, TokenQuotaChecker};
+use crate::token_stats::TokenStatsCollector;
+use crate::token_stats_storage::TokenStatsStorage;
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
+use dashmap::DashMap;
 use http::header::AUTHORIZATION;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::WithExportConfig as _;
@@ -23,7 +28,7 @@ use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio::time::interval;
@@ -51,6 +56,10 @@ pub struct ObservabilityRuntime {
     metrics_summary_path: Option<String>,
     metrics_token: Option<String>,
     pub storage: Option<Arc<MetricsStorage>>,
+    /// Token统计收集器
+    pub token_stats: Option<Arc<TokenStatsCollector>>,
+    /// Token配额管理器
+    pub token_quota_manager: Option<Arc<TokenQuotaManager>>,
 }
 
 impl Default for ObservabilityRuntime {
@@ -62,41 +71,93 @@ impl Default for ObservabilityRuntime {
             metrics_summary_path: None,
             metrics_token: None,
             storage: None,
+            token_stats: None,
+            token_quota_manager: None,
         }
     }
 }
 
 impl ObservabilityRuntime {
-    pub async fn from_config(config: Option<&ObservabilityConfig>) -> Result<Self, String> {
-        let Some(config) = config else {
-            return Ok(Self::default());
-        };
+    pub async fn from_config(
+        config: Option<&ObservabilityConfig>,
+        token_stats_config: Option<&TokenStatsConfig>,
+        resolved_api_keys: Option<&[crate::config::ResolvedApiKey]>,
+        config_storage: Option<Arc<ConfigStorage>>,
+    ) -> Result<Self, String> {
+        let mut runtime = Self::default();
 
-        if config.metrics.enabled {
-            let metrics_path = normalize_metrics_path(config.metrics.path.as_str());
+        // Initialize metrics if configured
+        if let Some(obs_config) = config {
+            if obs_config.metrics.enabled {
+                let metrics_path = normalize_metrics_path(obs_config.metrics.path.as_str());
 
-            // Initialize SQLite storage if configured
-            let storage = if let Some(sqlite_config) = &config.metrics.sqlite {
-                let (storage, _handle) = MetricsStorage::new(sqlite_config.clone()).await?;
-                info!("Metrics SQLite storage initialized at: {}", sqlite_config.path);
-                Some(Arc::new(storage))
-            } else {
-                None
-            };
+                // Initialize SQLite storage if configured
+                let storage = if let Some(sqlite_config) = &obs_config.metrics.sqlite {
+                    let (storage, _handle) = MetricsStorage::new(sqlite_config.clone()).await?;
+                    info!("Metrics SQLite storage initialized at: {}", sqlite_config.path);
+                    Some(Arc::new(storage))
+                } else {
+                    None
+                };
 
-            let metrics = Arc::new(GatewayMetrics::new(storage.clone()).await);
+                let metrics = Arc::new(GatewayMetrics::new(storage.clone(), config_storage).await);
 
-            return Ok(Self {
-                metrics: Some(metrics),
-                metrics_path: Some(metrics_path.clone()),
-                metrics_ui_path: Some(metrics_sub_path(metrics_path.as_str(), "ui")),
-                metrics_summary_path: Some(metrics_sub_path(metrics_path.as_str(), "summary")),
-                metrics_token: Some(config.metrics.token.clone()),
-                storage,
-            });
+                runtime.metrics = Some(metrics);
+                runtime.metrics_path = Some(metrics_path.clone());
+                runtime.metrics_ui_path = Some(metrics_sub_path(metrics_path.as_str(), "ui"));
+                runtime.metrics_summary_path = Some(metrics_sub_path(metrics_path.as_str(), "summary"));
+                runtime.metrics_token = Some(obs_config.metrics.token.clone());
+                runtime.storage = storage;
+            }
         }
 
-        Ok(Self::default())
+        // Initialize token stats and quota manager if configured
+        if let Some(ts_config) = token_stats_config {
+            if ts_config.enabled {
+                // Create token quota manager
+                let quota_manager = Arc::new(TokenQuotaManager::new());
+
+                // Initialize quotas from API keys
+                if let Some(keys) = resolved_api_keys {
+                    quota_manager.init_from_resolved_keys(keys);
+                }
+
+                // Create token quota checker
+                let _quota_checker = Arc::new(TokenQuotaChecker::new(quota_manager.clone()));
+
+                // Create token stats storage if configured
+                let token_storage = if let Some(sqlite_config) = &ts_config.sqlite {
+                    let storage = TokenStatsStorage::new(
+                        &sqlite_config.path,
+                        sqlite_config.flush_interval_secs,
+                        sqlite_config.batch_size,
+                    )
+                    .await
+                    .map_err(|e| format!("Failed to create token stats storage: {}", e))?;
+                    Some(Arc::new(storage))
+                } else {
+                    None
+                };
+
+                // Create token stats collector
+                let token_stats = Arc::new(TokenStatsCollector::new(
+                    token_storage,
+                    Some(quota_manager.clone()),
+                ));
+
+                // Load historical stats from SQLite
+                if let Err(e) = token_stats.load_historical_stats().await {
+                    warn!("Failed to load historical token stats: {}", e);
+                }
+
+                runtime.token_stats = Some(token_stats);
+                runtime.token_quota_manager = Some(quota_manager);
+
+                info!("Token stats and quota management initialized");
+            }
+        }
+
+        Ok(runtime)
     }
 
     pub fn metrics_path(&self) -> Option<&str> {
@@ -140,13 +201,17 @@ pub struct GatewayMetrics {
     upstream_duration_seconds: Family<UpstreamDurationLabels, Histogram>,
     inflight_requests: Family<RouteLabels, Gauge>,
     sse_streams_inflight: Family<RouteLabels, Gauge>,
-    summary_state: Mutex<SummaryState>,
+    // Use DashMap for fine-grained concurrent access instead of Mutex<SummaryState>
+    route_stats: DashMap<String, RouteStats>,
+    route_token_stats: DashMap<String, RouteTokenStats>,
+    ip_stats: DashMap<String, IPStats>,
     storage: Option<Arc<MetricsStorage>>,
+    config_storage: Option<Arc<ConfigStorage>>,
 }
 
 impl GatewayMetrics {
     /// Synchronous constructor for Default
-    fn new_sync(storage: Option<Arc<MetricsStorage>>) -> Self {
+    fn new_sync(storage: Option<Arc<MetricsStorage>>, config_storage: Option<Arc<ConfigStorage>>) -> Self {
         let requests_total = Family::<RequestCounterLabels, Counter>::default();
         let request_duration_seconds =
             Family::<RequestDurationLabels, Histogram>::new_with_constructor(|| {
@@ -193,13 +258,16 @@ impl GatewayMetrics {
             upstream_duration_seconds,
             inflight_requests,
             sse_streams_inflight,
-            summary_state: Mutex::new(SummaryState::default()),
+            route_stats: DashMap::new(),
+            route_token_stats: DashMap::new(),
+            ip_stats: DashMap::new(),
             storage,
+            config_storage,
         }
     }
 
     /// Asynchronous constructor that loads historical data from SQLite
-    pub async fn new(storage: Option<Arc<MetricsStorage>>) -> Self {
+    pub async fn new(storage: Option<Arc<MetricsStorage>>, config_storage: Option<Arc<ConfigStorage>>) -> Self {
         // Load historical data first (before creating the instance)
         // to avoid holding MutexGuard across await points
         let historical_data = if let Some(storage) = &storage {
@@ -214,14 +282,25 @@ impl GatewayMetrics {
             None
         };
 
-        let metrics = Self::new_sync(storage);
+        let metrics = Self::new_sync(storage, config_storage);
 
         // Apply historical data if loaded successfully
         if let Some((route_buckets, route_token_buckets, ip_stats)) = historical_data {
-            if let Ok(mut state) = metrics.summary_state.lock() {
-                state.route_buckets = route_buckets;
-                state.route_token_buckets = route_token_buckets;
-                state.ip_stats = ip_stats;
+            // Load route stats
+            for (route_id, buckets) in route_buckets {
+                let mut stats = RouteStats::default();
+                stats.buckets = buckets;
+                metrics.route_stats.insert(route_id, stats);
+            }
+            // Load token stats
+            for (route_id, token_map) in route_token_buckets {
+                let mut stats = RouteTokenStats::default();
+                stats.token_buckets = token_map;
+                metrics.route_token_stats.insert(route_id, stats);
+            }
+            // Load IP stats
+            for (ip, stats) in ip_stats {
+                metrics.ip_stats.insert(ip, stats);
             }
             info!("Historical metrics data loaded successfully");
         }
@@ -238,6 +317,33 @@ impl GatewayMetrics {
         status: StatusCode,
         duration: Duration,
     ) {
+        // Filter by config_storage if available
+        if let Some(config_storage) = &self.config_storage {
+            // Check if route_id is valid
+            let is_route_valid = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current()
+                    .block_on(config_storage.validate_route(route_id))
+            });
+            info!("validate_route: route_id={}, is_valid={}", route_id, is_route_valid);
+            if !is_route_valid {
+                return; // Skip recording for invalid routes
+            }
+
+            // Check if API key is valid (if token_label is provided)
+            if let Some(label) = token_label {
+                let validation_result = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current()
+                        .block_on(config_storage.validate_api_key(label))
+                });
+                info!("validate_api_key: label={}, result={:?}", label, validation_result);
+                if !matches!(validation_result, ConfigValidationResult::Valid { .. }) {
+                    return; // Skip recording for invalid API keys
+                }
+            }
+        } else {
+            info!("config_storage is None");
+        }
+
         let status_class = format!("{}xx", status.as_u16() / 100);
         self.requests_total
             .get_or_create(&RequestCounterLabels {
@@ -256,8 +362,31 @@ impl GatewayMetrics {
             })
             .observe(duration.as_secs_f64());
 
-        if let Ok(mut state) = self.summary_state.lock() {
-            state.observe_request(route_id, token_label, epoch_minute_now());
+        // Update route stats using DashMap for lock-free concurrent access
+        let minute_epoch = epoch_minute_now();
+        {
+            let mut stats = self.route_stats.entry(route_id.to_string()).or_default();
+            let current_inflight = stats.current_inflight;
+            if let Some(bucket) = ensure_route_bucket(&mut stats.buckets, minute_epoch) {
+                bucket.requests = bucket.requests.saturating_add(1);
+                bucket.max_inflight = bucket.max_inflight.max(current_inflight);
+            }
+        }
+
+        // Update token stats if token_label is provided
+        if let Some(label) = token_label {
+            let mut token_stats = self.route_token_stats.entry(route_id.to_string()).or_default();
+            if let Some(bucket) = ensure_request_bucket(
+                token_stats.token_buckets.entry(label.to_string()).or_default(),
+                minute_epoch,
+            ) {
+                bucket.requests = bucket.requests.saturating_add(1);
+            }
+        }
+
+        // Prune old data occasionally (simple probabilistic approach)
+        if minute_epoch % 100 == 0 {
+            self.prune_old_data(minute_epoch);
         }
 
         // Queue for SQLite persistence if enabled
@@ -305,9 +434,9 @@ impl GatewayMetrics {
                 route_id: route_id.to_string(),
             })
             .inc();
-        if let Ok(mut state) = self.summary_state.lock() {
-            state.adjust_inflight(route_id, 1, epoch_minute_now());
-        }
+        // Update inflight count using DashMap
+        let mut stats = self.route_stats.entry(route_id.to_string()).or_default();
+        stats.current_inflight = stats.current_inflight.saturating_add(1);
     }
 
     pub fn dec_inflight(&self, route_id: &str) {
@@ -316,9 +445,9 @@ impl GatewayMetrics {
                 route_id: route_id.to_string(),
             })
             .dec();
-        if let Ok(mut state) = self.summary_state.lock() {
-            state.adjust_inflight(route_id, -1, epoch_minute_now());
-        }
+        // Update inflight count using DashMap
+        let mut stats = self.route_stats.entry(route_id.to_string()).or_default();
+        stats.current_inflight = stats.current_inflight.saturating_sub(1);
     }
 
     pub fn inc_sse_inflight(&self, route_id: &str) {
@@ -343,8 +472,33 @@ impl GatewayMetrics {
         url: &str,
         token_label: Option<&str>,
     ) {
-        if let Ok(mut state) = self.summary_state.lock() {
-            state.observe_ip_request(ip, url, token_label, epoch_minute_now());
+        // Update IP stats using DashMap
+        let minute_epoch = epoch_minute_now();
+        let mut stats = self.ip_stats.entry(ip.to_string()).or_default();
+
+        // Find or create current minute bucket
+        let bucket = if let Some(existing) = stats.buckets.iter_mut().find(|b| b.minute_epoch == minute_epoch) {
+            existing
+        } else {
+            stats.buckets.push_back(IPMinuteBucket {
+                minute_epoch,
+                requests: 0,
+                urls: HashMap::new(),
+                tokens: HashMap::new(),
+            });
+            stats.buckets.back_mut().unwrap()
+        };
+
+        bucket.requests = bucket.requests.saturating_add(1);
+
+        // Record URL
+        let url_entry = bucket.urls.entry(url.to_string()).or_insert(0);
+        *url_entry = url_entry.saturating_add(1);
+
+        // Record token
+        if let Some(label) = token_label {
+            let token_entry = bucket.tokens.entry(label.to_string()).or_insert(0);
+            *token_entry = token_entry.saturating_add(1);
         }
 
         // Queue IP record for SQLite persistence
@@ -379,20 +533,278 @@ impl GatewayMetrics {
     }
 
     pub fn snapshot_summary(&self) -> ObservabilitySummary {
-        if let Ok(state) = self.summary_state.lock() {
-            state.snapshot()
-        } else {
-            ObservabilitySummary::empty()
+        let now_minute = epoch_minute_now();
+        let minute_1h = now_minute.saturating_sub(ONE_HOUR_MINUTES.saturating_sub(1));
+        let minute_24h = now_minute.saturating_sub(TWENTY_FOUR_HOURS_MINUTES.saturating_sub(1));
+
+        // Collect all route IDs from both route_stats and route_token_stats
+        let mut route_ids: Vec<String> = self.route_stats.iter().map(|e| e.key().clone()).collect();
+        route_ids.sort();
+        route_ids.dedup();
+
+        let mut routes = Vec::with_capacity(route_ids.len());
+        for route_id in route_ids {
+            let mut requests_1h = 0_u64;
+            let mut requests_24h = 0_u64;
+            let mut inflight_peak_1h = 0_u64;
+            let mut inflight_peak_24h = 0_u64;
+
+            if let Some(stats) = self.route_stats.get(&route_id) {
+                for bucket in &stats.buckets {
+                    if bucket.minute_epoch >= minute_24h {
+                        requests_24h = requests_24h.saturating_add(bucket.requests);
+                        inflight_peak_24h = inflight_peak_24h.max(bucket.max_inflight);
+                    }
+                    if bucket.minute_epoch >= minute_1h {
+                        requests_1h = requests_1h.saturating_add(bucket.requests);
+                        inflight_peak_1h = inflight_peak_1h.max(bucket.max_inflight);
+                    }
+                }
+
+                routes.push(RouteWindowSummary {
+                    route_id: route_id.clone(),
+                    requests_1h,
+                    requests_24h,
+                    inflight_current: stats.current_inflight,
+                    inflight_peak_1h,
+                    inflight_peak_24h,
+                });
+            }
         }
+
+        routes.sort_by(|left, right| {
+            right
+                .requests_24h
+                .cmp(&left.requests_24h)
+                .then(right.inflight_current.cmp(&left.inflight_current))
+                .then_with(|| left.route_id.cmp(&right.route_id))
+        });
+
+        // Collect route-isolated token stats
+        let mut tokens: Vec<TokenWindowSummary> = Vec::new();
+        for entry in self.route_token_stats.iter() {
+            let route_id = entry.key();
+            for (token, buckets) in &entry.token_buckets {
+                let mut requests_1h = 0_u64;
+                let mut requests_24h = 0_u64;
+                for bucket in buckets {
+                    if bucket.minute_epoch >= minute_24h {
+                        requests_24h = requests_24h.saturating_add(bucket.requests);
+                    }
+                    if bucket.minute_epoch >= minute_1h {
+                        requests_1h = requests_1h.saturating_add(bucket.requests);
+                    }
+                }
+                tokens.push(TokenWindowSummary {
+                    token: token.clone(),
+                    route_id: route_id.clone(),
+                    requests_1h,
+                    requests_24h,
+                });
+            }
+        }
+        tokens.sort_by(|left, right| {
+            right
+                .requests_24h
+                .cmp(&left.requests_24h)
+                .then_with(|| left.route_id.cmp(&right.route_id))
+                .then_with(|| left.token.cmp(&right.token))
+        });
+
+        let total_requests_1h = routes
+            .iter()
+            .fold(0_u64, |acc, route| acc.saturating_add(route.requests_1h));
+        let total_requests_24h = routes
+            .iter()
+            .fold(0_u64, |acc, route| acc.saturating_add(route.requests_24h));
+
+        // Aggregate IP stats
+        let ip_stats = self.snapshot_ip_stats(now_minute);
+
+        ObservabilitySummary {
+            generated_at_unix_ms: epoch_millis_now(),
+            total_requests_1h,
+            total_requests_24h,
+            routes,
+            tokens,
+            ip_stats,
+        }
+    }
+
+    /// Returns a filtered metrics summary containing only valid routes and API keys.
+    /// If config_storage is not set, returns the full unfiltered summary.
+    pub async fn snapshot_summary_filtered(&self) -> ObservabilitySummary {
+        let mut summary = self.snapshot_summary();
+
+        if let Some(config_storage) = &self.config_storage {
+            // Get valid route IDs and API key IDs
+            let valid_routes = config_storage.get_valid_route_ids().await;
+            let valid_api_keys = config_storage.get_valid_api_key_ids().await;
+
+            // Filter routes
+            summary.routes.retain(|route| valid_routes.contains(&route.route_id));
+
+            // Filter tokens (API keys)
+            summary.tokens.retain(|token| valid_api_keys.contains(&token.token));
+
+            // Recalculate totals after filtering
+            summary.total_requests_1h = summary
+                .routes
+                .iter()
+                .fold(0_u64, |acc, route| acc.saturating_add(route.requests_1h));
+            summary.total_requests_24h = summary
+                .routes
+                .iter()
+                .fold(0_u64, |acc, route| acc.saturating_add(route.requests_24h));
+        }
+
+        summary
+    }
+
+    fn snapshot_ip_stats(&self, now_minute: u64) -> IPStatsSummary {
+        let minute_5m = now_minute.saturating_sub(FIVE_MINUTES.saturating_sub(1));
+        let minute_1h = now_minute.saturating_sub(ONE_HOUR_MINUTES.saturating_sub(1));
+        let minute_24h = now_minute.saturating_sub(TWENTY_FOUR_HOURS_MINUTES.saturating_sub(1));
+        let minute_7d = now_minute.saturating_sub(ONE_WEEK_MINUTES.saturating_sub(1));
+        let minute_30d = now_minute.saturating_sub(ONE_MONTH_MINUTES.saturating_sub(1));
+
+        let mut ip_summaries: Vec<IPWindowSummary> = self
+            .ip_stats
+            .iter()
+            .map(|entry| {
+                let ip = entry.key();
+                let stats = entry.value();
+                let mut requests_5m = 0_u64;
+                let mut requests_1h = 0_u64;
+                let mut requests_24h = 0_u64;
+                let mut requests_7d = 0_u64;
+                let mut requests_30d = 0_u64;
+
+                // URL and token aggregation (24h window)
+                let mut url_counts: HashMap<String, u64> = HashMap::new();
+                let mut token_counts: HashMap<String, u64> = HashMap::new();
+
+                for bucket in &stats.buckets {
+                    if bucket.minute_epoch >= minute_30d {
+                        requests_30d = requests_30d.saturating_add(bucket.requests);
+                        if bucket.minute_epoch >= minute_7d {
+                            requests_7d = requests_7d.saturating_add(bucket.requests);
+                            if bucket.minute_epoch >= minute_24h {
+                                requests_24h = requests_24h.saturating_add(bucket.requests);
+                                // Only aggregate URLs and tokens within 24h
+                                for (url, count) in &bucket.urls {
+                                    let entry = url_counts.entry(url.clone()).or_insert(0);
+                                    *entry = entry.saturating_add(*count);
+                                }
+                                for (token, count) in &bucket.tokens {
+                                    let entry = token_counts.entry(token.clone()).or_insert(0);
+                                    *entry = entry.saturating_add(*count);
+                                }
+                                if bucket.minute_epoch >= minute_1h {
+                                    requests_1h = requests_1h.saturating_add(bucket.requests);
+                                    if bucket.minute_epoch >= minute_5m {
+                                        requests_5m = requests_5m.saturating_add(bucket.requests);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let mut urls: Vec<UrlSummary> = url_counts
+                    .into_iter()
+                    .map(|(url, count)| UrlSummary { url, count })
+                    .collect();
+                urls.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.url.cmp(&b.url)));
+                urls.truncate(100);
+
+                let mut tokens: Vec<IPTokenSummary> = token_counts
+                    .into_iter()
+                    .map(|(token, count)| IPTokenSummary { token, count })
+                    .collect();
+                tokens.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.token.cmp(&b.token)));
+                tokens.truncate(100);
+
+                IPWindowSummary {
+                    ip: ip.clone(),
+                    requests_5m,
+                    requests_1h,
+                    requests_24h,
+                    requests_7d,
+                    requests_30d,
+                    urls,
+                    tokens,
+                }
+            })
+            .collect();
+
+        ip_summaries.sort_by(|left, right| {
+            right
+                .requests_24h
+                .cmp(&left.requests_24h)
+                .then_with(|| left.ip.cmp(&right.ip))
+        });
+
+        let total_requests_5m = ip_summaries
+            .iter()
+            .fold(0_u64, |acc, ip| acc.saturating_add(ip.requests_5m));
+        let total_requests_1h = ip_summaries
+            .iter()
+            .fold(0_u64, |acc, ip| acc.saturating_add(ip.requests_1h));
+        let total_requests_24h = ip_summaries
+            .iter()
+            .fold(0_u64, |acc, ip| acc.saturating_add(ip.requests_24h));
+        let total_requests_7d = ip_summaries
+            .iter()
+            .fold(0_u64, |acc, ip| acc.saturating_add(ip.requests_7d));
+        let total_requests_30d = ip_summaries
+            .iter()
+            .fold(0_u64, |acc, ip| acc.saturating_add(ip.requests_30d));
+
+        IPStatsSummary {
+            total_requests_5m,
+            total_requests_1h,
+            total_requests_24h,
+            total_requests_7d,
+            total_requests_30d,
+            ips: ip_summaries,
+        }
+    }
+
+    /// Prune old data from all DashMaps
+    fn prune_old_data(&self, now_minute: u64) {
+        let cutoff_30d = now_minute.saturating_sub(ONE_MONTH_MINUTES);
+
+        // Prune route stats
+        for mut entry in self.route_stats.iter_mut() {
+            entry.buckets.retain(|b| b.minute_epoch >= cutoff_30d);
+        }
+
+        // Prune token stats
+        for mut entry in self.route_token_stats.iter_mut() {
+            for buckets in entry.token_buckets.values_mut() {
+                buckets.retain(|b| b.minute_epoch >= cutoff_30d);
+            }
+            // Remove empty token entries
+            entry.token_buckets.retain(|_, buckets| !buckets.is_empty());
+        }
+
+        // Prune IP stats
+        for mut entry in self.ip_stats.iter_mut() {
+            entry.buckets.retain(|b| b.minute_epoch >= cutoff_30d);
+        }
+        self.ip_stats.retain(|_, stats| !stats.buckets.is_empty());
     }
 }
 
 impl Default for GatewayMetrics {
     fn default() -> Self {
-        Self::new_sync(None)
+        Self::new_sync(None, None)
     }
 }
 
+/// Use String for labels - prometheus-client doesn't support Arc<str> directly
+/// The Strings are small and short-lived, so cloning is acceptable
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct RouteLabels {
     route_id: String,
@@ -464,19 +876,6 @@ pub struct IPTokenSummary {
     pub count: u64,
 }
 
-impl ObservabilitySummary {
-    fn empty() -> Self {
-        Self {
-            generated_at_unix_ms: epoch_millis_now(),
-            total_requests_1h: 0,
-            total_requests_24h: 0,
-            routes: Vec::new(),
-            tokens: Vec::new(),
-            ip_stats: IPStatsSummary::default(),
-        }
-    }
-}
-
 #[derive(Clone, Debug, Serialize)]
 pub struct RouteWindowSummary {
     pub route_id: String,
@@ -522,370 +921,18 @@ pub(crate) struct IPStats {
     buckets: VecDeque<IPMinuteBucket>,
 }
 
+/// Per-route statistics using DashMap for lock-free concurrent access
 #[derive(Debug, Default)]
-struct SummaryState {
-    route_buckets: HashMap<String, VecDeque<RouteMinuteBucket>>,
-    // Changed from global token_buckets to route-isolated: route_id -> token_label -> buckets
-    route_token_buckets: HashMap<String, HashMap<String, VecDeque<RequestMinuteBucket>>>,
-    route_inflight: HashMap<String, u64>,
-    ip_stats: HashMap<String, IPStats>,
+struct RouteStats {
+    buckets: VecDeque<RouteMinuteBucket>,
+    current_inflight: u64,
 }
 
-impl SummaryState {
-    fn observe_request(&mut self, route_id: &str, token_label: Option<&str>, minute_epoch: u64) {
-        let current_inflight = self.route_inflight.get(route_id).copied().unwrap_or(0);
-        if let Some(route_bucket) = ensure_route_bucket(
-            self.route_buckets.entry(route_id.to_string()).or_default(),
-            minute_epoch,
-        ) {
-            route_bucket.requests = route_bucket.requests.saturating_add(1);
-            route_bucket.max_inflight = route_bucket.max_inflight.max(current_inflight);
-        }
-
-        // Route-isolated token stats: route_id -> token_label -> buckets
-        if let Some(label) = token_label {
-            let route_tokens = self.route_token_buckets.entry(route_id.to_string()).or_default();
-            if let Some(token_bucket) = ensure_request_bucket(
-                route_tokens.entry(label.to_string()).or_default(),
-                minute_epoch,
-            ) {
-                token_bucket.requests = token_bucket.requests.saturating_add(1);
-            }
-        }
-
-        self.prune(minute_epoch);
-    }
-
-    fn observe_ip_request(
-        &mut self,
-        ip: &str,
-        url: &str,
-        token_label: Option<&str>,
-        minute_epoch: u64,
-    ) {
-        let ip_stats = self.ip_stats.entry(ip.to_string()).or_default();
-
-        // 查找或创建当前分钟的 bucket
-        let bucket = if let Some(existing) = ip_stats
-            .buckets
-            .iter_mut()
-            .find(|b| b.minute_epoch == minute_epoch)
-        {
-            existing
-        } else {
-            ip_stats.buckets.push_back(IPMinuteBucket {
-                minute_epoch,
-                requests: 0,
-                urls: HashMap::new(),
-                tokens: HashMap::new(),
-            });
-            ip_stats.buckets.back_mut().unwrap()
-        };
-
-        bucket.requests = bucket.requests.saturating_add(1);
-
-        // 记录 URL
-        let url_entry = bucket.urls.entry(url.to_string()).or_insert(0);
-        *url_entry = url_entry.saturating_add(1);
-
-        // 记录 token
-        if let Some(label) = token_label {
-            let token_entry = bucket.tokens.entry(label.to_string()).or_insert(0);
-            *token_entry = token_entry.saturating_add(1);
-        }
-
-        // 清理过期数据（保留30天）
-        self.prune_ip_stats(minute_epoch);
-    }
-
-    fn prune_ip_stats(&mut self, minute_epoch: u64) {
-        let cutoff = minute_epoch.saturating_sub(ONE_MONTH_MINUTES.saturating_sub(1));
-
-        let mut empty_ips = Vec::new();
-        for (ip, stats) in &mut self.ip_stats {
-            stats.buckets.retain(|b| b.minute_epoch >= cutoff);
-            if stats.buckets.is_empty() {
-                empty_ips.push(ip.clone());
-            }
-        }
-        for ip in empty_ips {
-            self.ip_stats.remove(&ip);
-        }
-    }
-
-    fn adjust_inflight(&mut self, route_id: &str, delta: i64, minute_epoch: u64) {
-        let entry = self.route_inflight.entry(route_id.to_string()).or_insert(0);
-        if delta >= 0 {
-            *entry = entry.saturating_add(delta as u64);
-        } else {
-            *entry = entry.saturating_sub(delta.unsigned_abs());
-        }
-        let current_inflight = *entry;
-        if let Some(route_bucket) = ensure_route_bucket(
-            self.route_buckets.entry(route_id.to_string()).or_default(),
-            minute_epoch,
-        ) {
-            route_bucket.max_inflight = route_bucket.max_inflight.max(current_inflight);
-        }
-
-        self.prune(minute_epoch);
-    }
-
-    fn prune(&mut self, minute_epoch: u64) {
-        let cutoff = minute_epoch.saturating_sub(TWENTY_FOUR_HOURS_MINUTES.saturating_sub(1));
-
-        let mut empty_routes = Vec::new();
-        for (route_id, buckets) in &mut self.route_buckets {
-            prune_old_route_buckets(buckets, cutoff);
-            let inflight = self.route_inflight.get(route_id).copied().unwrap_or(0);
-            if buckets.is_empty() && inflight == 0 {
-                empty_routes.push(route_id.clone());
-            }
-        }
-        for route_id in empty_routes {
-            self.route_buckets.remove(route_id.as_str());
-            self.route_inflight.remove(route_id.as_str());
-        }
-        self.route_inflight.retain(|route_id, inflight| {
-            *inflight > 0 || self.route_buckets.contains_key(route_id)
-        });
-
-        // 清理 route-isolated token stats
-        let mut empty_routes_for_tokens = Vec::new();
-        for (route_id, token_map) in &mut self.route_token_buckets {
-            let mut empty_tokens = Vec::new();
-            for (token, buckets) in token_map.iter_mut() {
-                prune_old_request_buckets(buckets, cutoff);
-                if buckets.is_empty() {
-                    empty_tokens.push(token.clone());
-                }
-            }
-            for token in empty_tokens {
-                token_map.remove(&token);
-            }
-            if token_map.is_empty() {
-                empty_routes_for_tokens.push(route_id.clone());
-            }
-        }
-        for route_id in empty_routes_for_tokens {
-            self.route_token_buckets.remove(&route_id);
-        }
-
-        // 清理 IP 统计
-        self.prune_ip_stats(minute_epoch);
-    }
-
-    fn snapshot(&self) -> ObservabilitySummary {
-        let now_minute = epoch_minute_now();
-        let minute_1h = now_minute.saturating_sub(ONE_HOUR_MINUTES.saturating_sub(1));
-        let minute_24h = now_minute.saturating_sub(TWENTY_FOUR_HOURS_MINUTES.saturating_sub(1));
-
-        let mut route_ids: Vec<String> = self.route_buckets.keys().cloned().collect();
-        for route_id in self.route_inflight.keys() {
-            if !self.route_buckets.contains_key(route_id) {
-                route_ids.push(route_id.clone());
-            }
-        }
-        route_ids.sort();
-        route_ids.dedup();
-
-        let mut routes = Vec::with_capacity(route_ids.len());
-        for route_id in route_ids {
-            let mut requests_1h = 0_u64;
-            let mut requests_24h = 0_u64;
-            let mut inflight_peak_1h = 0_u64;
-            let mut inflight_peak_24h = 0_u64;
-            if let Some(buckets) = self.route_buckets.get(route_id.as_str()) {
-                for bucket in buckets {
-                    if bucket.minute_epoch >= minute_24h {
-                        requests_24h = requests_24h.saturating_add(bucket.requests);
-                        inflight_peak_24h = inflight_peak_24h.max(bucket.max_inflight);
-                    }
-                    if bucket.minute_epoch >= minute_1h {
-                        requests_1h = requests_1h.saturating_add(bucket.requests);
-                        inflight_peak_1h = inflight_peak_1h.max(bucket.max_inflight);
-                    }
-                }
-            }
-
-            routes.push(RouteWindowSummary {
-                route_id: route_id.clone(),
-                requests_1h,
-                requests_24h,
-                inflight_current: self
-                    .route_inflight
-                    .get(route_id.as_str())
-                    .copied()
-                    .unwrap_or(0),
-                inflight_peak_1h,
-                inflight_peak_24h,
-            });
-        }
-
-        routes.sort_by(|left, right| {
-            right
-                .requests_24h
-                .cmp(&left.requests_24h)
-                .then(right.inflight_current.cmp(&left.inflight_current))
-                .then_with(|| left.route_id.cmp(&right.route_id))
-        });
-
-        // Collect route-isolated token stats
-        let mut tokens: Vec<TokenWindowSummary> = Vec::new();
-        for (route_id, token_map) in &self.route_token_buckets {
-            for (token, buckets) in token_map {
-                let mut requests_1h = 0_u64;
-                let mut requests_24h = 0_u64;
-                for bucket in buckets {
-                    if bucket.minute_epoch >= minute_24h {
-                        requests_24h = requests_24h.saturating_add(bucket.requests);
-                    }
-                    if bucket.minute_epoch >= minute_1h {
-                        requests_1h = requests_1h.saturating_add(bucket.requests);
-                    }
-                }
-                tokens.push(TokenWindowSummary {
-                    token: token.clone(),
-                    route_id: route_id.clone(),
-                    requests_1h,
-                    requests_24h,
-                });
-            }
-        }
-        tokens.sort_by(|left, right| {
-            right
-                .requests_24h
-                .cmp(&left.requests_24h)
-                .then_with(|| left.route_id.cmp(&right.route_id))
-                .then_with(|| left.token.cmp(&right.token))
-        });
-
-        let total_requests_1h = routes
-            .iter()
-            .fold(0_u64, |acc, route| acc.saturating_add(route.requests_1h));
-        let total_requests_24h = routes
-            .iter()
-            .fold(0_u64, |acc, route| acc.saturating_add(route.requests_24h));
-
-        // 聚合 IP 统计
-        let ip_stats = self.snapshot_ip_stats(now_minute);
-
-        ObservabilitySummary {
-            generated_at_unix_ms: epoch_millis_now(),
-            total_requests_1h,
-            total_requests_24h,
-            routes,
-            tokens,
-            ip_stats,
-        }
-    }
-
-    fn snapshot_ip_stats(&self, now_minute: u64) -> IPStatsSummary {
-        let minute_5m = now_minute.saturating_sub(FIVE_MINUTES.saturating_sub(1));
-        let minute_1h = now_minute.saturating_sub(ONE_HOUR_MINUTES.saturating_sub(1));
-        let minute_24h = now_minute.saturating_sub(TWENTY_FOUR_HOURS_MINUTES.saturating_sub(1));
-        let minute_7d = now_minute.saturating_sub(ONE_WEEK_MINUTES.saturating_sub(1));
-        let minute_30d = now_minute.saturating_sub(ONE_MONTH_MINUTES.saturating_sub(1));
-
-        let mut ip_summaries: Vec<IPWindowSummary> = self
-            .ip_stats
-            .iter()
-            .map(|(ip, stats)| {
-                let mut requests_5m = 0_u64;
-                let mut requests_1h = 0_u64;
-                let mut requests_24h = 0_u64;
-                let mut requests_7d = 0_u64;
-                let mut requests_30d = 0_u64;
-
-                // URL 和 token 聚合（24小时窗口）
-                let mut url_counts: HashMap<String, u64> = HashMap::new();
-                let mut token_counts: HashMap<String, u64> = HashMap::new();
-
-                for bucket in &stats.buckets {
-                    if bucket.minute_epoch >= minute_30d {
-                        requests_30d = requests_30d.saturating_add(bucket.requests);
-                        if bucket.minute_epoch >= minute_7d {
-                            requests_7d = requests_7d.saturating_add(bucket.requests);
-                            if bucket.minute_epoch >= minute_24h {
-                                requests_24h = requests_24h.saturating_add(bucket.requests);
-                                // 只聚合24小时内的 URL 和 token
-                                for (url, count) in &bucket.urls {
-                                    let entry = url_counts.entry(url.clone()).or_insert(0);
-                                    *entry = entry.saturating_add(*count);
-                                }
-                                for (token, count) in &bucket.tokens {
-                                    let entry = token_counts.entry(token.clone()).or_insert(0);
-                                    *entry = entry.saturating_add(*count);
-                                }
-                                if bucket.minute_epoch >= minute_1h {
-                                    requests_1h = requests_1h.saturating_add(bucket.requests);
-                                    if bucket.minute_epoch >= minute_5m {
-                                        requests_5m = requests_5m.saturating_add(bucket.requests);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                let mut urls: Vec<UrlSummary> = url_counts
-                    .into_iter()
-                    .map(|(url, count)| UrlSummary { url, count })
-                    .collect();
-                urls.sort_by(|a, b| b.count.cmp(&a.count));
-                urls.truncate(10); // 只保留 top 10 URL
-
-                let mut tokens: Vec<IPTokenSummary> = token_counts
-                    .into_iter()
-                    .map(|(token, count)| IPTokenSummary { token, count })
-                    .collect();
-                tokens.sort_by(|a, b| b.count.cmp(&a.count));
-
-                IPWindowSummary {
-                    ip: ip.clone(),
-                    requests_5m,
-                    requests_1h,
-                    requests_24h,
-                    requests_7d,
-                    requests_30d,
-                    urls,
-                    tokens,
-                }
-            })
-            .filter(|ip| ip.requests_30d > 0)
-            .collect();
-
-        ip_summaries.sort_by(|a, b| {
-            b.requests_24h
-                .cmp(&a.requests_24h)
-                .then_with(|| a.ip.cmp(&b.ip))
-        });
-
-        let total_requests_5m = ip_summaries.iter().fold(0_u64, |acc, ip| {
-            acc.saturating_add(ip.requests_5m)
-        });
-        let total_requests_1h = ip_summaries.iter().fold(0_u64, |acc, ip| {
-            acc.saturating_add(ip.requests_1h)
-        });
-        let total_requests_24h = ip_summaries.iter().fold(0_u64, |acc, ip| {
-            acc.saturating_add(ip.requests_24h)
-        });
-        let total_requests_7d = ip_summaries.iter().fold(0_u64, |acc, ip| {
-            acc.saturating_add(ip.requests_7d)
-        });
-        let total_requests_30d = ip_summaries.iter().fold(0_u64, |acc, ip| {
-            acc.saturating_add(ip.requests_30d)
-        });
-
-        IPStatsSummary {
-            total_requests_5m,
-            total_requests_1h,
-            total_requests_24h,
-            total_requests_7d,
-            total_requests_30d,
-            ips: ip_summaries,
-        }
-    }
+/// Per-route token statistics
+#[derive(Debug, Default)]
+struct RouteTokenStats {
+    // token_label -> buckets
+    token_buckets: HashMap<String, VecDeque<RequestMinuteBucket>>,
 }
 
 fn ensure_request_bucket(
@@ -919,24 +966,6 @@ fn ensure_route_bucket(
         max_inflight: 0,
     });
     buckets.back_mut()
-}
-
-fn prune_old_request_buckets(buckets: &mut VecDeque<RequestMinuteBucket>, cutoff: u64) {
-    while buckets
-        .front()
-        .is_some_and(|bucket| bucket.minute_epoch < cutoff)
-    {
-        let _ = buckets.pop_front();
-    }
-}
-
-fn prune_old_route_buckets(buckets: &mut VecDeque<RouteMinuteBucket>, cutoff: u64) {
-    while buckets
-        .front()
-        .is_some_and(|bucket| bucket.minute_epoch < cutoff)
-    {
-        let _ = buckets.pop_front();
-    }
 }
 
 fn normalize_metrics_path(path: &str) -> String {
