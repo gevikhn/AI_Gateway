@@ -969,24 +969,7 @@ fn epoch_millis_now() -> u64 {
 }
 
 pub fn token_label(token: &str) -> String {
-    let token = token.trim();
-    if token.is_empty() {
-        return "***".to_string();
-    }
-
-    let prefix: String = token.chars().take(3).collect();
-    let suffix: String = token
-        .chars()
-        .rev()
-        .take(2)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    if token.chars().count() <= 5 {
-        return format!("{prefix}***");
-    }
-    format!("{prefix}***{suffix}")
+    token.trim().to_string()
 }
 
 pub fn extract_or_generate_request_id(headers: &HeaderMap) -> String {

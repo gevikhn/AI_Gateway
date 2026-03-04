@@ -655,7 +655,7 @@ function renderApiKeys() {
     const status = isBanned ? 'banned' : (key.enabled ? 'enabled' : 'disabled');
     const statusClass = `status-${status}`;
     const statusText = isBanned ? '封禁中' : (key.enabled ? '启用' : '禁用');
-    const shortKey = key.key.substring(0, 20) + '...';
+    const shortKey = key.key;
 
     // 路由标签（支持多路由显示）
     let routeTags;
@@ -1795,7 +1795,7 @@ function renderBanLogs() {
 
     // 查找 API Key 信息
     const apiKey = apiKeysData.find(k => k.id === log.api_key_id);
-    const apiKeyDisplay = apiKey ? (apiKey.key.substring(0, 20) + '...') : log.api_key_id;
+    const apiKeyDisplay = apiKey ? apiKey.key : log.api_key_id;
 
     // 计算封禁时长
     const durationSecs = log.banned_until - log.banned_at;

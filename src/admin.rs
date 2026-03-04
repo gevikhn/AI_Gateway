@@ -424,6 +424,16 @@ async fn admin_metrics_handler(
             }
         }
 
+        // 重新计算总请求数，使其与过滤后的路由列表一致
+        summary.total_requests_1h = summary
+            .routes
+            .iter()
+            .fold(0_u64, |acc, route| acc.saturating_add(route.requests_1h));
+        summary.total_requests_24h = summary
+            .routes
+            .iter()
+            .fold(0_u64, |acc, route| acc.saturating_add(route.requests_24h));
+
         json_ok(&summary)
     } else {
         json_error(StatusCode::NOT_FOUND, "metrics_not_available")
