@@ -40,7 +40,7 @@ impl TokenExtractor {
             return None;
         }
 
-        tracing::info!("Extracting tokens from body of {} bytes", body.len());
+        tracing::debug!("Extracting tokens from body of {} bytes", body.len());
 
         // 尝试解析为JSON
         let json_value: serde_json::Value = match serde_json::from_slice(body) {
@@ -61,11 +61,11 @@ impl TokenExtractor {
             }
         };
 
-        tracing::info!("Found usage field: {:?}", usage);
+        tracing::debug!("Found usage field: {:?}", usage);
 
         // 尝试OpenAI格式
         if let Ok(openai_usage) = serde_json::from_value::<OpenAiUsage>(usage.clone()) {
-            tracing::info!(
+            tracing::debug!(
                 "Extracted OpenAI format tokens: prompt={}, completion={}",
                 openai_usage.prompt_tokens,
                 openai_usage.completion_tokens
@@ -79,7 +79,7 @@ impl TokenExtractor {
 
         // 尝试Claude格式
         if let Ok(claude_usage) = serde_json::from_value::<ClaudeUsage>(usage.clone()) {
-            tracing::info!(
+            tracing::debug!(
                 "Extracted Claude format tokens: input={}, output={}",
                 claude_usage.input_tokens,
                 claude_usage.output_tokens
@@ -125,7 +125,7 @@ impl TokenExtractor {
     pub fn extract_from_sse_body(full_body: &Bytes) -> Option<TokenUsage> {
         let text = String::from_utf8_lossy(full_body);
 
-        tracing::info!("Extracting from SSE body of {} bytes", full_body.len());
+        tracing::debug!("Extracting from SSE body of {} bytes", full_body.len());
 
         // 按行分割，收集所有 data: 行
         let mut data_lines: Vec<&str> = Vec::new();
@@ -140,7 +140,7 @@ impl TokenExtractor {
             }
         }
 
-        tracing::info!("Found {} data lines in SSE body", data_lines.len());
+        tracing::debug!("Found {} data lines in SSE body", data_lines.len());
 
         if data_lines.is_empty() {
             tracing::warn!("No data: line found in SSE body");
@@ -155,7 +155,7 @@ impl TokenExtractor {
                 if let Ok(json) = serde_json::from_str::<serde_json::Value>(json_str.trim()) {
                     if json.get("usage").is_some() {
                         usage_line = Some(line);
-                        tracing::info!("Found data line with usage field");
+                        tracing::debug!("Found data line with usage field");
                         break;
                     }
                 }
@@ -164,7 +164,7 @@ impl TokenExtractor {
 
         // 如果没找到包含 usage 的行，使用最后一行（OpenAI 格式）
         let data_line = usage_line.or_else(|| data_lines.last().copied()).unwrap();
-        tracing::info!("Using data line: {}", data_line.chars().take(100).collect::<String>());
+        tracing::debug!("Using data line: {}", data_line.chars().take(100).collect::<String>());
 
         // 支持 "data: " (带空格) 和 "data:" (无空格) 两种前缀
         let json_str = if let Some(s) = data_line.strip_prefix("data: ") {
@@ -176,7 +176,7 @@ impl TokenExtractor {
             return None;
         };
 
-        tracing::info!("JSON string to parse: {}", json_str.chars().take(200).collect::<String>());
+        tracing::debug!("JSON string to parse: {}", json_str.chars().take(200).collect::<String>());
 
         // 解析JSON
         let json_value: serde_json::Value = match serde_json::from_str(json_str) {
@@ -190,14 +190,14 @@ impl TokenExtractor {
         // 查找usage字段（可能在不同位置）
         // OpenAI: 在根对象的usage字段
         // Claude: 也在根对象的usage字段
-        tracing::info!("Looking for usage field in JSON, keys: {:?}", json_value.as_object().map(|o| o.keys().collect::<Vec<_>>()));
+        tracing::debug!("Looking for usage field in JSON, keys: {:?}", json_value.as_object().map(|o| o.keys().collect::<Vec<_>>()));
 
         if let Some(usage) = json_value.get("usage") {
-            tracing::info!("Found usage field: {:?}", usage);
+            tracing::debug!("Found usage field: {:?}", usage);
             // 尝试OpenAI格式
             if let Ok(openai_usage) = serde_json::from_value::<OpenAiUsage>(usage.clone()) {
                 if openai_usage.prompt_tokens > 0 || openai_usage.completion_tokens > 0 {
-                    tracing::info!("Extracted OpenAI format from SSE: prompt={}, completion={}", openai_usage.prompt_tokens, openai_usage.completion_tokens);
+                    tracing::debug!("Extracted OpenAI format from SSE: prompt={}, completion={}", openai_usage.prompt_tokens, openai_usage.completion_tokens);
                     return Some(TokenUsage {
                         input_tokens: openai_usage.prompt_tokens,
                         output_tokens: openai_usage.completion_tokens,
@@ -209,7 +209,7 @@ impl TokenExtractor {
             // 尝试Claude格式
             if let Ok(claude_usage) = serde_json::from_value::<ClaudeUsage>(usage.clone()) {
                 if claude_usage.input_tokens > 0 || claude_usage.output_tokens > 0 {
-                    tracing::info!("Extracted Claude format from SSE: input={}, output={}", claude_usage.input_tokens, claude_usage.output_tokens);
+                    tracing::debug!("Extracted Claude format from SSE: input={}, output={}", claude_usage.input_tokens, claude_usage.output_tokens);
                     return Some(TokenUsage {
                         input_tokens: claude_usage.input_tokens,
                         output_tokens: claude_usage.output_tokens,

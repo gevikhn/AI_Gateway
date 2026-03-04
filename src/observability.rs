@@ -324,7 +324,6 @@ impl GatewayMetrics {
                 tokio::runtime::Handle::current()
                     .block_on(config_storage.validate_route(route_id))
             });
-            info!("validate_route: route_id={}, is_valid={}", route_id, is_route_valid);
             if !is_route_valid {
                 return; // Skip recording for invalid routes
             }
@@ -335,13 +334,10 @@ impl GatewayMetrics {
                     tokio::runtime::Handle::current()
                         .block_on(config_storage.validate_api_key(label))
                 });
-                info!("validate_api_key: label={}, result={:?}", label, validation_result);
                 if !matches!(validation_result, ConfigValidationResult::Valid { .. }) {
                     return; // Skip recording for invalid API keys
                 }
             }
-        } else {
-            info!("config_storage is None");
         }
 
         let status_class = format!("{}xx", status.as_u16() / 100);

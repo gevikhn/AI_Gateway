@@ -964,7 +964,7 @@ async fn proxy_handler(
             // 创建响应guard（包含token提取功能）
             // 对非SSE和SSE响应都尝试提取token（SSE的最后一条消息可能包含usage）
             let should_extract_tokens = state.token_stats().is_some();
-            tracing::info!(
+            tracing::debug!(
                 "Setting up token extraction: is_sse={}, token_stats_exists={}, will_extract={}",
                 is_sse,
                 state.token_stats().is_some(),
@@ -1428,14 +1428,14 @@ where
                 if let Some(bytes_sent) = &self.bytes_sent {
                     bytes_sent.fetch_add(chunk_len as u64, Ordering::Relaxed);
                 }
-                tracing::info!("Received chunk: {} bytes, total buffer: {} bytes", chunk_len, self.buffer.len());
+                tracing::debug!("Received chunk: {} bytes, total buffer: {} bytes", chunk_len, self.buffer.len());
                 std::task::Poll::Ready(Some(Ok(chunk)))
             }
             std::task::Poll::Ready(None) => {
                 // 流结束，解析token usage
                 let buffer_size = self.buffer.len();
                 let body_sample = String::from_utf8_lossy(&self.buffer[..self.buffer.len().min(200)]);
-                tracing::info!(
+                tracing::debug!(
                     "Stream ended, buffer size: {}, is_sse: {}, body sample: {}",
                     buffer_size,
                     self.is_sse,
@@ -1500,7 +1500,7 @@ fn attach_response_guards(response: Response<Body>, guards: ResponseGuards) -> R
 
     let (parts, body) = response.into_parts();
 
-    tracing::info!(
+    tracing::debug!(
         "Attaching response guards: extract_tokens={}, has_input_tokens={}, has_output_tokens={}",
         guards.extract_tokens,
         guards.input_tokens.is_some(),
@@ -1509,7 +1509,7 @@ fn attach_response_guards(response: Response<Body>, guards: ResponseGuards) -> R
 
     // 如果需要提取token，使用TokenCapturingStream
     if guards.extract_tokens && guards.input_tokens.is_some() && guards.output_tokens.is_some() {
-        tracing::info!("Using TokenCapturingStreamWithGuards for token extraction");
+        tracing::debug!("Using TokenCapturingStreamWithGuards for token extraction");
         let input_tokens = guards.input_tokens.clone().unwrap();
         let output_tokens = guards.output_tokens.clone().unwrap();
         let bytes_sent = guards.bytes_sent.clone();
