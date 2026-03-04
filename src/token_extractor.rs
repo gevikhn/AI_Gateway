@@ -1,5 +1,6 @@
 use axum::body::Bytes;
 use serde::Deserialize;
+use std::io::Read;
 
 /// Token使用信息
 #[derive(Debug, Clone, Copy)]
@@ -32,6 +33,28 @@ struct ClaudeUsage {
 pub struct TokenExtractor;
 
 impl TokenExtractor {
+    /// 检测并解压缩gzip数据
+    fn decompress_if_needed(body: &Bytes) -> Option<Bytes> {
+        // 检查是否是gzip格式（魔数：0x1f 0x8b）
+        if body.len() >= 2 && body[0] == 0x1f && body[1] == 0x8b {
+            tracing::debug!("Detected gzip compressed response ({} bytes), decompressing...", body.len());
+            let mut decoder = flate2::read::GzDecoder::new(&body[..]);
+            let mut decompressed = Vec::new();
+            match decoder.read_to_end(&mut decompressed) {
+                Ok(_) => {
+                    tracing::debug!("Successfully decompressed {} bytes to {} bytes", body.len(), decompressed.len());
+                    Some(Bytes::from(decompressed))
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to decompress gzip data: {}", e);
+                    None
+                }
+            }
+        } else {
+            Some(body.clone())
+        }
+    }
+
     /// 从非流式响应体中提取token使用信息
     pub fn extract_from_body(body: &Bytes) -> Option<TokenUsage> {
         // 如果body为空，直接返回
@@ -42,8 +65,14 @@ impl TokenExtractor {
 
         tracing::debug!("Extracting tokens from body of {} bytes", body.len());
 
+        // 先尝试解压缩（如果是gzip格式）
+        let body = match Self::decompress_if_needed(body) {
+            Some(b) => b,
+            None => return None,
+        };
+
         // 尝试解析为JSON
-        let json_value: serde_json::Value = match serde_json::from_slice(body) {
+        let json_value: serde_json::Value = match serde_json::from_slice(&body) {
             Ok(v) => v,
             Err(e) => {
                 let preview = String::from_utf8_lossy(&body[..body.len().min(100)]);
@@ -123,7 +152,13 @@ impl TokenExtractor {
     /// 从累积的SSE chunks中提取token使用信息
     /// SSE流的最后一条消息通常包含usage信息
     pub fn extract_from_sse_body(full_body: &Bytes) -> Option<TokenUsage> {
-        let text = String::from_utf8_lossy(full_body);
+        // 先尝试解压缩（如果是gzip格式）
+        let full_body = match Self::decompress_if_needed(full_body) {
+            Some(b) => b,
+            None => full_body.clone(),
+        };
+
+        let text = String::from_utf8_lossy(&full_body);
 
         tracing::debug!("Extracting from SSE body of {} bytes", full_body.len());
 
@@ -243,7 +278,13 @@ impl TokenExtractor {
     /// 从流式SSE chunk中提取token使用信息
     /// 注意：大多数SSE流只在最后一条消息包含usage
     pub fn extract_from_sse_chunk(chunk: &Bytes) -> Option<TokenUsage> {
-        let text = String::from_utf8_lossy(chunk);
+        // 先尝试解压缩（如果是gzip格式）
+        let chunk = match Self::decompress_if_needed(chunk) {
+            Some(c) => c,
+            None => chunk.clone(),
+        };
+
+        let text = String::from_utf8_lossy(&chunk);
 
         for line in text.lines() {
             let trimmed = line.trim();

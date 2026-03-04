@@ -1433,15 +1433,6 @@ where
             }
             std::task::Poll::Ready(None) => {
                 // 流结束，解析token usage
-                let buffer_size = self.buffer.len();
-                let body_sample = String::from_utf8_lossy(&self.buffer[..self.buffer.len().min(200)]);
-                tracing::debug!(
-                    "Stream ended, buffer size: {}, is_sse: {}, body sample: {}",
-                    buffer_size,
-                    self.is_sse,
-                    body_sample
-                );
-
                 let usage = if self.is_sse {
                     // 对于SSE流，从SSE格式中提取最后一条data消息
                     TokenExtractor::extract_from_sse_body(&Bytes::from(std::mem::take(&mut self.buffer)))
@@ -1453,12 +1444,12 @@ where
                 if let Some(usage) = usage {
                     self.input_tokens.store(usage.input_tokens, Ordering::Relaxed);
                     self.output_tokens.store(usage.output_tokens, Ordering::Relaxed);
-                    tracing::info!(
+                    tracing::debug!(
                         "Extracted token usage: input={}, output={}",
                         usage.input_tokens, usage.output_tokens
                     );
                 } else {
-                    tracing::warn!("No token usage found in response body");
+                    tracing::debug!("No token usage found in response body");
                 }
                 std::task::Poll::Ready(None)
             }
@@ -1776,6 +1767,10 @@ fn build_upstream_clients(config: &AppConfig) -> Result<HashMap<String, reqwest:
 fn build_upstream_client(upstream: &UpstreamConfig) -> Result<reqwest::Client, String> {
     let mut builder = reqwest::Client::builder()
         .connect_timeout(Duration::from_millis(upstream.connect_timeout_ms))
+        // 自动解压所有支持的编码格式（gzip, brotli, deflate）
+        .gzip(true)
+        .brotli(true)
+        .deflate(true)
         // HTTP/2 优化配置
         .http2_adaptive_window(true)
         // 连接池配置
