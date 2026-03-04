@@ -1,0 +1,17 @@
+id: deepseek
+prefix: /ds
+upstream:
+    base_url: https://api.deepseek.com
+    strip_prefix: true
+    connect_timeout_ms: 10000
+    request_timeout_ms: 300000
+    inject_headers:
+    - name: Authorization
+      value: Bearer ${DEEPSEEK_API_KEY}
+    remove_headers:
+    - Authorization
+    - X-Forwarded-For
+    - Forwarded
+    - Cf-Connecting-Ip
+    - True-Client-Ip
+    upstream_key_max_inflight: 4

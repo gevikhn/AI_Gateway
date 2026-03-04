@@ -60,7 +60,7 @@ pub struct ApiKeyManager {
     /// 全局封禁规则（对所有 API Key 生效）
     ban_rules: Vec<BanRule>,
     /// 封禁引擎的最大时间窗口（用于初始化每个 key 的计数器）
-    ban_max_window_secs: u64,
+    _ban_max_window_secs: u64,
 }
 
 #[derive(Debug)]
@@ -131,7 +131,7 @@ impl ApiKeyManager {
             id_index: RwLock::new(id_index),
             ban_log_store,
             ban_rules: global_ban_rules,
-            ban_max_window_secs,
+            _ban_max_window_secs: ban_max_window_secs,
         }
     }
 

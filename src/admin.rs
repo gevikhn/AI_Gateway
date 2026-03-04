@@ -1,12 +1,15 @@
-use crate::config::AppConfig;
+use crate::config::{AppConfig, BanRule};
 use crate::server::{AppState, build_runtime_state};
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{Query, State};
+use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, Response, StatusCode};
 use axum::routing::{get, post};
 use http::header::CONTENT_TYPE;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+use std::fs;
+use std::path::Path;
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
@@ -216,6 +219,143 @@ async fn admin_config_apply_handler(
     }))
 }
 
+/// 主配置结构（不包含 routes 和 api_keys）
+#[derive(Debug, Serialize)]
+struct MainConfigOnly {
+    pub listen: String,
+    pub gateway_auth: crate::config::GatewayAuthConfig,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data_dir: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inbound_tls: Option<crate::config::InboundTlsConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cors: Option<crate::config::CorsConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_limit: Option<crate::config::RateLimitConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub concurrency: Option<crate::config::ConcurrencyConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observability: Option<crate::config::ObservabilityConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub admin: Option<crate::config::AdminConfig>,
+}
+
+/// Ban Rules 独立配置文件结构
+#[derive(Debug, Serialize, Deserialize)]
+struct BanRulesFileConfig {
+    pub rules: Vec<BanRule>,
+}
+
+/// 将 ID 转换为安全的文件名
+fn sanitize_filename(id: &str) -> String {
+    id.chars()
+        .map(|c| match c {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' => c,
+            _ => '_',
+        })
+        .collect()
+}
+
+/// 清理目录中不再需要的文件
+fn cleanup_old_files<T, F>(dir: &Path, items: &[T], get_id: F) -> Result<(), String>
+where
+    F: Fn(&T) -> &str,
+{
+    let valid_ids: HashSet<String> = items
+        .iter()
+        .map(|item| sanitize_filename(get_id(item)))
+        .collect();
+
+    for entry in fs::read_dir(dir).map_err(|e| format!("读取目录失败: {}", e))? {
+        let entry = entry.map_err(|e| format!("读取目录项失败: {}", e))?;
+        let path = entry.path();
+        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+            if !valid_ids.contains(stem) {
+                let _ = fs::remove_file(&path);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 将配置保存到多个文件
+fn save_config_to_files(config: &AppConfig, config_path: &Path) -> Result<(), String> {
+    // 1. 确定 data 目录路径
+    let base_dir = config_path.parent().unwrap_or(Path::new("."));
+    let data_dir = config.data_dir.as_deref().unwrap_or("./data");
+    let data_path = base_dir.join(data_dir);
+
+    // 2. 创建目录结构
+    fs::create_dir_all(&data_path).map_err(|e| format!("创建 data 目录失败: {}", e))?;
+    fs::create_dir_all(data_path.join("routes"))
+        .map_err(|e| format!("创建 routes 目录失败: {}", e))?;
+    fs::create_dir_all(data_path.join("apikeys"))
+        .map_err(|e| format!("创建 apikeys 目录失败: {}", e))?;
+
+    // 3. 保存主配置（不包含 routes 和 api_keys）
+    let main_config = MainConfigOnly {
+        listen: config.listen.clone(),
+        gateway_auth: config.gateway_auth.clone(),
+        data_dir: config.data_dir.clone(),
+        inbound_tls: config.inbound_tls.clone(),
+        cors: config.cors.clone(),
+        rate_limit: config.rate_limit.clone(),
+        concurrency: config.concurrency.clone(),
+        observability: config.observability.clone(),
+        admin: config.admin.clone(),
+    };
+    let main_yaml =
+        serde_yaml::to_string(&main_config).map_err(|e| format!("序列化主配置失败: {}", e))?;
+
+    let temp_path = config_path.with_extension("yaml.tmp");
+    fs::write(&temp_path, &main_yaml).map_err(|e| format!("写入主配置失败: {}", e))?;
+    fs::rename(&temp_path, config_path).map_err(|e| format!("重命名主配置失败: {}", e))?;
+
+    // 4. 保存 routes
+    if let Some(routes) = &config.routes {
+        // 清理已删除的 route 文件
+        let routes_dir = data_path.join("routes");
+        cleanup_old_files(&routes_dir, routes, |r| &r.id)?;
+
+        for route in routes {
+            let file_name = format!("{}.yaml", sanitize_filename(&route.id));
+            let route_path = routes_dir.join(&file_name);
+            let route_yaml = serde_yaml::to_string(route)
+                .map_err(|e| format!("序列化 route {} 失败: {}", route.id, e))?;
+            fs::write(&route_path, &route_yaml)
+                .map_err(|e| format!("写入 route {} 失败: {}", route.id, e))?;
+        }
+    }
+
+    // 5. 保存 api_keys
+    if let Some(api_keys) = &config.api_keys {
+        // 清理已删除的 apikey 文件
+        let keys_dir = data_path.join("apikeys");
+        cleanup_old_files(&keys_dir, &api_keys.keys, |k| &k.id)?;
+
+        for key in &api_keys.keys {
+            let file_name = format!("{}.yaml", sanitize_filename(&key.id));
+            let key_path = keys_dir.join(&file_name);
+            let key_yaml = serde_yaml::to_string(key)
+                .map_err(|e| format!("序列化 apikey {} 失败: {}", key.id, e))?;
+            fs::write(&key_path, &key_yaml)
+                .map_err(|e| format!("写入 apikey {} 失败: {}", key.id, e))?;
+        }
+
+        // 6. 保存 ban_rules
+        let ban_rules_path = data_path.join("ban_rules.yaml");
+        let ban_config = BanRulesFileConfig {
+            rules: api_keys.ban_rules.clone(),
+        };
+        let ban_yaml = serde_yaml::to_string(&ban_config)
+            .map_err(|e| format!("序列化 ban_rules 失败: {}", e))?;
+        fs::write(&ban_rules_path, &ban_yaml)
+            .map_err(|e| format!("写入 ban_rules 失败: {}", e))?;
+    }
+
+    Ok(())
+}
+
 async fn admin_config_save_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -229,41 +369,22 @@ async fn admin_config_save_handler(
     };
 
     let runtime = state.runtime.load();
-    let yaml = match serde_yaml::to_string(runtime.config.as_ref()) {
-        Ok(yaml) => yaml,
-        Err(err) => {
-            error!(error = %err, "admin: failed to serialize config to YAML");
-            return json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("serialization_error: {err}"),
-            );
+
+    // 使用新的分散保存函数
+    match save_config_to_files(runtime.config.as_ref(), config_path) {
+        Ok(()) => {
+            info!(path = %config_path.display(), "admin: config saved to files");
+            json_ok(&serde_json::json!({
+                "status": "saved",
+                "path": config_path.display().to_string(),
+                "message": "Configuration saved to multiple files."
+            }))
         }
-    };
-
-    let temp_path = config_path.with_extension("yaml.tmp");
-    if let Err(err) = std::fs::write(&temp_path, &yaml) {
-        error!(error = %err, path = %temp_path.display(), "admin: failed to write temp config file");
-        return json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("write_error: {err}"),
-        );
+        Err(err) => {
+            error!(error = %err, "admin: failed to save config files");
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, &err)
+        }
     }
-    if let Err(err) = std::fs::rename(&temp_path, config_path) {
-        error!(error = %err, "admin: failed to rename temp config file");
-        let _ = std::fs::remove_file(&temp_path);
-        return json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("rename_error: {err}"),
-        );
-    }
-
-    info!(path = %config_path.display(), "admin: config saved to file");
-
-    json_ok(&serde_json::json!({
-        "status": "saved",
-        "path": config_path.display().to_string(),
-        "message": "Configuration persisted to YAML file."
-    }))
 }
 
 async fn admin_metrics_handler(
@@ -279,6 +400,8 @@ async fn admin_metrics_handler(
         let valid_route_ids: std::collections::HashSet<String> = runtime
             .config
             .routes
+            .as_deref()
+            .unwrap_or_default()
             .iter()
             .map(|r| r.id.clone())
             .collect();
@@ -518,9 +641,6 @@ fn admin_dashboard_html(prefix: &str) -> String {
 
 // ===== API Key 管理 API =====
 
-use axum::extract::Path;
-use serde::Serialize;
-
 /// API Key 列表响应
 #[derive(Debug, Serialize)]
 struct ApiKeyListResponse {
@@ -628,7 +748,7 @@ async fn admin_list_api_keys(
 async fn admin_ban_api_key(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(id): Path<String>,
+    AxumPath(id): AxumPath<String>,
     body: axum::body::Bytes,
 ) -> Response<Body> {
     if !is_admin_authorized(&state, &headers) {
@@ -671,7 +791,7 @@ async fn admin_ban_api_key(
 async fn admin_unban_api_key(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(id): Path<String>,
+    AxumPath(id): AxumPath<String>,
 ) -> Response<Body> {
     if !is_admin_authorized(&state, &headers) {
         return json_error(StatusCode::UNAUTHORIZED, "unauthorized");
@@ -701,7 +821,7 @@ async fn admin_unban_api_key(
 async fn admin_get_ban_logs(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(id): Path<String>,
+    AxumPath(id): AxumPath<String>,
     Query(query): Query<BanLogQuery>,
 ) -> Response<Body> {
     if !is_admin_authorized(&state, &headers) {

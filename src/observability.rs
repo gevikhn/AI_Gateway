@@ -17,7 +17,7 @@ use prometheus_client::metrics::histogram::{Histogram, exponential_buckets};
 use prometheus_client::registry::Registry;
 use serde::Serialize;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-use sqlx::{Pool, Row, Sqlite};
+use sqlx::{Pool, Sqlite};
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::Path;
@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio::time::interval;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 
@@ -496,13 +496,13 @@ pub struct TokenWindowSummary {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-struct RequestMinuteBucket {
+pub(crate) struct RequestMinuteBucket {
     minute_epoch: u64,
     requests: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-struct RouteMinuteBucket {
+pub(crate) struct RouteMinuteBucket {
     minute_epoch: u64,
     requests: u64,
     max_inflight: u64,
@@ -518,7 +518,7 @@ struct IPMinuteBucket {
 }
 
 #[derive(Debug, Default)]
-struct IPStats {
+pub(crate) struct IPStats {
     buckets: VecDeque<IPMinuteBucket>,
 }
 
@@ -1213,7 +1213,7 @@ fn is_valid_request_id(value: &str) -> bool {
 
 /// Metrics record for batch insertion
 #[derive(Debug, Clone)]
-struct MetricsRecord {
+pub(crate) struct MetricsRecord {
     timestamp: i64,
     route_id: String,
     method: String,
@@ -1232,7 +1232,7 @@ struct MetricsRecord {
 #[derive(Debug)]
 pub struct MetricsStorage {
     pool: Pool<Sqlite>,
-    config: MetricsSqliteConfig,
+    _config: MetricsSqliteConfig,
     sender: mpsc::UnboundedSender<MetricsRecord>,
 }
 
@@ -1282,7 +1282,7 @@ impl MetricsStorage {
 
         let storage = Self {
             pool,
-            config: config.clone(),
+            _config: config.clone(),
             sender,
         };
 
@@ -1352,12 +1352,12 @@ impl MetricsStorage {
     }
 
     /// Queue a record for batch insertion
-    pub fn queue_record(&self, record: MetricsRecord) {
+    pub(crate) fn queue_record(&self, record: MetricsRecord) {
         let _ = self.sender.send(record);
     }
 
     /// Load historical data from SQLite and return the data structures
-    pub async fn load_historical_data(
+    pub(crate) async fn load_historical_data(
         &self,
     ) -> Result<
         (
@@ -1528,13 +1528,13 @@ impl MetricsStorage {
              VALUES "
         );
 
-        let mut param_count = 0;
+        let mut _param_count = 0;
         for (i, _) in batch.iter().enumerate() {
             if i > 0 {
                 query_builder.push_str(", ");
             }
             query_builder.push_str("(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
-            param_count += 12;
+            _param_count += 12;
         }
 
         let mut query = sqlx::query(&query_builder);

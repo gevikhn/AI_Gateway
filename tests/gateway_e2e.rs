@@ -84,13 +84,14 @@ async fn route_specific_user_agent_is_applied_independently() {
     let (upstream_addr, upstream_handle) = spawn_router(upstream).await;
 
     let mut config = gateway_config(upstream_addr.to_string(), 2_000);
-    config.routes[0].upstream.user_agent = Some("Route-A-UA/1.0".to_string());
+    let routes = config.routes.as_mut().expect("routes should exist");
+    routes[0].upstream.user_agent = Some("Route-A-UA/1.0".to_string());
 
-    let mut route_b = config.routes[0].clone();
+    let mut route_b = routes[0].clone();
     route_b.id = "anthropic".to_string();
     route_b.prefix = "/claude".to_string();
     route_b.upstream.user_agent = Some("Route-B-UA/2.0".to_string());
-    config.routes.push(route_b);
+    routes.push(route_b);
 
     let app = build_test_app(config).await;
     let (gateway_addr, gateway_handle) = spawn_router(app).await;
@@ -332,21 +333,22 @@ async fn upstream_concurrency_limit_is_scoped_by_upstream_key() {
     let (upstream_addr, upstream_handle) = spawn_router(upstream).await;
 
     let mut config = gateway_config(upstream_addr.to_string(), 2_000);
-    config.routes[0].id = "openai-a".to_string();
-    config.routes[0].prefix = "/openai-a".to_string();
-    config.routes[0].upstream.inject_headers = vec![HeaderInjection {
+    let routes = config.routes.as_mut().expect("routes should exist");
+    routes[0].id = "openai-a".to_string();
+    routes[0].prefix = "/openai-a".to_string();
+    routes[0].upstream.inject_headers = vec![HeaderInjection {
         name: "x-api-key".to_string(),
         value: "key-a".to_string(),
     }];
 
-    let mut route_b = config.routes[0].clone();
+    let mut route_b = routes[0].clone();
     route_b.id = "openai-b".to_string();
     route_b.prefix = "/openai-b".to_string();
     route_b.upstream.inject_headers = vec![HeaderInjection {
         name: "x-api-key".to_string(),
         value: "key-b".to_string(),
     }];
-    config.routes.push(route_b);
+    routes.push(route_b);
 
     config.concurrency = Some(ConcurrencyConfig {
         downstream_max_inflight: None,
@@ -559,8 +561,9 @@ async fn http_proxy_with_auth_is_used_for_upstream() {
     let (proxy_addr, proxy_handle) = spawn_router(proxy_server).await;
 
     let mut config = gateway_config("proxy-target.local".to_string(), 2_000);
-    config.routes[0].upstream.base_url = "http://proxy-target.local".to_string();
-    config.routes[0].upstream.proxy = Some(UpstreamProxyConfig {
+    let routes = config.routes.as_mut().expect("routes should exist");
+    routes[0].upstream.base_url = "http://proxy-target.local".to_string();
+    routes[0].upstream.proxy = Some(UpstreamProxyConfig {
         protocol: ProxyProtocol::Http,
         address: proxy_addr.to_string(),
         username: Some("proxy-user".to_string()),
@@ -956,7 +959,8 @@ fn gateway_config(upstream_addr: String, request_timeout_ms: u64) -> AppConfig {
         gateway_auth: GatewayAuthConfig {
             token_sources: vec![TokenSourceConfig::AuthorizationBearer],
         },
-        routes: vec![RouteConfig {
+        data_dir: None,
+        routes: Some(vec![RouteConfig {
             id: "openai".to_string(),
             prefix: "/openai".to_string(),
             upstream: UpstreamConfig {
@@ -980,7 +984,7 @@ fn gateway_config(upstream_addr: String, request_timeout_ms: u64) -> AppConfig {
                 upstream_key_max_inflight: None,
                 user_agent: None,
             },
-        }],
+        }]),
         api_keys: Some(ApiKeysGlobalConfig {
             keys: vec![ApiKeyConfig {
                 id: "default".to_string(),

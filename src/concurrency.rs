@@ -50,6 +50,8 @@ impl ConcurrencyController {
             .and_then(|concurrency| concurrency.upstream_per_key_max_inflight);
         let has_route_override = config
             .routes
+            .as_deref()
+            .unwrap_or_default()
             .iter()
             .any(|route| route.upstream.upstream_key_max_inflight.is_some());
 
@@ -354,7 +356,7 @@ mod tests {
                 value: "key-a".to_string(),
             }],
         );
-        config.routes.push(RouteConfig {
+        config.routes.as_mut().unwrap().push(RouteConfig {
             id: "anthropic".to_string(),
             prefix: "/claude".to_string(),
             upstream: UpstreamConfig {
@@ -374,8 +376,9 @@ mod tests {
             },
         });
         let controller = ConcurrencyController::new(&config).expect("controller should exist");
-        let route_a = config.routes.remove(0);
-        let route_b = config.routes.remove(0);
+        let routes = config.routes.as_mut().unwrap();
+        let route_a = routes.remove(0);
+        let route_b = routes.remove(0);
 
         let first = controller
             .acquire_upstream(&route_a)
@@ -411,7 +414,7 @@ mod tests {
             }],
         );
         let controller = ConcurrencyController::new(&config).expect("controller should exist");
-        let route = config.routes.remove(0);
+        let route = config.routes.as_mut().unwrap().remove(0);
 
         let first = controller
             .acquire_upstream(&route)
@@ -485,7 +488,7 @@ mod tests {
         );
 
         let controller = ConcurrencyController::new(&config).expect("controller should exist");
-        let route = config.routes.remove(0);
+        let route = config.routes.as_mut().unwrap().remove(0);
 
         // api-key-1 有 1 个上游并发限制
         let first = controller
@@ -521,7 +524,7 @@ mod tests {
         );
 
         let controller = ConcurrencyController::new(&config).expect("controller should exist");
-        let route = config.routes.first().unwrap();
+        let route = config.routes.as_ref().unwrap().first().unwrap();
 
         // 测试 API Key 级别配置优先
         let resolved = controller.resolve_config(Some("api-key-1"), route);
@@ -545,7 +548,8 @@ mod tests {
             gateway_auth: GatewayAuthConfig {
                 token_sources: vec![TokenSourceConfig::AuthorizationBearer],
             },
-            routes: vec![RouteConfig {
+            data_dir: None,
+            routes: Some(vec![RouteConfig {
                 id: "openai".to_string(),
                 prefix: "/openai".to_string(),
                 upstream: UpstreamConfig {
@@ -560,7 +564,7 @@ mod tests {
                     upstream_key_max_inflight: route_upstream_limit,
                     user_agent: None,
                 },
-            }],
+            }]),
             api_keys: None,
             inbound_tls: None,
             cors: None,
@@ -601,7 +605,8 @@ mod tests {
             gateway_auth: GatewayAuthConfig {
                 token_sources: vec![TokenSourceConfig::AuthorizationBearer],
             },
-            routes: vec![RouteConfig {
+            data_dir: None,
+            routes: Some(vec![RouteConfig {
                 id: "openai".to_string(),
                 prefix: "/openai".to_string(),
                 upstream: UpstreamConfig {
@@ -616,7 +621,7 @@ mod tests {
                     upstream_key_max_inflight: None,
                     user_agent: None,
                 },
-            }],
+            }]),
             api_keys: Some(ApiKeysGlobalConfig {
                 keys: api_key_configs,
                 ban_rules: vec![],

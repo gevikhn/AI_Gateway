@@ -10,8 +10,15 @@ use std::path::Path;
 pub struct AppConfig {
     pub listen: String,
     pub gateway_auth: GatewayAuthConfig,
-    pub routes: Vec<RouteConfig>,
+    /// 数据目录路径，用于存放分散的配置文件（routes、apikeys、ban_rules）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_dir: Option<String>,
+    /// Route 配置列表
+    /// 当使用分散配置时，可以从 data/routes/ 目录加载
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routes: Option<Vec<RouteConfig>>,
     /// API Key 全局配置（独立管理）
+    /// 当使用分散配置时，可以从 data/apikeys/ 目录和 data/ban_rules.yaml 加载
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_keys: Option<ApiKeysGlobalConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -545,8 +552,59 @@ impl AppConfig {
         })
     }
     pub fn load_from_file(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
+        let path = path.as_ref();
         let raw = fs::read_to_string(path).map_err(ConfigError::Io)?;
-        Self::from_yaml_str(&raw)
+        let interpolated = interpolate_env_vars(&raw)?;
+        let mut config: Self = serde_yaml::from_str(&interpolated).map_err(ConfigError::Yaml)?;
+
+        // 确定 data 目录路径（相对于配置文件所在目录）
+        let base_dir = path.parent().unwrap_or(Path::new("."));
+        let data_dir = config.data_dir.as_deref().unwrap_or("./data");
+        let data_path = base_dir.join(data_dir);
+
+        // 如果主配置中没有 routes，尝试从 data/routes/ 目录加载
+        if config.routes.is_none() || config.routes.as_ref().map_or(true, |r| r.is_empty()) {
+            config.routes = Some(
+                load_routes_from_dir(&data_path).map_err(|e| {
+                    ConfigError::Validation(format!(
+                        "failed to load routes from '{}': {}",
+                        data_path.join("routes").display(),
+                        e
+                    ))
+                })?,
+            );
+        }
+
+        // 如果主配置中没有 api_keys，尝试从 data/apikeys/ 目录加载
+        if config.api_keys.is_none() {
+            config.api_keys = load_api_keys_from_dir(&data_path).map_err(|e| {
+                ConfigError::Validation(format!(
+                    "failed to load api_keys from '{}': {}",
+                    data_path.join("apikeys").display(),
+                    e
+                ))
+            })?;
+        } else if let Some(ref mut api_keys) = config.api_keys {
+            // 如果已有 api_keys 但没有 keys，尝试加载
+            if api_keys.keys.is_empty() {
+                if let Some(loaded) = load_api_keys_from_dir(&data_path).map_err(|e| {
+                    ConfigError::Validation(format!(
+                        "failed to load api_keys from '{}': {}",
+                        data_path.join("apikeys").display(),
+                        e
+                    ))
+                })? {
+                    api_keys.keys = loaded.keys;
+                    // ban_rules 可以从独立文件加载，也可以从主配置继承
+                    if api_keys.ban_rules.is_empty() {
+                        api_keys.ban_rules = loaded.ban_rules;
+                    }
+                }
+            }
+        }
+
+        config.validate()?;
+        Ok(config)
     }
 
     pub fn from_yaml_str(yaml: &str) -> Result<Self, ConfigError> {
@@ -628,7 +686,8 @@ impl AppConfig {
             }
         }
 
-        if self.routes.is_empty() {
+        let routes = self.routes.as_deref().unwrap_or_default();
+        if routes.is_empty() {
             return Err(ConfigError::Validation(
                 "`routes` must contain at least one route".to_string(),
             ));
@@ -638,7 +697,7 @@ impl AppConfig {
         let mut prefixes = HashSet::new();
         let mut has_route_upstream_key_concurrency = false;
 
-        for route in &self.routes {
+        for route in routes {
             if route.id.trim().is_empty() {
                 return Err(ConfigError::Validation(
                     "route `id` must not be empty".to_string(),
@@ -787,7 +846,7 @@ impl AppConfig {
         }
 
         if has_global_upstream_key_concurrency || has_route_upstream_key_concurrency {
-            for route in &self.routes {
+            for route in routes {
                 let route_uses_upstream_key_concurrency = has_global_upstream_key_concurrency
                     || route.upstream.upstream_key_max_inflight.is_some();
                 if !route_uses_upstream_key_concurrency {
@@ -1087,6 +1146,144 @@ fn route_has_upstream_key_injection(route: &RouteConfig) -> bool {
     })
 }
 
+/// 从 data/routes/ 目录加载所有 route 配置
+fn load_routes_from_dir(data_path: &Path) -> Result<Vec<RouteConfig>, ConfigError> {
+    let routes_dir = data_path.join("routes");
+    if !routes_dir.exists() {
+        return Ok(vec![]);
+    }
+
+    let mut routes = vec![];
+    for entry in fs::read_dir(&routes_dir).map_err(ConfigError::Io)? {
+        let entry = entry.map_err(ConfigError::Io)?;
+        let path = entry.path();
+        if path.extension().map_or(false, |e| e == "yaml" || e == "yml") {
+            let file_path = path.to_string_lossy().to_string();
+            let raw = fs::read_to_string(&path).map_err(|e| {
+                ConfigError::Validation(format!("failed to read route file '{}': {}", file_path, e))
+            })?;
+            let interpolated = interpolate_env_vars(&raw).map_err(|e| {
+                ConfigError::Validation(format!(
+                    "failed to interpolate env vars in route file '{}': {}",
+                    file_path, e
+                ))
+            })?;
+            match serde_yaml::from_str::<RouteConfig>(&interpolated) {
+                Ok(route) => routes.push(route),
+                Err(e) => {
+                    // 检查是否是缺少必需字段的错误
+                    let err_str = e.to_string();
+                    if err_str.contains("missing field") {
+                        // 跳过无效的路由文件，记录警告
+                        eprintln!(
+                            "warning: skipping invalid route file '{}': {}. \
+                             If this is not a route config, please move it to another directory.",
+                            file_path, e
+                        );
+                        continue;
+                    }
+                    return Err(ConfigError::Validation(format!(
+                        "failed to parse route file '{}': {}",
+                        file_path, e
+                    )));
+                }
+            }
+        }
+    }
+    Ok(routes)
+}
+
+/// Ban Rules 独立配置文件结构
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BanRulesFileConfig {
+    pub rules: Vec<BanRule>,
+}
+
+/// 从 data/apikeys/ 目录加载所有 apikey 配置
+fn load_api_keys_from_dir(
+    data_path: &Path,
+) -> Result<Option<ApiKeysGlobalConfig>, ConfigError> {
+    let keys_dir = data_path.join("apikeys");
+    if !keys_dir.exists() {
+        return Ok(None);
+    }
+
+    let mut keys = vec![];
+    for entry in fs::read_dir(&keys_dir).map_err(ConfigError::Io)? {
+        let entry = entry.map_err(ConfigError::Io)?;
+        let path = entry.path();
+        if path.extension().map_or(false, |e| e == "yaml" || e == "yml") {
+            let file_path = path.to_string_lossy().to_string();
+            let raw = fs::read_to_string(&path).map_err(|e| {
+                ConfigError::Validation(format!(
+                    "failed to read apikey file '{}': {}",
+                    file_path, e
+                ))
+            })?;
+            let interpolated = interpolate_env_vars(&raw).map_err(|e| {
+                ConfigError::Validation(format!(
+                    "failed to interpolate env vars in apikey file '{}': {}",
+                    file_path, e
+                ))
+            })?;
+            match serde_yaml::from_str::<ApiKeyConfig>(&interpolated) {
+                Ok(key) => keys.push(key),
+                Err(e) => {
+                    let err_str = e.to_string();
+                    if err_str.contains("missing field") {
+                        eprintln!(
+                            "warning: skipping invalid apikey file '{}': {}. \
+                             If this is not an apikey config, please move it to another directory.",
+                            file_path, e
+                        );
+                        continue;
+                    }
+                    return Err(ConfigError::Validation(format!(
+                        "failed to parse apikey file '{}': {}",
+                        file_path, e
+                    )));
+                }
+            }
+        }
+    }
+
+    // 加载 ban_rules
+    let ban_rules_path = data_path.join("ban_rules.yaml");
+    let ban_rules = if ban_rules_path.exists() {
+        let file_path = ban_rules_path.to_string_lossy().to_string();
+        let raw = fs::read_to_string(&ban_rules_path).map_err(|e| {
+            ConfigError::Validation(format!(
+                "failed to read ban_rules file '{}': {}",
+                file_path, e
+            ))
+        })?;
+        let interpolated = interpolate_env_vars(&raw).map_err(|e| {
+            ConfigError::Validation(format!(
+                "failed to interpolate env vars in ban_rules file '{}': {}",
+                file_path, e
+            ))
+        })?;
+        match serde_yaml::from_str::<BanRulesFileConfig>(&interpolated) {
+            Ok(ban_config) => ban_config.rules,
+            Err(e) => {
+                return Err(ConfigError::Validation(format!(
+                    "failed to parse ban_rules file '{}': {}. \
+                     Note: ban_rules.yaml must have a 'rules:' top-level field.",
+                    file_path, e
+                )));
+            }
+        }
+    } else {
+        vec![]
+    };
+
+    Ok(Some(ApiKeysGlobalConfig {
+        keys,
+        ban_rules,
+        sqlite: None, // sqlite 配置从主配置继承
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{AppConfig, LogFormat, LogRotation, ProxyProtocol};
@@ -1110,7 +1307,7 @@ routes:
 "#;
 
         let config = AppConfig::from_yaml_str(yaml).expect("config should parse");
-        assert_eq!(config.routes.len(), 1);
+        assert_eq!(config.routes.as_ref().map_or(0, |r| r.len()), 1);
         assert!(config.cors.is_none());
         assert!(config.rate_limit.is_none());
         assert!(config.concurrency.is_none());
@@ -1162,7 +1359,7 @@ routes:
 "#;
 
         let config = AppConfig::from_yaml_str(yaml).expect("config should parse");
-        let proxy = config.routes[0]
+        let proxy = config.routes.as_ref().unwrap()[0]
             .upstream
             .proxy
             .as_ref()
@@ -1325,7 +1522,7 @@ concurrency:
         let concurrency = config.concurrency.as_ref().expect("concurrency");
         assert_eq!(concurrency.downstream_max_inflight, Some(40));
         assert_eq!(concurrency.upstream_per_key_max_inflight, Some(8));
-        assert_eq!(config.routes[0].upstream.upstream_key_max_inflight, Some(3));
+        assert_eq!(config.routes.as_ref().unwrap()[0].upstream.upstream_key_max_inflight, Some(3));
     }
 
     #[test]
@@ -1644,6 +1841,36 @@ routes:
         // Should still be parseable after serialization
         let reparsed = AppConfig::from_yaml_str(&serialized).expect("should reparse");
         assert_eq!(reparsed.listen, config.listen);
-        assert_eq!(reparsed.routes.len(), config.routes.len());
+        assert_eq!(
+            reparsed.routes.as_ref().map_or(0, |r| r.len()),
+            config.routes.as_ref().map_or(0, |r| r.len())
+        );
+    }
+
+    #[test]
+    fn test_load_config_with_data_dir() {
+        // 使用测试配置文件测试分散配置加载
+        let config = AppConfig::load_from_file("config/test_unit.yaml");
+        assert!(config.is_ok(), "Failed to load config: {:?}", config.err());
+
+        let config = config.unwrap();
+        assert_eq!(config.listen, "127.0.0.1:8080");
+        assert_eq!(config.data_dir, Some("./data".to_string()));
+
+        // 验证 routes 从 data/routes/ 目录加载
+        let routes = config.routes.as_ref().expect("routes should be loaded");
+        assert!(!routes.is_empty(), "routes should not be empty");
+
+        // 查找存在的 route（deepseek 或 kimi）
+        let route = routes.iter().find(|r| r.id == "deepseek" || r.id == "kimi");
+        assert!(route.is_some(), "at least one route (deepseek or kimi) should exist");
+
+        // 验证 api_keys 从 data/apikeys/ 目录加载
+        let api_keys = config.api_keys.as_ref().expect("api_keys should be loaded");
+        assert!(!api_keys.keys.is_empty(), "api_keys should not be empty");
+
+        // 验证 ban_rules 从 data/ban_rules.yaml 加载（如果存在）
+        // 注意：如果 ban_rules.yaml 不存在或格式不正确，ban_rules 可能为空
+        println!("Loaded {} api keys and {} ban rules", api_keys.keys.len(), api_keys.ban_rules.len());
     }
 }

@@ -1,0 +1,14 @@
+id: key_1772505243012
+route_ids:
+  - kimi
+key: ${GW_APIKEY_KIMI}
+enabled: true
+rate_limit:
+  per_minute: 12
+ban_status:
+  is_banned: false
+  banned_at: null
+  banned_until: null
+  triggered_rule_id: null
+  reason: null
+  ban_count: 0

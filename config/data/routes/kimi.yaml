@@ -1,0 +1,19 @@
+id: kimi
+prefix: /kimi
+upstream:
+  base_url: https://api.kimi.com/coding/v1
+  strip_prefix: true
+  connect_timeout_ms: 10000
+  request_timeout_ms: 300000
+  inject_headers:
+    - name: x-api-key
+      value: ${KIMI_API_KEY}
+  remove_headers:
+    - Authorization
+    - X-Forwarded-For
+    - Forwarded
+    - Cf-Connecting-Ip
+    - True-Client-Ip
+    - x-api-key
+  upstream_key_max_inflight: 10
+  user_agent: claude-cli/2.1.63 (external, cli)

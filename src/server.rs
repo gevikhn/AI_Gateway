@@ -482,7 +482,7 @@ async fn proxy_handler(
     );
     let _span_entered = request_span.enter();
 
-    let Some(route) = proxy::match_route(&path, &runtime.config.routes) else {
+    let Some(route) = proxy::match_route(&path, runtime.config.routes.as_deref().unwrap_or_default()) else {
         tracing::Span::current().record("route_id", "__unmatched__");
         return finalize_observed_proxy_response(
             json_error(StatusCode::NOT_FOUND, "route_not_found"),
@@ -1510,8 +1510,9 @@ enum UpstreamError {
 }
 
 fn build_upstream_clients(config: &AppConfig) -> Result<HashMap<String, reqwest::Client>, String> {
-    let mut clients = HashMap::with_capacity(config.routes.len());
-    for route in &config.routes {
+    let routes = config.routes.as_deref().unwrap_or_default();
+    let mut clients = HashMap::with_capacity(routes.len());
+    for route in routes {
         let client = build_upstream_client(&route.upstream).map_err(|err| {
             format!(
                 "failed to build upstream client for route `{}`: {err}",
@@ -1740,7 +1741,7 @@ mod tests {
     #[test]
     fn build_upstream_clients_once_per_route() {
         let mut config = test_config();
-        config.routes.push(RouteConfig {
+        config.routes.as_mut().unwrap().push(RouteConfig {
             id: "anthropic".to_string(),
             prefix: "/claude".to_string(),
             upstream: UpstreamConfig {
@@ -1791,7 +1792,8 @@ mod tests {
             gateway_auth: GatewayAuthConfig {
                 token_sources: vec![TokenSourceConfig::AuthorizationBearer],
             },
-            routes: vec![RouteConfig {
+            data_dir: None,
+            routes: Some(vec![RouteConfig {
                 id: "openai".to_string(),
                 prefix: "/openai".to_string(),
                 upstream: UpstreamConfig {
@@ -1806,7 +1808,7 @@ mod tests {
                     upstream_key_max_inflight: None,
                     user_agent: None,
                 },
-            }],
+            }]),
             api_keys: None,
             inbound_tls: None,
             cors: None,

@@ -191,11 +191,6 @@ fn upsert_header(headers: &mut HeaderMap, injection: &HeaderInjection) -> Result
     Ok(())
 }
 
-fn remove_header_case_insensitive(headers: &mut HeaderMap, header_name: &str) {
-    if let Ok(name) = HeaderName::from_bytes(header_name.as_bytes()) {
-        headers.remove(name);
-    }
-}
 
 fn normalize_path(path: &str) -> String {
     if path.is_empty() {

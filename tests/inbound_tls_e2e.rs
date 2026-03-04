@@ -20,7 +20,8 @@ async fn https_listener_auto_generates_self_signed_cert() {
         gateway_auth: GatewayAuthConfig {
             token_sources: vec![TokenSourceConfig::AuthorizationBearer],
         },
-        routes: vec![RouteConfig {
+        data_dir: None,
+        routes: Some(vec![RouteConfig {
             id: "openai".to_string(),
             prefix: "/openai".to_string(),
             upstream: UpstreamConfig {
@@ -38,7 +39,7 @@ async fn https_listener_auto_generates_self_signed_cert() {
                 upstream_key_max_inflight: None,
                 user_agent: None,
             },
-        }],
+        }]),
         api_keys: Some(ApiKeysGlobalConfig {
             keys: vec![ApiKeyConfig {
                 id: "default".to_string(),

@@ -92,6 +92,82 @@ cargo zigbuild --release --target x86_64-unknown-linux-gnu
 
 项目内有示例配置：`config/dev.yaml`。你也可以自定义 `config.yaml`，运行时通过 `--config` 指定。
 
+#### 配置文件结构（v2.0+）
+
+从 v2.0 开始，配置文件采用分散结构，将路由、API Key 和封禁规则分离到独立文件中：
+
+```
+config/
+├── conf.yaml              # 主配置文件
+└── data/                  # 数据目录（路径可配置）
+    ├── apikeys/           # API Key 配置目录
+    │   ├── dev_key.yaml
+    │   └── prod_key.yaml
+    ├── routes/            # 路由配置目录
+    │   ├── openai.yaml
+    │   └── claude.yaml
+    └── ban_rules.yaml     # 封禁规则配置
+```
+
+**主配置文件示例：**
+
+```yaml
+listen: "127.0.0.1:8080"
+gateway_auth:
+  token_sources:
+    - type: "authorization_bearer"
+
+# 数据目录配置（相对于 conf.yaml 的路径）
+data_dir: "./data"
+
+# 其他基础配置...
+admin:
+  enabled: true
+  token: "${ADMIN_TOKEN}"
+```
+
+**路由配置** (`data/routes/{route_id}.yaml`)：
+
+```yaml
+id: "openai"
+prefix: "/openai"
+upstream:
+  base_url: "https://api.openai.com"
+  strip_prefix: true
+  inject_headers:
+    - name: "authorization"
+      value: "Bearer ${OPENAI_API_KEY}"
+```
+
+**API Key 配置** (`data/apikeys/{key_id}.yaml`)：
+
+```yaml
+id: "dev_key"
+key: "sk-openai-abc123..."
+enabled: true
+remark: "开发环境密钥"
+route_ids: ["openai"]
+rate_limit:
+  per_minute: 60
+```
+
+**封禁规则配置** (`data/ban_rules.yaml`)：
+
+```yaml
+rules:
+  - id: "rule_1"
+    name: "高错误率封禁"
+    condition:
+      type: "error_rate"
+      threshold: 0.5
+      window_secs: 300
+      min_requests: 10
+    ban_duration_secs: 3600
+    enabled: true
+```
+
+**向后兼容性**：如果主配置文件中仍然包含 `routes` 和 `api_keys` 字段，将优先使用内嵌配置（兼容旧格式）。
+
 Linux 也支持安装命令（需要 root）：
 
 ```bash
@@ -193,6 +269,8 @@ admin:
 - **API Key 管理**：查看、启用/禁用、删除 API Key，支持按路由、状态、关键词过滤
 - **封禁日志**：查看自动/手动封禁历史，支持手动解封
 - **实时编辑**：在线编辑 API Key 的限流、并发、封禁规则配置
+- **配置结构管理**：支持分散配置文件结构，自动保存到对应文件
+- **名称唯一性验证**：创建/编辑 Route 和 API Key 时自动检查名称是否重复
 
 访问地址：`http://127.0.0.1:8081/admin/ui`
 

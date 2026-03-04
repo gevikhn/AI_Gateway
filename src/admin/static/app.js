@@ -7,6 +7,33 @@ const CONFIG = {
   adminPrefix: window.CONFIG?.adminPrefix || '/admin'
 };
 
+/**
+ * 验证 route ID 是否已存在
+ * @param {string} id - 要验证的 ID
+ * @param {number} excludeIndex - 排除的索引（编辑时使用）
+ * @returns {boolean}
+ */
+function isRouteIdExists(id, excludeIndex = -1) {
+  if (!cfg?.routes) return false;
+  const routes = cfg.routes;
+  // 处理 routes 是数组的情况（新配置结构）
+  if (Array.isArray(routes)) {
+    return routes.some((r, idx) => r.id === id && idx !== excludeIndex);
+  }
+  return false;
+}
+
+/**
+ * 验证 apikey ID 是否已存在
+ * @param {string} id - 要验证的 ID
+ * @param {string} excludeId - 排除的 ID（编辑时使用）
+ * @returns {boolean}
+ */
+function isApiKeyIdExists(id, excludeId = null) {
+  if (!cfg?.api_keys?.keys) return false;
+  return cfg.api_keys.keys.some(k => k.id === id && k.id !== excludeId);
+}
+
 const TOKEN_KEY = 'ai_gateway_admin_token';
 let cfg = null;
 let metricsData = null;
@@ -1162,6 +1189,17 @@ function saveApiKeyV2(id) {
   const routeInput = document.getElementById('apikey-routes');
   const selectedRoutes = routeInput ? JSON.parse(routeInput.value || '[]') : [];
 
+  // 生成新的 ID
+  const newId = id || 'key_' + Date.now();
+
+  // 验证 apikey ID 唯一性
+  if (!id || newId !== id) {
+    if (isApiKeyIdExists(newId, id)) {
+      Toast.show(`API Key ID '${newId}' 已存在，请使用其他名称`, 'error');
+      return;
+    }
+  }
+
   // 查找路由名称
   const routeNames = selectedRoutes.map(r => {
     const rt = cfg?.routes?.find(rt => rt.id === r);
@@ -1170,7 +1208,7 @@ function saveApiKeyV2(id) {
 
   // 构建 API Key 数据对象
   const keyData = {
-    id: id || 'key_' + Date.now(),
+    id: newId,
     key: value || generateApiKey(selectedRoutes[0] || 'global'),
     route_ids: selectedRoutes,
     route_names: routeNames,
@@ -2098,6 +2136,17 @@ function routeDetailHtml(r, i) {
 }
 
 function updateRouteItemName(index, value) {
+  // 验证 route ID 唯一性
+  if (value && isRouteIdExists(value, index)) {
+    Toast.show(`路由 ID '${value}' 已存在，请使用其他名称`, 'error');
+    // 恢复原来的值
+    const input = document.querySelector(`.route-detail-body input[data-validate*="required"]`);
+    if (input) {
+      input.value = cfg.routes[index]?.id || '';
+    }
+    return;
+  }
+
   const item = document.querySelector(`.route-list-item[data-idx="${index}"] .route-item-name`);
   if (item) {
     item.textContent = value || '(未命名)';

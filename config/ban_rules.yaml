@@ -1,0 +1,11 @@
+rules:
+  - id: rule_1772507643678
+    name: 限流
+    condition:
+      type: request_count
+      window_secs: 60
+      max_requests: 120
+    ban_duration_secs: 600
+    enabled: true
+    trigger_count_threshold: 3
+    trigger_window_secs: 3600

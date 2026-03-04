@@ -15,29 +15,54 @@ const INSTALL_BIN_PATH: &str = "/usr/local/bin/ai-gw-lite";
 const DEFAULT_CONFIG_TEMPLATE: &str = r#"listen: "0.0.0.0:8080"
 
 gateway_auth:
-  tokens:
-    - "${GW_TOKEN}"
   token_sources:
     - type: "authorization_bearer"
 
-routes:
-  - id: "openai"
-    prefix: "/openai"
-    upstream:
-      base_url: "https://api.openai.com"
-      strip_prefix: true
-      connect_timeout_ms: 10000
-      request_timeout_ms: 60000
-      inject_headers:
-        - name: "authorization"
-          value: "Bearer ${OPENAI_API_KEY}"
-      remove_headers:
-        - "authorization"
-        - "x-forwarded-for"
-        - "forwarded"
-        - "cf-connecting-ip"
-        - "true-client-ip"
-      forward_xff: false
+# 数据目录配置（相对于 conf.yaml 的路径）
+# 路由、API Key 和封禁规则将从此目录加载
+data_dir: "./data"
+
+# CORS 配置
+cors:
+  enabled: false
+  allow_origins: []
+  allow_headers: []
+  allow_methods: []
+  expose_headers: []
+
+# 限流配置
+rate_limit:
+  per_minute: 120
+
+# 并发控制配置
+concurrency:
+  downstream_max_inflight: 100
+  upstream_per_key_max_inflight: 8
+
+# 可观测性配置
+observability:
+  logging:
+    level: "info"
+    format: "json"
+    to_stdout: true
+    file:
+      enabled: true
+      dir: "./logs"
+      prefix: "ai-gw-lite"
+      rotation: "daily"
+      max_files: 7
+  metrics:
+    enabled: true
+    path: "/metrics"
+    token: "${GW_METRICS_TOKEN}"
+  tracing:
+    enabled: false
+    sample_ratio: 0.05
+
+# Admin 管理界面配置
+admin:
+  enabled: true
+  token: "${ADMIN_TOKEN}"
 "#;
 
 #[derive(Debug, Clone)]
@@ -162,7 +187,10 @@ fn run_install_linux() -> Result<InstallReport, InstallError> {
         true
     };
 
-    // 3. 获取当前可执行文件路径并复制到安装位置
+    // 3. 创建 data 目录结构和示例配置文件
+    create_data_dir_structure(config_dir)?;
+
+    // 4. 获取当前可执行文件路径并复制到安装位置
     let current_exe = std::env::current_exe().map_err(InstallError::CurrentExe)?;
     let exe_path =
         fs::canonicalize(&current_exe).map_err(|source| InstallError::CanonicalizeExe {
@@ -227,6 +255,94 @@ fn run_install_linux() -> Result<InstallReport, InstallError> {
         service_was_running,
         bin_updated,
     })
+}
+
+#[cfg(target_os = "linux")]
+fn create_data_dir_structure(config_dir: &std::path::Path) -> Result<(), InstallError> {
+    use std::fs;
+
+    let data_dir = config_dir.join("data");
+    let routes_dir = data_dir.join("routes");
+    let apikeys_dir = data_dir.join("apikeys");
+
+    // 创建目录结构
+    fs::create_dir_all(&routes_dir).map_err(|source| InstallError::Io {
+        path: routes_dir.clone(),
+        source,
+    })?;
+    fs::create_dir_all(&apikeys_dir).map_err(|source| InstallError::Io {
+        path: apikeys_dir.clone(),
+        source,
+    })?;
+
+    // 创建示例路由配置（如果不存在）
+    let example_route_path = routes_dir.join("openai.yaml");
+    if !example_route_path.exists() {
+        let route_template = r#"id: "openai"
+prefix: "/openai"
+upstream:
+  base_url: "https://api.openai.com"
+  strip_prefix: true
+  connect_timeout_ms: 10000
+  request_timeout_ms: 60000
+  inject_headers:
+    - name: "authorization"
+      value: "Bearer ${OPENAI_API_KEY}"
+  remove_headers:
+    - "authorization"
+    - "x-forwarded-for"
+    - "forwarded"
+    - "cf-connecting-ip"
+    - "true-client-ip"
+  forward_xff: false
+"#;
+        fs::write(&example_route_path, route_template).map_err(|source| InstallError::Io {
+            path: example_route_path,
+            source,
+        })?;
+    }
+
+    // 创建示例 API Key 配置（如果不存在）
+    let example_key_path = apikeys_dir.join("default.yaml");
+    if !example_key_path.exists() {
+        let key_template = r#"id: "default"
+key: "${GW_TOKEN}"
+enabled: true
+remark: "默认 API Key"
+route_ids:
+  - "openai"
+rate_limit:
+  per_minute: 60
+"#;
+        fs::write(&example_key_path, key_template).map_err(|source| InstallError::Io {
+            path: example_key_path,
+            source,
+        })?;
+    }
+
+    // 创建示例 ban_rules 配置（如果不存在）
+    let ban_rules_path = data_dir.join("ban_rules.yaml");
+    if !ban_rules_path.exists() {
+        let ban_rules_template = r#"rules:
+  - id: "rule_1"
+    name: "高错误率封禁"
+    condition:
+      type: "error_rate"
+      window_secs: 300
+      threshold: 0.5
+      min_requests: 10
+    ban_duration_secs: 3600
+    enabled: true
+    trigger_count_threshold: 3
+    trigger_window_secs: 3600
+"#;
+        fs::write(&ban_rules_path, ban_rules_template).map_err(|source| InstallError::Io {
+            path: ban_rules_path,
+            source,
+        })?;
+    }
+
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]

@@ -1,0 +1,14 @@
+listen: "127.0.0.1:8080"
+gateway_auth:
+  token_sources:
+    - type: "authorization_bearer"
+
+# 数据目录配置
+data_dir: "./data"
+
+cors:
+  enabled: false
+
+admin:
+  enabled: true
+  token: "admin_test_token"
