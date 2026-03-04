@@ -1,4 +1,5 @@
 use crate::config::RateLimitConfig;
+use dashmap::DashMap;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -12,15 +13,15 @@ pub enum RateLimitDecision {
 pub struct RateLimiterManager {
     /// 全局默认限流配置
     global_config: Option<RateLimitConfig>,
-    /// API Key 级别的限流器
-    key_limiters: Mutex<HashMap<String, RateLimiter>>,
+    /// API Key 级别的限流器，使用 DashMap 实现细粒度锁
+    key_limiters: DashMap<String, RateLimiter>,
 }
 
 impl RateLimiterManager {
     pub fn new(global_config: Option<RateLimitConfig>) -> Self {
         Self {
             global_config,
-            key_limiters: Mutex::new(HashMap::new()),
+            key_limiters: DashMap::new(),
         }
     }
 
@@ -46,18 +47,15 @@ impl RateLimiterManager {
             return RateLimitDecision::Allowed;
         };
 
-        let mut limiters = self.key_limiters.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        let limiter = limiters
-            .entry(api_key.to_string())
-            .or_insert_with(|| RateLimiter::new(config.per_minute));
+        let entry = self.key_limiters.entry(api_key.to_string());
+        let mut limiter_ref = entry.or_insert_with(|| RateLimiter::new(config.per_minute));
 
         // 如果配置变更，更新限流器的限制
-        if limiter.per_minute != config.per_minute {
-            limiter.update_limit(config.per_minute);
+        if limiter_ref.per_minute != config.per_minute {
+            limiter_ref.update_limit(config.per_minute);
         }
 
-        limiter.check_internal(current_epoch_seconds())
+        limiter_ref.check_internal(current_epoch_seconds())
     }
 
     /// 获取或创建限流器（用于向后兼容）
@@ -66,9 +64,7 @@ impl RateLimiterManager {
         api_key: &str,
         per_minute: u64,
     ) -> RateLimiter {
-        let mut limiters = self.key_limiters.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        limiters
+        self.key_limiters
             .entry(api_key.to_string())
             .or_insert_with(|| RateLimiter::new(per_minute))
             .clone_for_key(api_key)
@@ -309,7 +305,6 @@ mod tests {
     #[test]
     fn backward_compatible_check() {
         let limiter = RateLimiter::new(2);
-        let now = 1_700_000_040;
 
         // 测试旧的 check 方法
         assert!(matches!(
@@ -322,6 +317,28 @@ mod tests {
         ));
         assert!(matches!(
             limiter.check("gw_token", "openai"),
+            RateLimitDecision::Rejected { .. }
+        ));
+    }
+
+    #[test]
+    fn api_key_rate_limit_is_global_across_routes() {
+        // 测试 API Key 级别的限流应该跨路由共享计数器
+        // 这是 manager.rs 中使用 "global" 作为固定 route_id 的行为
+        let limiter = RateLimiter::new(2);
+
+        // 使用 "global" 作为 key（模拟 manager.rs 的修复后行为）
+        assert!(matches!(
+            limiter.check("api_key_1", "global"),
+            RateLimitDecision::Allowed
+        ));
+        assert!(matches!(
+            limiter.check("api_key_1", "global"),
+            RateLimitDecision::Allowed
+        ));
+        // 第三次应该被拒绝
+        assert!(matches!(
+            limiter.check("api_key_1", "global"),
             RateLimitDecision::Rejected { .. }
         ));
     }

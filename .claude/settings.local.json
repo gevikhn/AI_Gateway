@@ -9,7 +9,8 @@
       "Bash(cargo check:*)",
       "Bash(cargo run:*)",
       "Bash(node:*)",
-      "Bash(grep:*)"
+      "Bash(grep:*)",
+      "Bash(git add:*)"
     ]
   }
 }

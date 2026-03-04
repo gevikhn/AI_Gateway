@@ -265,6 +265,7 @@ function checkAuth() {
 const TABS = [
   { id: 'routes', label: '路由配置' },
   { id: 'apikeys', label: 'API Keys' },
+  { id: 'tokenstats', label: 'Token统计' },
   { id: 'banrules', label: '封禁规则' },
   { id: 'banlogs', label: '封禁日志' },
   { id: 'metrics', label: '监控' },
@@ -306,6 +307,9 @@ function loadApiKeysFromConfig() {
     // 封禁状态处理
     const banStatus = keyConfig.ban_status || {};
 
+    // Token配额配置
+    const tokenQuota = keyConfig.token_quota || {};
+
     return {
       id: keyConfig.id,
       key: keyConfig.key,
@@ -328,6 +332,15 @@ function loadApiKeysFromConfig() {
       },
       // 封禁规则（新结构）
       ban_rules: keyConfig.ban_rules || [],
+      // Token配额配置
+      token_quota: {
+        daily_total_limit: tokenQuota.daily_total_limit || null,
+        daily_input_limit: tokenQuota.daily_input_limit || null,
+        daily_output_limit: tokenQuota.daily_output_limit || null,
+        weekly_total_limit: tokenQuota.weekly_total_limit || null,
+        weekly_input_limit: tokenQuota.weekly_input_limit || null,
+        weekly_output_limit: tokenQuota.weekly_output_limit || null
+      },
       created_at: keyConfig.created_at || new Date().toISOString(),
       updated_at: keyConfig.updated_at || new Date().toISOString()
     };
@@ -338,6 +351,12 @@ function loadApiKeysFromConfig() {
 function convertApiKeyToConfig(apiKey) {
   // 支持多路由：route_ids 数组
   const routeIds = apiKey.route_ids?.length > 0 ? apiKey.route_ids : null;
+
+  // 处理Token配额配置
+  const tokenQuota = apiKey.token_quota || {};
+  const hasTokenQuota = tokenQuota.daily_total_limit || tokenQuota.daily_input_limit ||
+                        tokenQuota.daily_output_limit || tokenQuota.weekly_total_limit ||
+                        tokenQuota.weekly_input_limit || tokenQuota.weekly_output_limit;
 
   return {
     id: apiKey.id,
@@ -351,7 +370,15 @@ function convertApiKeyToConfig(apiKey) {
     ban_status: apiKey.ban_status || {
       is_banned: false,
       ban_count: 0
-    }
+    },
+    token_quota: hasTokenQuota ? {
+      daily_total_limit: tokenQuota.daily_total_limit || null,
+      daily_input_limit: tokenQuota.daily_input_limit || null,
+      daily_output_limit: tokenQuota.daily_output_limit || null,
+      weekly_total_limit: tokenQuota.weekly_total_limit || null,
+      weekly_input_limit: tokenQuota.weekly_input_limit || null,
+      weekly_output_limit: tokenQuota.weekly_output_limit || null
+    } : null
   };
 }
 
@@ -479,6 +506,8 @@ async function loadApiKeys() {
         // 保留配置中的其他字段
         per_minute: serverKey.per_minute || configKey?.per_minute || 120,
         max_inflight: serverKey.max_inflight || configKey?.max_inflight || null,
+        // 保留 Token 配额配置
+        token_quota: serverKey.token_quota || configKey?.token_quota || null,
         created_at: serverKey.created_at || configKey?.created_at || new Date().toISOString(),
         updated_at: serverKey.updated_at || configKey?.updated_at || new Date().toISOString()
       };
@@ -543,6 +572,9 @@ async function switchTab(id) {
   } else if (id === 'banlogs') {
     await loadBanLogs();
     renderBanLogs();
+  } else if (id === 'tokenstats') {
+    await loadTokenStats();
+    renderTokenStats();
   }
 }
 
@@ -598,6 +630,7 @@ function renderAll() {
   renderMetrics();
   renderGateway();
   renderAdvanced();
+  renderTokenStats();
 }
 
 // -- API Keys 管理页面 --
@@ -1080,6 +1113,50 @@ function openApiKeyModal(id) {
             </div>
           </div>
 
+          <div class="form-section">
+            <h4 class="section-title">Token 配额配置</h4>
+            <div class="form-row">
+              <div class="field">
+                <label class="field-label">每日 Token 上限（总数）</label>
+                <input type="number" class="input" id="apikey-daily-total-limit" value="${key?.token_quota?.daily_total_limit || ''}"
+                       min="0" placeholder="无限制">
+                <div class="field-help">每日允许使用的最大 Token 总数（input + output）</div>
+              </div>
+              <div class="field">
+                <label class="field-label">每日 Input Token 上限</label>
+                <input type="number" class="input" id="apikey-daily-input-limit" value="${key?.token_quota?.daily_input_limit || ''}"
+                       min="0" placeholder="无限制">
+                <div class="field-help">每日允许使用的最大 Input Token 数</div>
+              </div>
+            </div>
+            <div class="form-row">
+              <div class="field">
+                <label class="field-label">每日 Output Token 上限</label>
+                <input type="number" class="input" id="apikey-daily-output-limit" value="${key?.token_quota?.daily_output_limit || ''}"
+                       min="0" placeholder="无限制">
+                <div class="field-help">每日允许使用的最大 Output Token 数</div>
+              </div>
+              <div class="field">
+                <label class="field-label">每周 Token 上限（总数）</label>
+                <input type="number" class="input" id="apikey-weekly-total-limit" value="${key?.token_quota?.weekly_total_limit || ''}"
+                       min="0" placeholder="无限制">
+                <div class="field-help">每周允许使用的最大 Token 总数</div>
+              </div>
+            </div>
+            <div class="form-row">
+              <div class="field">
+                <label class="field-label">每周 Input Token 上限</label>
+                <input type="number" class="input" id="apikey-weekly-input-limit" value="${key?.token_quota?.weekly_input_limit || ''}"
+                       min="0" placeholder="无限制">
+              </div>
+              <div class="field">
+                <label class="field-label">每周 Output Token 上限</label>
+                <input type="number" class="input" id="apikey-weekly-output-limit" value="${key?.token_quota?.weekly_output_limit || ''}"
+                       min="0" placeholder="无限制">
+              </div>
+            </div>
+          </div>
+
           <div class="form-section info-section">
             <div class="info-box">
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -1185,6 +1262,14 @@ function saveApiKeyV2(id) {
   const perMinute = parseInt(document.getElementById('apikey-per-minute').value) || 120;
   const maxInflight = parseInt(document.getElementById('apikey-max-inflight').value) || null;
 
+  // Token配额配置
+  const dailyTotalLimit = parseInt(document.getElementById('apikey-daily-total-limit')?.value) || null;
+  const dailyInputLimit = parseInt(document.getElementById('apikey-daily-input-limit')?.value) || null;
+  const dailyOutputLimit = parseInt(document.getElementById('apikey-daily-output-limit')?.value) || null;
+  const weeklyTotalLimit = parseInt(document.getElementById('apikey-weekly-total-limit')?.value) || null;
+  const weeklyInputLimit = parseInt(document.getElementById('apikey-weekly-input-limit')?.value) || null;
+  const weeklyOutputLimit = parseInt(document.getElementById('apikey-weekly-output-limit')?.value) || null;
+
   // 收集选中的路由（支持多路由）
   const routeInput = document.getElementById('apikey-routes');
   const selectedRoutes = routeInput ? JSON.parse(routeInput.value || '[]') : [];
@@ -1206,6 +1291,15 @@ function saveApiKeyV2(id) {
     return rt ? (rt.name || rt.id) : r;
   });
 
+  // 构建 Token 配额对象
+  const tokenQuota = {};
+  if (dailyTotalLimit) tokenQuota.daily_total_limit = dailyTotalLimit;
+  if (dailyInputLimit) tokenQuota.daily_input_limit = dailyInputLimit;
+  if (dailyOutputLimit) tokenQuota.daily_output_limit = dailyOutputLimit;
+  if (weeklyTotalLimit) tokenQuota.weekly_total_limit = weeklyTotalLimit;
+  if (weeklyInputLimit) tokenQuota.weekly_input_limit = weeklyInputLimit;
+  if (weeklyOutputLimit) tokenQuota.weekly_output_limit = weeklyOutputLimit;
+
   // 构建 API Key 数据对象
   const keyData = {
     id: newId,
@@ -1224,6 +1318,7 @@ function saveApiKeyV2(id) {
       reason: null,
       ban_count: 0
     },
+    token_quota: Object.keys(tokenQuota).length > 0 ? tokenQuota : null,
     updated_at: new Date().toISOString()
   };
 
@@ -2246,6 +2341,7 @@ function renderGateway() {
   const corsHtml = renderGatewayCorsSection();
   const rateLimitHtml = renderGatewayRateLimitSection();
   const concurrencyHtml = renderGatewayConcurrencySection();
+  const tokenStatsHtml = renderGatewayTokenStatsSection();
 
   panel.innerHTML = `
     <div class="gateway-config-layout">
@@ -2279,6 +2375,13 @@ function renderGateway() {
             </svg>
             并发控制
           </a>
+          <a href="#section-tokenstats" class="gateway-nav-item" data-section="tokenstats">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="12" cy="12" r="10"/>
+              <path d="M12 6v6l4 2"/>
+            </svg>
+            Token统计
+          </a>
         </nav>
       </aside>
 
@@ -2299,6 +2402,10 @@ function renderGateway() {
         <div id="section-concurrency" class="config-section">
           <h3 class="section-title">并发控制配置</h3>
           ${concurrencyHtml}
+        </div>
+        <div id="section-tokenstats" class="config-section">
+          <h3 class="section-title">Token统计配置</h3>
+          ${tokenStatsHtml}
         </div>
       </div>
     </div>
@@ -2453,6 +2560,71 @@ function renderGatewayConcurrencySection() {
   `;
 }
 
+function renderGatewayTokenStatsSection() {
+  const ts = cfg.token_stats;
+  const enabled = !!(ts && ts.enabled);
+  const sqlite = ts ? ts.sqlite : null;
+
+  return `
+    <div class="field">
+      <label class="toggle">
+        <input type="checkbox" class="toggle-input" ${enabled ? 'checked' : ''} onchange="toggleTokenStats(this.checked)" />
+        <span class="toggle-slider" aria-hidden="true"></span>
+        <span class="toggle-label">启用Token统计</span>
+      </label>
+      <div class="field-help">启用后会统计每个API Key和路由的Token使用量，支持配额限制</div>
+    </div>
+    <div class="field">
+      <label class="field-label">SQLite数据库路径</label>
+      <input class="input" type="text" value="${sqlite ? sqlite.path : './data/token_stats.db'}" placeholder="./data/token_stats.db" ${enabled ? '' : 'disabled'} onchange="updateTokenStatsSqlitePath(this.value)" />
+      <div class="field-help">Token统计数据存储的SQLite数据库文件路径</div>
+    </div>
+    <div class="field">
+      <label class="field-label">批量写入间隔（秒）</label>
+      <input class="input" type="number" value="${sqlite ? sqlite.flush_interval_secs : 60}" placeholder="60" min="1" ${enabled ? '' : 'disabled'} onchange="updateTokenStatsFlushInterval(+this.value)" />
+      <div class="field-help">数据写入数据库的间隔时间（秒）</div>
+    </div>
+    <div class="field">
+      <label class="field-label">批量大小</label>
+      <input class="input" type="number" value="${sqlite ? sqlite.batch_size : 1000}" placeholder="1000" min="1" ${enabled ? '' : 'disabled'} onchange="updateTokenStatsBatchSize(+this.value)" />
+      <div class="field-help">每次批量写入的记录数</div>
+    </div>
+  `;
+}
+
+function toggleTokenStats(enabled) {
+  if (enabled) {
+    cfg.token_stats = {
+      enabled: true,
+      sqlite: {
+        path: './data/token_stats.db',
+        flush_interval_secs: 60,
+        batch_size: 1000
+      }
+    };
+  } else {
+    cfg.token_stats = null;
+  }
+  renderGateway();
+}
+
+function updateTokenStatsSqlitePath(path) {
+  if (cfg.token_stats && cfg.token_stats.sqlite) {
+    cfg.token_stats.sqlite.path = path;
+  }
+}
+
+function updateTokenStatsFlushInterval(value) {
+  if (cfg.token_stats && cfg.token_stats.sqlite) {
+    cfg.token_stats.sqlite.flush_interval_secs = value;
+  }
+}
+
+function updateTokenStatsBatchSize(value) {
+  if (cfg.token_stats && cfg.token_stats.sqlite) {
+    cfg.token_stats.sqlite.batch_size = value;
+  }
+}
 
 function toggleRateLimit(enabled) {
   if (enabled) {
@@ -3151,12 +3323,6 @@ function initCharts(routeData, tokenData) {
   }
 }
 
-function formatNumber(n) {
-  if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
-  if (n >= 1000) return (n / 1000).toFixed(1) + 'K';
-  return n.toString();
-}
-
 // ===== 初始化 =====
 document.addEventListener('DOMContentLoaded', async () => {
   // 检查登录状态
@@ -3459,3 +3625,1238 @@ window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', (e)
 
 // 页面加载时初始化主题
 document.addEventListener('DOMContentLoaded', initTheme);
+
+// ===== Token 统计管理 =====
+let tokenStatsData = {
+  summary: null,
+  apiKeys: [],
+  routes: []
+};
+let tokenStatsFilter = {
+  window: 'day', // day, week, month
+  apiKey: '',
+  route: ''
+};
+
+// 从服务器加载 Token 统计数据
+async function loadTokenStats() {
+  const token = getToken();
+  if (!token) return null;
+
+  const prefix = window.CONFIG?.adminPrefix || '/admin';
+
+  try {
+    // 加载汇总数据
+    const summaryUrl = `${prefix}/api/token-stats/summary?window=${tokenStatsFilter.window}`;
+    const summaryResponse = await fetch(summaryUrl, {
+      headers: { 'Authorization': `Bearer ${token}` }
+    });
+
+    if (!summaryResponse.ok) {
+      if (summaryResponse.status === 401) {
+        logout();
+        return null;
+      }
+      throw new Error(`HTTP ${summaryResponse.status}`);
+    }
+
+    const summaryData = await summaryResponse.json();
+    tokenStatsData.summary = summaryData;
+    tokenStatsData.apiKeys = summaryData.api_keys || [];
+    tokenStatsData.routes = summaryData.routes || [];
+
+    return tokenStatsData;
+  } catch (err) {
+    console.error('Failed to load token stats:', err);
+    return null;
+  }
+}
+
+// 加载单个 API Key 的 Token 统计详情
+async function loadApiKeyTokenStats(apiKeyId) {
+  const token = getToken();
+  if (!token) return null;
+
+  const prefix = window.CONFIG?.adminPrefix || '/admin';
+  const url = `${prefix}/api/token-stats/keys/${apiKeyId}?window=${tokenStatsFilter.window}`;
+
+  try {
+    const response = await fetch(url, {
+      headers: { 'Authorization': `Bearer ${token}` }
+    });
+
+    if (!response.ok) {
+      if (response.status === 401) {
+        logout();
+        return null;
+      }
+      throw new Error(`HTTP ${response.status}`);
+    }
+
+    return await response.json();
+  } catch (err) {
+    console.error('Failed to load API Key token stats:', err);
+    return null;
+  }
+}
+
+// 加载单个 Route 的 Token 统计详情
+async function loadRouteTokenStats(routeId) {
+  const token = getToken();
+  if (!token) return null;
+
+  const prefix = window.CONFIG?.adminPrefix || '/admin';
+  const url = `${prefix}/api/token-stats/routes/${routeId}?window=${tokenStatsFilter.window}`;
+
+  try {
+    const response = await fetch(url, {
+      headers: { 'Authorization': `Bearer ${token}` }
+    });
+
+    if (!response.ok) {
+      if (response.status === 401) {
+        logout();
+        return null;
+      }
+      throw new Error(`HTTP ${response.status}`);
+    }
+
+    return await response.json();
+  } catch (err) {
+    console.error('Failed to load Route token stats:', err);
+    return null;
+  }
+}
+
+// Token 统计图表实例
+let tokenTrendChart = null;
+let tokenDistributionChart = null;
+let tokenRatioChart = null;
+
+// 表格排序状态
+let apiKeySortState = { column: 'totalTokens', order: 'desc' };
+let routeSortState = { column: 'totalTokens', order: 'desc' };
+
+// 渲染 Token 统计页面
+function renderTokenStats() {
+  const panel = document.getElementById('tab-tokenstats');
+  if (!panel) return;
+
+  const hasData = tokenStatsData.summary && (tokenStatsData.apiKeys.length > 0 || tokenStatsData.routes.length > 0);
+
+  const windowLabels = {
+    day: '今日',
+    week: '本周',
+    month: '本月'
+  };
+
+  panel.innerHTML = `
+    ${!hasData ? `
+      <div class="metrics-header">
+        <div class="metrics-title">
+          <h2>Token 统计</h2>
+        </div>
+        <div style="display: flex; gap: var(--space-3);">
+          <select class="input select" id="token-stats-window" onchange="changeTokenStatsWindow(this.value)">
+            <option value="day" ${tokenStatsFilter.window === 'day' ? 'selected' : ''}>今日</option>
+            <option value="week" ${tokenStatsFilter.window === 'week' ? 'selected' : ''}>本周</option>
+            <option value="month" ${tokenStatsFilter.window === 'month' ? 'selected' : ''}>本月</option>
+          </select>
+          <button class="btn btn-primary btn-sm" onclick="refreshTokenStats()">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/>
+              <path d="M3 3v5h5"/>
+              <path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/>
+              <path d="M16 21h5v-5"/>
+            </svg>
+            刷新
+          </button>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-body">
+          <div class="empty-state">
+            <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+              <circle cx="12" cy="12" r="10"/>
+              <path d="M12 6v6l4 2"/>
+            </svg>
+            <p>暂无 Token 统计数据</p>
+            <p class="text-secondary">请确保已启用 Token 统计功能并已有请求记录</p>
+          </div>
+        </div>
+      </div>
+    ` : `
+      <!-- 页面头部 -->
+      <div class="metrics-header">
+        <div class="metrics-title">
+          <h2>Token 统计</h2>
+          <span class="metrics-time">${windowLabels[tokenStatsFilter.window]}数据</span>
+        </div>
+        <div style="display: flex; gap: var(--space-3);">
+          <select class="input select" id="token-stats-window" onchange="changeTokenStatsWindow(this.value)">
+            <option value="day" ${tokenStatsFilter.window === 'day' ? 'selected' : ''}>今日</option>
+            <option value="week" ${tokenStatsFilter.window === 'week' ? 'selected' : ''}>本周</option>
+            <option value="month" ${tokenStatsFilter.window === 'month' ? 'selected' : ''}>本月</option>
+          </select>
+          <button class="btn btn-primary btn-sm" onclick="refreshTokenStats()">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/>
+              <path d="M3 3v5h5"/>
+              <path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/>
+              <path d="M16 21h5v-5"/>
+            </svg>
+            刷新
+          </button>
+        </div>
+      </div>
+
+      <!-- 图表区域 -->
+      <div class="token-stats-charts">
+        <div class="chart-container">
+          <h3 class="chart-title">Token 使用趋势</h3>
+          <canvas id="tokenTrendChart"></canvas>
+        </div>
+        <div class="chart-container">
+          <h3 class="chart-title">API Key 分布</h3>
+          <canvas id="tokenDistributionChart"></canvas>
+        </div>
+      </div>
+
+      <!-- 总览卡片 -->
+      ${renderTokenStatsOverview()}
+
+      <!-- API Key 统计 -->
+      <div class="metrics-section">
+        <div class="token-stats-section-header">
+          <h3>API Key 统计</h3>
+          <span class="token-stats-count">共 ${tokenStatsData.apiKeys.length} 个</span>
+        </div>
+        <div class="metrics-table-wrapper">
+          ${renderApiKeyTokenStatsTable()}
+        </div>
+      </div>
+
+      <!-- Route 统计 -->
+      <div class="metrics-section">
+        <div class="token-stats-section-header">
+          <h3>路由统计</h3>
+          <span class="token-stats-count">共 ${tokenStatsData.routes.length} 个</span>
+        </div>
+        <div class="metrics-table-wrapper">
+          ${renderRouteTokenStatsTable()}
+        </div>
+      </div>
+    `}
+  `;
+
+  // 如果有数据，渲染图表
+  if (hasData) {
+    initTokenStatsCharts();
+  }
+}
+
+// 渲染 Token 统计概览 - 使用监控页面 metrics-cards 风格
+function renderTokenStatsOverview() {
+  const apiKeys = tokenStatsData.apiKeys;
+  const routes = tokenStatsData.routes;
+
+  // 计算总计
+  let totalInput = 0, totalOutput = 0, totalRequests = 0;
+
+  if (tokenStatsFilter.window === 'day') {
+    totalInput = apiKeys.reduce((sum, k) => sum + (k.today_input_tokens || 0), 0);
+    totalOutput = apiKeys.reduce((sum, k) => sum + (k.today_output_tokens || 0), 0);
+    totalRequests = apiKeys.reduce((sum, k) => sum + (k.request_count_today || 0), 0);
+  } else if (tokenStatsFilter.window === 'week') {
+    totalInput = apiKeys.reduce((sum, k) => sum + (k.week_input_tokens || 0), 0);
+    totalOutput = apiKeys.reduce((sum, k) => sum + (k.week_output_tokens || 0), 0);
+    totalRequests = apiKeys.reduce((sum, k) => sum + (k.request_count_week || 0), 0);
+  } else {
+    totalInput = apiKeys.reduce((sum, k) => sum + (k.month_input_tokens || 0), 0);
+    totalOutput = apiKeys.reduce((sum, k) => sum + (k.month_output_tokens || 0), 0);
+    totalRequests = apiKeys.reduce((sum, k) => sum + (k.request_count_month || 0), 0);
+  }
+
+  const totalTokens = totalInput + totalOutput;
+  const inputPercent = totalTokens > 0 ? (totalInput / totalTokens * 100).toFixed(1) : 0;
+  const outputPercent = totalTokens > 0 ? (totalOutput / totalTokens * 100).toFixed(1) : 0;
+
+  return `
+    <div class="metrics-cards">
+      <div class="metric-card">
+        <div class="metric-label">总 Token 数</div>
+        <div class="metric-value">${formatCompactNumber(totalTokens)}</div>
+        <div class="token-ratio-bar">
+          <div class="token-ratio-input" style="width: ${inputPercent}%"></div>
+          <div class="token-ratio-output" style="width: ${outputPercent}%"></div>
+        </div>
+        <div class="token-ratio-legend">
+          <span class="legend-item"><span class="legend-dot input"></span>Input ${inputPercent}%</span>
+          <span class="legend-item"><span class="legend-dot output"></span>Output ${outputPercent}%</span>
+        </div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">Input Tokens</div>
+        <div class="metric-value" style="color: var(--success-600);">${formatCompactNumber(totalInput)}</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">Output Tokens</div>
+        <div class="metric-value" style="color: var(--warning-600);">${formatCompactNumber(totalOutput)}</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">请求数</div>
+        <div class="metric-value" style="color: var(--primary-600);">${formatCompactNumber(totalRequests)}</div>
+      </div>
+    </div>
+  `;
+}
+
+// 渲染 API Key Token 统计表格 - 增强版，支持排序、排名、进度条
+function renderApiKeyTokenStatsTable() {
+  const apiKeys = [...tokenStatsData.apiKeys]; // 复制数组避免修改原数据
+
+  if (apiKeys.length === 0) {
+    return '<div class="empty-state"><p>暂无 API Key 统计数据</p></div>';
+  }
+
+  // 计算所有数据并排序
+  const enrichedKeys = apiKeys.map(key => {
+    let inputTokens, outputTokens, totalTokens, requestCount;
+
+    if (tokenStatsFilter.window === 'day') {
+      inputTokens = key.today_input_tokens || 0;
+      outputTokens = key.today_output_tokens || 0;
+      totalTokens = key.today_total_tokens || 0;
+      requestCount = key.request_count_today || 0;
+    } else if (tokenStatsFilter.window === 'week') {
+      inputTokens = key.week_input_tokens || 0;
+      outputTokens = key.week_output_tokens || 0;
+      totalTokens = key.week_total_tokens || 0;
+      requestCount = key.request_count_week || 0;
+    } else {
+      inputTokens = key.month_input_tokens || 0;
+      outputTokens = key.month_output_tokens || 0;
+      totalTokens = key.month_total_tokens || 0;
+      requestCount = key.request_count_month || 0;
+    }
+
+    return {
+      ...key,
+      inputTokens,
+      outputTokens,
+      totalTokens,
+      requestCount
+    };
+  });
+
+  // 根据当前排序列排序
+  enrichedKeys.sort((a, b) => {
+    const col = apiKeySortState.column;
+    const order = apiKeySortState.order === 'asc' ? 1 : -1;
+
+    switch (col) {
+      case 'api_key_id':
+        return order * a.api_key_id.localeCompare(b.api_key_id);
+      case 'inputTokens':
+        return order * (a.inputTokens - b.inputTokens);
+      case 'outputTokens':
+        return order * (a.outputTokens - b.outputTokens);
+      case 'totalTokens':
+        return order * (a.totalTokens - b.totalTokens);
+      case 'requestCount':
+        return order * (a.requestCount - b.requestCount);
+      default:
+        return 0;
+    }
+  });
+
+  // 计算最大总 Token 数用于进度条
+  const maxTotalTokens = Math.max(...enrichedKeys.map(k => k.totalTokens), 1);
+
+  const rows = enrichedKeys.map((key, index) => {
+    const rank = index + 1;
+    const rankClass = rank === 1 ? 'top1' : rank === 2 ? 'top2' : rank === 3 ? 'top3' : '';
+    const progressPercent = (key.totalTokens / maxTotalTokens * 100).toFixed(1);
+
+    // 计算 Input/Output 比例
+    const inputPercent = key.totalTokens > 0 ? (key.inputTokens / key.totalTokens * 100).toFixed(0) : 50;
+    const outputPercent = key.totalTokens > 0 ? (key.outputTokens / key.totalTokens * 100).toFixed(0) : 50;
+
+    return `
+      <tr class="${rank <= 3 ? 'top-row' : ''}">
+        <td class="rank-cell">
+          ${rankClass ? `<span class="rank-badge ${rankClass}">${rank}</span>` : `<span class="rank-badge">${rank}</span>`}
+        </td>
+        <td><code class="apikey-code" title="${esc(key.api_key_id)}">${esc(key.api_key || key.api_key_id)}</code></td>
+        <td>
+          <div class="token-cell">
+            <span class="token-value">${formatNumber(key.inputTokens)}</span>
+            <div class="token-usage-bar">
+              <div class="token-usage-bar-input" style="width: ${inputPercent}%"></div>
+              <div class="token-usage-bar-output" style="width: ${outputPercent}%"></div>
+            </div>
+          </div>
+        </td>
+        <td>
+          <div class="token-cell">
+            <span class="token-value">${formatNumber(key.outputTokens)}</span>
+          </div>
+        </td>
+        <td>
+          <div class="token-total-cell">
+            <strong>${formatNumber(key.totalTokens)}</strong>
+            <div class="token-progress-bg">
+              <div class="token-progress-bar" style="width: ${progressPercent}%"></div>
+            </div>
+          </div>
+        </td>
+        <td>${formatNumber(key.requestCount)}</td>
+        <td>
+          <button class="btn btn-sm btn-ghost" onclick="showApiKeyTokenDetail('${esc(key.api_key_id)}')">
+            详情
+          </button>
+        </td>
+      </tr>
+    `;
+  }).join('');
+
+  return `
+    <table class="metrics-table token-stats-table">
+      <thead>
+        <tr>
+          <th class="rank-header">#</th>
+          <th onclick="sortApiKeyTokenStats('api_key_id')" class="sortable ${apiKeySortState.column === 'api_key_id' ? 'sorted' : ''}">
+            API Key ${getTokenStatsSortIcon('api_key_id', apiKeySortState.column, apiKeySortState.order)}
+          </th>
+          <th onclick="sortApiKeyTokenStats('inputTokens')" class="sortable ${apiKeySortState.column === 'inputTokens' ? 'sorted' : ''}">
+            Input Tokens ${getTokenStatsSortIcon('inputTokens', apiKeySortState.column, apiKeySortState.order)}
+          </th>
+          <th onclick="sortApiKeyTokenStats('outputTokens')" class="sortable ${apiKeySortState.column === 'outputTokens' ? 'sorted' : ''}">
+            Output Tokens ${getTokenStatsSortIcon('outputTokens', apiKeySortState.column, apiKeySortState.order)}
+          </th>
+          <th onclick="sortApiKeyTokenStats('totalTokens')" class="sortable ${apiKeySortState.column === 'totalTokens' ? 'sorted' : ''}">
+            总 Token 数 ${getTokenStatsSortIcon('totalTokens', apiKeySortState.column, apiKeySortState.order)}
+          </th>
+          <th onclick="sortApiKeyTokenStats('requestCount')" class="sortable ${apiKeySortState.column === 'requestCount' ? 'sorted' : ''}">
+            请求数 ${getTokenStatsSortIcon('requestCount', apiKeySortState.column, apiKeySortState.order)}
+          </th>
+          <th>操作</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${rows}
+      </tbody>
+    </table>
+  `;
+}
+
+// 渲染 Route Token 统计表格 - 增强版，支持排序、排名、进度条
+function renderRouteTokenStatsTable() {
+  const routes = [...tokenStatsData.routes]; // 复制数组避免修改原数据
+
+  if (routes.length === 0) {
+    return '<div class="empty-state"><p>暂无路由统计数据</p></div>';
+  }
+
+  // 计算所有数据并排序
+  const enrichedRoutes = routes.map(route => {
+    let inputTokens, outputTokens, totalTokens, requestCount;
+
+    if (tokenStatsFilter.window === 'day') {
+      inputTokens = route.today_input_tokens || 0;
+      outputTokens = route.today_output_tokens || 0;
+      totalTokens = route.today_total_tokens || 0;
+      requestCount = route.request_count_today || 0;
+    } else if (tokenStatsFilter.window === 'week') {
+      inputTokens = route.week_input_tokens || 0;
+      outputTokens = route.week_output_tokens || 0;
+      totalTokens = route.week_total_tokens || 0;
+      requestCount = route.request_count_week || 0;
+    } else {
+      inputTokens = route.month_input_tokens || 0;
+      outputTokens = route.month_output_tokens || 0;
+      totalTokens = route.month_total_tokens || 0;
+      requestCount = route.request_count_month || 0;
+    }
+
+    return {
+      ...route,
+      inputTokens,
+      outputTokens,
+      totalTokens,
+      requestCount
+    };
+  });
+
+  // 根据当前排序列排序
+  enrichedRoutes.sort((a, b) => {
+    const col = routeSortState.column;
+    const order = routeSortState.order === 'asc' ? 1 : -1;
+
+    switch (col) {
+      case 'route_id':
+        return order * a.route_id.localeCompare(b.route_id);
+      case 'inputTokens':
+        return order * (a.inputTokens - b.inputTokens);
+      case 'outputTokens':
+        return order * (a.outputTokens - b.outputTokens);
+      case 'totalTokens':
+        return order * (a.totalTokens - b.totalTokens);
+      case 'requestCount':
+        return order * (a.requestCount - b.requestCount);
+      default:
+        return 0;
+    }
+  });
+
+  // 计算最大总 Token 数用于进度条
+  const maxTotalTokens = Math.max(...enrichedRoutes.map(r => r.totalTokens), 1);
+
+  const rows = enrichedRoutes.map((route, index) => {
+    const rank = index + 1;
+    const rankClass = rank === 1 ? 'top1' : rank === 2 ? 'top2' : rank === 3 ? 'top3' : '';
+    const progressPercent = (route.totalTokens / maxTotalTokens * 100).toFixed(1);
+
+    // 计算 Input/Output 比例
+    const inputPercent = route.totalTokens > 0 ? (route.inputTokens / route.totalTokens * 100).toFixed(0) : 50;
+    const outputPercent = route.totalTokens > 0 ? (route.outputTokens / route.totalTokens * 100).toFixed(0) : 50;
+
+    return `
+      <tr class="${rank <= 3 ? 'top-row' : ''}">
+        <td class="rank-cell">
+          ${rankClass ? `<span class="rank-badge ${rankClass}">${rank}</span>` : `<span class="rank-badge">${rank}</span>`}
+        </td>
+        <td><code>${esc(route.route_id)}</code></td>
+        <td>
+          <div class="token-cell">
+            <span class="token-value">${formatNumber(route.inputTokens)}</span>
+            <div class="token-usage-bar">
+              <div class="token-usage-bar-input" style="width: ${inputPercent}%"></div>
+              <div class="token-usage-bar-output" style="width: ${outputPercent}%"></div>
+            </div>
+          </div>
+        </td>
+        <td>
+          <div class="token-cell">
+            <span class="token-value">${formatNumber(route.outputTokens)}</span>
+          </div>
+        </td>
+        <td>
+          <div class="token-total-cell">
+            <strong>${formatNumber(route.totalTokens)}</strong>
+            <div class="token-progress-bg">
+              <div class="token-progress-bar" style="width: ${progressPercent}%"></div>
+            </div>
+          </div>
+        </td>
+        <td>${formatNumber(route.requestCount)}</td>
+        <td>
+          <button class="btn btn-sm btn-ghost" onclick="showRouteTokenDetail('${esc(route.route_id)}')">
+            详情
+          </button>
+        </td>
+      </tr>
+    `;
+  }).join('');
+
+  return `
+    <table class="metrics-table token-stats-table">
+      <thead>
+        <tr>
+          <th class="rank-header">#</th>
+          <th onclick="sortRouteTokenStats('route_id')" class="sortable ${routeSortState.column === 'route_id' ? 'sorted' : ''}">
+            路由 ID ${getTokenStatsSortIcon('route_id', routeSortState.column, routeSortState.order)}
+          </th>
+          <th onclick="sortRouteTokenStats('inputTokens')" class="sortable ${routeSortState.column === 'inputTokens' ? 'sorted' : ''}">
+            Input Tokens ${getTokenStatsSortIcon('inputTokens', routeSortState.column, routeSortState.order)}
+          </th>
+          <th onclick="sortRouteTokenStats('outputTokens')" class="sortable ${routeSortState.column === 'outputTokens' ? 'sorted' : ''}">
+            Output Tokens ${getTokenStatsSortIcon('outputTokens', routeSortState.column, routeSortState.order)}
+          </th>
+          <th onclick="sortRouteTokenStats('totalTokens')" class="sortable ${routeSortState.column === 'totalTokens' ? 'sorted' : ''}">
+            总 Token 数 ${getTokenStatsSortIcon('totalTokens', routeSortState.column, routeSortState.order)}
+          </th>
+          <th onclick="sortRouteTokenStats('requestCount')" class="sortable ${routeSortState.column === 'requestCount' ? 'sorted' : ''}">
+            请求数 ${getTokenStatsSortIcon('requestCount', routeSortState.column, routeSortState.order)}
+          </th>
+          <th>操作</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${rows}
+      </tbody>
+    </table>
+  `;
+}
+
+// 渲染 Token 统计图表 - 使用 Chart.js
+function initTokenStatsCharts() {
+  const apiKeys = tokenStatsData.apiKeys;
+  if (!apiKeys || apiKeys.length === 0) return;
+
+  // 销毁旧图表
+  if (tokenTrendChart) {
+    tokenTrendChart.destroy();
+  }
+  if (tokenDistributionChart) {
+    tokenDistributionChart.destroy();
+  }
+
+  // 使用后端返回的真实时间序列数据
+  const timeSeries = tokenStatsData.summary?.time_series || [];
+
+  // 准备趋势图数据
+  let trendLabels, inputData, outputData;
+
+  if (timeSeries.length > 0) {
+    // 使用真实数据，根据用户本地时区格式化时间标签
+    trendLabels = timeSeries.map(p => formatTimeSeriesLabel(p.timestamp, tokenStatsFilter.window));
+    inputData = timeSeries.map(p => p.input_tokens);
+    outputData = timeSeries.map(p => p.output_tokens);
+  } else {
+    // 无数据时显示空的时间框架
+    trendLabels = generateTrendLabels();
+    inputData = new Array(trendLabels.length).fill(0);
+    outputData = new Array(trendLabels.length).fill(0);
+  }
+
+  // Token 趋势图 (柱状图)
+  const trendCtx = document.getElementById('tokenTrendChart');
+  if (trendCtx) {
+    tokenTrendChart = new Chart(trendCtx, {
+      type: 'bar',
+      data: {
+        labels: trendLabels,
+        datasets: [
+          {
+            label: 'Input Tokens',
+            data: inputData,
+            backgroundColor: 'rgba(16, 185, 129, 0.8)',
+            borderColor: 'rgba(16, 185, 129, 1)',
+            borderWidth: 1,
+            borderRadius: 4
+          },
+          {
+            label: 'Output Tokens',
+            data: outputData,
+            backgroundColor: 'rgba(245, 158, 11, 0.8)',
+            borderColor: 'rgba(245, 158, 11, 1)',
+            borderWidth: 1,
+            borderRadius: 4
+          }
+        ]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: {
+            position: 'top',
+            labels: {
+              usePointStyle: true,
+              padding: 15
+            }
+          }
+        },
+        scales: {
+          y: {
+            beginAtZero: true,
+            grid: {
+              color: 'rgba(0, 0, 0, 0.05)'
+            },
+            ticks: {
+              callback: function(value) {
+                return formatCompactNumber(value);
+              }
+            }
+          },
+          x: {
+            grid: {
+              display: false
+            }
+          }
+        }
+      }
+    });
+  }
+
+  // API Key 分布图 (环形图) - Top 5 + Others
+  const distributionCtx = document.getElementById('tokenDistributionChart');
+  if (distributionCtx) {
+    const topKeys = [...apiKeys]
+      .map(key => ({
+        id: key.api_key_id,
+        total: tokenStatsFilter.window === 'day'
+          ? (key.today_total_tokens || 0)
+          : tokenStatsFilter.window === 'week'
+            ? (key.week_total_tokens || 0)
+            : (key.month_total_tokens || 0)
+      }))
+      .sort((a, b) => b.total - a.total)
+      .slice(0, 5);
+
+    const top5Total = topKeys.reduce((sum, k) => sum + k.total, 0);
+    const allTotal = apiKeys.reduce((sum, k) => {
+      const tokens = tokenStatsFilter.window === 'day'
+        ? (k.today_total_tokens || 0)
+        : tokenStatsFilter.window === 'week'
+          ? (k.week_total_tokens || 0)
+          : (k.month_total_tokens || 0);
+      return sum + tokens;
+    }, 0);
+    const othersTotal = allTotal - top5Total;
+
+    const colors = [
+      'rgba(20, 184, 166, 0.8)',
+      'rgba(59, 130, 246, 0.8)',
+      'rgba(245, 158, 11, 0.8)',
+      'rgba(239, 68, 68, 0.8)',
+      'rgba(139, 92, 246, 0.8)',
+      'rgba(148, 163, 184, 0.6)'
+    ];
+
+    const labels = topKeys.map(k => k.id.substring(0, 8) + (k.id.length > 8 ? '...' : ''));
+    const data = topKeys.map(k => k.total);
+
+    if (othersTotal > 0) {
+      labels.push('其他');
+      data.push(othersTotal);
+    }
+
+    tokenDistributionChart = new Chart(distributionCtx, {
+      type: 'doughnut',
+      data: {
+        labels: labels,
+        datasets: [{
+          data: data,
+          backgroundColor: colors.slice(0, data.length),
+          borderWidth: 2,
+          borderColor: '#ffffff'
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        cutout: '60%',
+        plugins: {
+          legend: {
+            position: 'right',
+            labels: {
+              boxWidth: 12,
+              padding: 10,
+              font: {
+                size: 11
+              }
+            }
+          },
+          tooltip: {
+            callbacks: {
+              label: function(context) {
+                const value = context.raw;
+                const percentage = ((value / allTotal) * 100).toFixed(1);
+                return `${context.label}: ${formatCompactNumber(value)} (${percentage}%)`;
+              }
+            }
+          }
+        }
+      }
+    });
+  }
+}
+
+// 生成趋势图标签
+function generateTrendLabels() {
+  const window = tokenStatsFilter.window;
+  const labels = [];
+
+  if (window === 'day') {
+    // 今日：显示每 4 小时
+    for (let i = 0; i < 6; i++) {
+      labels.push(`${i * 4}:00`);
+    }
+  } else if (window === 'week') {
+    // 本周：显示每天
+    const days = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'];
+    const today = new Date().getDay();
+    const adjustedToday = today === 0 ? 6 : today - 1; // 转换为周一为第一天
+    for (let i = 0; i < 7; i++) {
+      const dayIndex = (adjustedToday - 6 + i + 7) % 7;
+      labels.push(days[dayIndex]);
+    }
+  } else {
+    // 本月：显示每周
+    for (let i = 1; i <= 4; i++) {
+      labels.push(`第 ${i} 周`);
+    }
+  }
+
+  return labels;
+}
+
+// 根据用户本地时区格式化时间序列标签
+function formatTimeSeriesLabel(timestamp, window) {
+  // timestamp 是 Unix 时间戳（秒）
+  const date = new Date(timestamp * 1000);
+
+  switch (window) {
+    case 'day':
+      // 显示小时: 格式如 "14:00"
+      return date.toLocaleTimeString('zh-CN', {
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: false
+      });
+    case 'week':
+    case 'month':
+      // 显示月-日: 格式如 "03-04"
+      return date.toLocaleDateString('zh-CN', {
+        month: '2-digit',
+        day: '2-digit'
+      });
+    default:
+      return date.toLocaleString('zh-CN');
+  }
+}
+
+// 生成趋势图数据 - 基于实际数据按比例分配模拟时间序列
+function generateTrendData() {
+  const apiKeys = tokenStatsData.apiKeys;
+  const window = tokenStatsFilter.window;
+
+  let totalInput = 0, totalOutput = 0;
+
+  if (window === 'day') {
+    totalInput = apiKeys.reduce((sum, k) => sum + (k.today_input_tokens || 0), 0);
+    totalOutput = apiKeys.reduce((sum, k) => sum + (k.today_output_tokens || 0), 0);
+  } else if (window === 'week') {
+    totalInput = apiKeys.reduce((sum, k) => sum + (k.week_input_tokens || 0), 0);
+    totalOutput = apiKeys.reduce((sum, k) => sum + (k.week_output_tokens || 0), 0);
+  } else {
+    totalInput = apiKeys.reduce((sum, k) => sum + (k.month_input_tokens || 0), 0);
+    totalOutput = apiKeys.reduce((sum, k) => sum + (k.month_output_tokens || 0), 0);
+  }
+
+  const pointCount = window === 'day' ? 6 : window === 'week' ? 7 : 4;
+
+  // 使用时间分布模拟：下午和晚上使用量更高
+  const distribution = window === 'day'
+    ? [0.05, 0.1, 0.15, 0.25, 0.3, 0.15] // 每4小时
+    : window === 'week'
+      ? [0.12, 0.13, 0.14, 0.15, 0.18, 0.16, 0.12] // 每天
+      : [0.2, 0.25, 0.3, 0.25]; // 每周
+
+  return {
+    input: distribution.map(d => Math.round(totalInput * d)),
+    output: distribution.map(d => Math.round(totalOutput * d))
+  };
+}
+
+// 排序 API Key Token 统计
+function sortApiKeyTokenStats(column) {
+  if (apiKeySortState.column === column) {
+    apiKeySortState.order = apiKeySortState.order === 'asc' ? 'desc' : 'asc';
+  } else {
+    apiKeySortState.column = column;
+    apiKeySortState.order = 'desc';
+  }
+  renderTokenStats();
+}
+
+// 排序 Route Token 统计
+function sortRouteTokenStats(column) {
+  if (routeSortState.column === column) {
+    routeSortState.order = routeSortState.order === 'asc' ? 'desc' : 'asc';
+  } else {
+    routeSortState.column = column;
+    routeSortState.order = 'desc';
+  }
+  renderTokenStats();
+}
+
+// 获取排序图标 (Token统计页面用)
+function getTokenStatsSortIcon(column, currentColumn, currentOrder) {
+  if (column !== currentColumn) {
+    return '<svg class="sort-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m7 15 5 5 5-5M7 9l5-5 5 5"/></svg>';
+  }
+  return currentOrder === 'asc'
+    ? '<svg class="sort-icon active" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m18 15-6-6-6 6"/></svg>'
+    : '<svg class="sort-icon active" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6"/></svg>';
+}
+
+// 格式化数字为紧凑形式 (1.2K, 1.5M)
+function formatCompactNumber(num) {
+  if (num === null || num === undefined) return '-';
+  if (num >= 1000000) return (num / 1000000).toFixed(1) + 'M';
+  if (num >= 1000) return (num / 1000).toFixed(1) + 'K';
+  return num.toLocaleString('zh-CN');
+}
+
+// 格式化数字（添加千位分隔符）
+function formatNumber(num) {
+  if (num === null || num === undefined) return '-';
+  return num.toLocaleString('zh-CN');
+}
+
+// 切换时间窗口
+async function changeTokenStatsWindow(window) {
+  tokenStatsFilter.window = window;
+  await loadTokenStats();
+  renderTokenStats();
+}
+
+// 刷新 Token 统计
+async function refreshTokenStats() {
+  await loadTokenStats();
+  renderTokenStats();
+  Toast.show('Token 统计数据已刷新', 'success');
+}
+
+// 显示 API Key Token 详情 - 增强版，添加趋势图和配额环形图
+async function showApiKeyTokenDetail(apiKeyId) {
+  const detail = await loadApiKeyTokenStats(apiKeyId);
+  if (!detail) {
+    Toast.show('加载详情失败', 'error');
+    return;
+  }
+
+  const modal = document.createElement('div');
+  modal.className = 'modal-overlay';
+  modal.id = 'token-stats-detail-modal';
+
+  const summary = detail.summary;
+  const quota = detail.quota;
+
+  let inputTokens, outputTokens, totalTokens, requestCount;
+  if (tokenStatsFilter.window === 'day') {
+    inputTokens = summary.today_input_tokens || 0;
+    outputTokens = summary.today_output_tokens || 0;
+    totalTokens = summary.today_total_tokens || 0;
+    requestCount = summary.request_count_today || 0;
+  } else if (tokenStatsFilter.window === 'week') {
+    inputTokens = summary.week_input_tokens || 0;
+    outputTokens = summary.week_output_tokens || 0;
+    totalTokens = summary.week_total_tokens || 0;
+    requestCount = summary.request_count_week || 0;
+  } else {
+    inputTokens = summary.month_input_tokens || 0;
+    outputTokens = summary.month_output_tokens || 0;
+    totalTokens = summary.month_total_tokens || 0;
+    requestCount = summary.request_count_month || 0;
+  }
+
+  // 计算占比
+  const totalAllTokens = tokenStatsData.apiKeys.reduce((sum, k) => {
+    const tokens = tokenStatsFilter.window === 'day'
+      ? (k.today_total_tokens || 0)
+      : tokenStatsFilter.window === 'week'
+        ? (k.week_total_tokens || 0)
+        : (k.month_total_tokens || 0);
+    return sum + tokens;
+  }, 0);
+  const usagePercent = totalAllTokens > 0 ? ((totalTokens / totalAllTokens) * 100).toFixed(1) : 0;
+  const avgTokensPerRequest = requestCount > 0 ? Math.round(totalTokens / requestCount) : 0;
+
+  // 配额可视化
+  let quotaHtml = '';
+  if (quota && (quota.daily_total_limit || quota.weekly_total_limit)) {
+    quotaHtml = renderQuotaSection(quota);
+  }
+
+  // 使用实际的API Key值显示（如果有的话）
+  const displayKey = summary.api_key || apiKeyId;
+
+  modal.innerHTML = `
+    <div class="modal token-stats-modal" role="dialog" aria-modal="true">
+      <div class="modal-header">
+        <h3 class="modal-title">API Key Token 详情: <code class="apikey-code">${esc(displayKey)}</code></h3>
+        <button class="btn btn-ghost btn-sm" onclick="closeTokenStatsDetailModal()">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M18 6 6 18M6 6l12 12"/>
+          </svg>
+        </button>
+      </div>
+      <div class="modal-body">
+        <div class="token-stats-detail-grid">
+          <div class="stat-box highlight">
+            <div class="stat-box-value">${formatNumber(totalTokens)}</div>
+            <div class="stat-box-label">总 Token 数</div>
+            <div class="stat-box-percent">占总量 ${usagePercent}%</div>
+          </div>
+          <div class="stat-box">
+            <div class="stat-box-value" style="color: var(--success-600);">${formatNumber(inputTokens)}</div>
+            <div class="stat-box-label">Input Tokens</div>
+          </div>
+          <div class="stat-box">
+            <div class="stat-box-value" style="color: var(--warning-600);">${formatNumber(outputTokens)}</div>
+            <div class="stat-box-label">Output Tokens</div>
+          </div>
+          <div class="stat-box">
+            <div class="stat-box-value" style="color: var(--primary-600);">${formatNumber(requestCount)}</div>
+            <div class="stat-box-label">请求数</div>
+            <div class="stat-box-percent">平均 ${formatCompactNumber(avgTokensPerRequest)}/请求</div>
+          </div>
+        </div>
+
+        <!-- Token 分布图表 -->
+        <div class="token-detail-chart-container">
+          <h4 class="section-title">Token 使用分布</h4>
+          <div class="token-detail-charts">
+            <div class="token-detail-chart-item">
+              <canvas id="apiKeyDetailPieChart"></canvas>
+            </div>
+            <div class="token-detail-stats">
+              <div class="token-detail-stat-row">
+                <span class="stat-dot" style="background: var(--success-500);"></span>
+                <span class="stat-label">Input</span>
+                <span class="stat-value">${formatNumber(inputTokens)}</span>
+                <span class="stat-percent">${totalTokens > 0 ? ((inputTokens / totalTokens) * 100).toFixed(1) : 0}%</span>
+              </div>
+              <div class="token-detail-stat-row">
+                <span class="stat-dot" style="background: var(--warning-500);"></span>
+                <span class="stat-label">Output</span>
+                <span class="stat-value">${formatNumber(outputTokens)}</span>
+                <span class="stat-percent">${totalTokens > 0 ? ((outputTokens / totalTokens) * 100).toFixed(1) : 0}%</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        ${quotaHtml}
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" onclick="closeTokenStatsDetailModal()">关闭</button>
+      </div>
+    </div>
+  `;
+
+  document.body.appendChild(modal);
+
+  // 初始化 Input/Output 饼图
+  setTimeout(() => {
+    const ctx = document.getElementById('apiKeyDetailPieChart');
+    if (ctx) {
+      new Chart(ctx, {
+        type: 'doughnut',
+        data: {
+          labels: ['Input', 'Output'],
+          datasets: [{
+            data: [inputTokens, outputTokens],
+            backgroundColor: ['rgba(16, 185, 129, 0.8)', 'rgba(245, 158, 11, 0.8)'],
+            borderWidth: 2,
+            borderColor: '#ffffff'
+          }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          cutout: '65%',
+          plugins: {
+            legend: { display: false }
+          }
+        }
+      });
+    }
+  }, 100);
+
+  modal.addEventListener('click', (e) => {
+    if (e.target === modal) closeTokenStatsDetailModal();
+  });
+}
+
+// 渲染配额可视化
+function renderQuotaSection(quota) {
+  const sections = [];
+
+  if (quota.daily_total_limit) {
+    const percent = Math.min(100, (quota.daily_used_total / quota.daily_total_limit) * 100);
+    const status = percent > 90 ? 'danger' : percent > 70 ? 'warning' : 'success';
+    sections.push(`
+      <div class="quota-ring-item">
+        <div class="quota-ring ${status}" style="--percent: ${percent}">
+          <div class="quota-ring-inner">
+            <span class="quota-percent">${percent.toFixed(0)}%</span>
+          </div>
+        </div>
+        <div class="quota-ring-info">
+          <div class="quota-ring-title">每日限额</div>
+          <div class="quota-ring-value">${formatCompactNumber(quota.daily_used_total)} / ${formatCompactNumber(quota.daily_total_limit)}</div>
+        </div>
+      </div>
+    `);
+  }
+
+  if (quota.weekly_total_limit) {
+    const percent = Math.min(100, (quota.weekly_used_total / quota.weekly_total_limit) * 100);
+    const status = percent > 90 ? 'danger' : percent > 70 ? 'warning' : 'success';
+    sections.push(`
+      <div class="quota-ring-item">
+        <div class="quota-ring ${status}" style="--percent: ${percent}">
+          <div class="quota-ring-inner">
+            <span class="quota-percent">${percent.toFixed(0)}%</span>
+          </div>
+        </div>
+        <div class="quota-ring-info">
+          <div class="quota-ring-title">每周限额</div>
+          <div class="quota-ring-value">${formatCompactNumber(quota.weekly_used_total)} / ${formatCompactNumber(quota.weekly_total_limit)}</div>
+        </div>
+      </div>
+    `);
+  }
+
+  if (sections.length === 0) return '';
+
+  return `
+    <div class="token-detail-quota">
+      <h4 class="section-title">配额使用情况</h4>
+      <div class="quota-rings">
+        ${sections.join('')}
+      </div>
+    </div>
+  `;
+}
+
+// 显示 Route Token 详情 - 增强版
+async function showRouteTokenDetail(routeId) {
+  const detail = await loadRouteTokenStats(routeId);
+  if (!detail) {
+    Toast.show('加载详情失败', 'error');
+    return;
+  }
+
+  const modal = document.createElement('div');
+  modal.className = 'modal-overlay';
+  modal.id = 'token-stats-detail-modal';
+
+  const summary = detail.summary;
+
+  let inputTokens, outputTokens, totalTokens, requestCount;
+  if (tokenStatsFilter.window === 'day') {
+    inputTokens = summary.today_input_tokens || 0;
+    outputTokens = summary.today_output_tokens || 0;
+    totalTokens = summary.today_total_tokens || 0;
+    requestCount = summary.request_count_today || 0;
+  } else if (tokenStatsFilter.window === 'week') {
+    inputTokens = summary.week_input_tokens || 0;
+    outputTokens = summary.week_output_tokens || 0;
+    totalTokens = summary.week_total_tokens || 0;
+    requestCount = summary.request_count_week || 0;
+  } else {
+    inputTokens = summary.month_input_tokens || 0;
+    outputTokens = summary.month_output_tokens || 0;
+    totalTokens = summary.month_total_tokens || 0;
+    requestCount = summary.request_count_month || 0;
+  }
+
+  // 计算占比
+  const totalAllTokens = tokenStatsData.routes.reduce((sum, r) => {
+    const tokens = tokenStatsFilter.window === 'day'
+      ? (r.today_total_tokens || 0)
+      : tokenStatsFilter.window === 'week'
+        ? (r.week_total_tokens || 0)
+        : (r.month_total_tokens || 0);
+    return sum + tokens;
+  }, 0);
+  const usagePercent = totalAllTokens > 0 ? ((totalTokens / totalAllTokens) * 100).toFixed(1) : 0;
+  const avgTokensPerRequest = requestCount > 0 ? Math.round(totalTokens / requestCount) : 0;
+
+  modal.innerHTML = `
+    <div class="modal token-stats-modal" role="dialog" aria-modal="true">
+      <div class="modal-header">
+        <h3 class="modal-title">路由 Token 详情: ${esc(routeId)}</h3>
+        <button class="btn btn-ghost btn-sm" onclick="closeTokenStatsDetailModal()">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M18 6 6 18M6 6l12 12"/>
+          </svg>
+        </button>
+      </div>
+      <div class="modal-body">
+        <div class="token-stats-detail-grid">
+          <div class="stat-box highlight">
+            <div class="stat-box-value">${formatNumber(totalTokens)}</div>
+            <div class="stat-box-label">总 Token 数</div>
+            <div class="stat-box-percent">占总量 ${usagePercent}%</div>
+          </div>
+          <div class="stat-box">
+            <div class="stat-box-value" style="color: var(--success-600);">${formatNumber(inputTokens)}</div>
+            <div class="stat-box-label">Input Tokens</div>
+          </div>
+          <div class="stat-box">
+            <div class="stat-box-value" style="color: var(--warning-600);">${formatNumber(outputTokens)}</div>
+            <div class="stat-box-label">Output Tokens</div>
+          </div>
+          <div class="stat-box">
+            <div class="stat-box-value" style="color: var(--primary-600);">${formatNumber(requestCount)}</div>
+            <div class="stat-box-label">请求数</div>
+            <div class="stat-box-percent">平均 ${formatCompactNumber(avgTokensPerRequest)}/请求</div>
+          </div>
+        </div>
+
+        <!-- Token 分布图表 -->
+        <div class="token-detail-chart-container">
+          <h4 class="section-title">Token 使用分布</h4>
+          <div class="token-detail-charts">
+            <div class="token-detail-chart-item">
+              <canvas id="routeDetailPieChart"></canvas>
+            </div>
+            <div class="token-detail-stats">
+              <div class="token-detail-stat-row">
+                <span class="stat-dot" style="background: var(--success-500);"></span>
+                <span class="stat-label">Input</span>
+                <span class="stat-value">${formatNumber(inputTokens)}</span>
+                <span class="stat-percent">${totalTokens > 0 ? ((inputTokens / totalTokens) * 100).toFixed(1) : 0}%</span>
+              </div>
+              <div class="token-detail-stat-row">
+                <span class="stat-dot" style="background: var(--warning-500);"></span>
+                <span class="stat-label">Output</span>
+                <span class="stat-value">${formatNumber(outputTokens)}</span>
+                <span class="stat-percent">${totalTokens > 0 ? ((outputTokens / totalTokens) * 100).toFixed(1) : 0}%</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" onclick="closeTokenStatsDetailModal()">关闭</button>
+      </div>
+    </div>
+  `;
+
+  document.body.appendChild(modal);
+
+  // 初始化 Input/Output 饼图
+  setTimeout(() => {
+    const ctx = document.getElementById('routeDetailPieChart');
+    if (ctx) {
+      new Chart(ctx, {
+        type: 'doughnut',
+        data: {
+          labels: ['Input', 'Output'],
+          datasets: [{
+            data: [inputTokens, outputTokens],
+            backgroundColor: ['rgba(16, 185, 129, 0.8)', 'rgba(245, 158, 11, 0.8)'],
+            borderWidth: 2,
+            borderColor: '#ffffff'
+          }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          cutout: '65%',
+          plugins: {
+            legend: { display: false }
+          }
+        }
+      });
+    }
+  }, 100);
+
+  modal.addEventListener('click', (e) => {
+    if (e.target === modal) closeTokenStatsDetailModal();
+  });
+}
+
+// 关闭 Token 统计详情弹窗
+function closeTokenStatsDetailModal() {
+  const modal = document.getElementById('token-stats-detail-modal');
+  if (modal) modal.remove();
+}

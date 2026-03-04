@@ -3,6 +3,7 @@ use crate::api_keys::ban_log::{BanLogEntry, BanLogStore};
 use crate::api_keys::current_epoch_seconds;
 use crate::config::ResolvedApiKey;
 use crate::ratelimit::{RateLimitDecision, RateLimiter};
+use crate::token_quota::{TokenQuotaChecker, CheckQuotaResult};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
@@ -15,6 +16,7 @@ pub enum ApiKeyError {
     RouteNotAllowed,
     RateLimitExceeded { retry_after_secs: u64 },
     ConcurrencyLimitExceeded,
+    TokenQuotaExceeded { quota_type: String, limit: u64, used: u64 },
 }
 
 impl std::fmt::Display for ApiKeyError {
@@ -34,6 +36,9 @@ impl std::fmt::Display for ApiKeyError {
                 write!(f, "Rate limit exceeded, retry after {} seconds", retry_after_secs)
             }
             ApiKeyError::ConcurrencyLimitExceeded => write!(f, "Concurrency limit exceeded"),
+            ApiKeyError::TokenQuotaExceeded { quota_type, limit, used } => {
+                write!(f, "Token quota exceeded: {} limit {}/{} tokens", quota_type, used, limit)
+            }
         }
     }
 }
@@ -61,6 +66,8 @@ pub struct ApiKeyManager {
     ban_rules: Vec<BanRule>,
     /// 封禁引擎的最大时间窗口（用于初始化每个 key 的计数器）
     _ban_max_window_secs: u64,
+    /// Token配额检查器
+    token_quota_checker: Option<Arc<TokenQuotaChecker>>,
 }
 
 #[derive(Debug)]
@@ -77,6 +84,7 @@ impl ApiKeyManager {
         resolved_keys: Vec<ResolvedApiKey>,
         ban_log_store: Option<Arc<dyn BanLogStore>>,
         global_ban_rules: Vec<BanRule>,
+        token_quota_checker: Option<Arc<TokenQuotaChecker>>,
     ) -> Self {
         let mut keys = HashMap::new();
         let mut id_index = HashMap::new();
@@ -132,6 +140,7 @@ impl ApiKeyManager {
             ban_log_store,
             ban_rules: global_ban_rules,
             _ban_max_window_secs: ban_max_window_secs,
+            token_quota_checker,
         }
     }
 
@@ -176,12 +185,14 @@ impl ApiKeyManager {
         })
     }
 
-    pub async fn check_rate_limit(&self, key_value: &str, route_id: &str) -> Result<(), ApiKeyError> {
+    pub async fn check_rate_limit(&self, key_value: &str, _route_id: &str) -> Result<(), ApiKeyError> {
         let keys = self.keys.read().await;
         let info = keys.get(key_value).ok_or(ApiKeyError::KeyNotFound)?;
 
         if let Some(limiter) = &info.rate_limiter {
-            match limiter.check(&info.resolved.id, route_id) {
+            // API Key 级别的限流是针对该 Key 的全局限制，不区分路由
+            // 使用固定的 key 来统计该 API Key 的所有请求
+            match limiter.check(&info.resolved.id, "global") {
                 RateLimitDecision::Allowed => Ok(()),
                 RateLimitDecision::Rejected { retry_after_secs } => {
                     Err(ApiKeyError::RateLimitExceeded { retry_after_secs })
@@ -204,6 +215,163 @@ impl ApiKeyManager {
         } else {
             Ok(None)
         }
+    }
+
+    /// 检查Token配额
+    pub fn check_token_quota(&self, key_value: &str) -> Result<CheckQuotaResult, ApiKeyError> {
+        if let Some(checker) = &self.token_quota_checker {
+            // 获取API Key ID
+            // 注意：这里我们使用key_value作为临时ID，实际应该使用key_id
+            // 但由于check_token_quota是同步方法，无法async获取key_id
+            // 我们将在validate_key之后调用此方法，传入key_id
+            let key_id = self.get_key_id_sync(key_value);
+            if let Some(id) = key_id {
+                let result = checker.check_quota(&id);
+                if !result.allowed {
+                    // 构造错误信息
+                    if let Some(limit) = result.daily_limit_total {
+                        if result.daily_used_total >= limit {
+                            return Err(ApiKeyError::TokenQuotaExceeded {
+                                quota_type: "daily_total".to_string(),
+                                limit,
+                                used: result.daily_used_total,
+                            });
+                        }
+                    }
+                    if let Some(limit) = result.daily_limit_input {
+                        if result.daily_used_input >= limit {
+                            return Err(ApiKeyError::TokenQuotaExceeded {
+                                quota_type: "daily_input".to_string(),
+                                limit,
+                                used: result.daily_used_input,
+                            });
+                        }
+                    }
+                    if let Some(limit) = result.daily_limit_output {
+                        if result.daily_used_output >= limit {
+                            return Err(ApiKeyError::TokenQuotaExceeded {
+                                quota_type: "daily_output".to_string(),
+                                limit,
+                                used: result.daily_used_output,
+                            });
+                        }
+                    }
+                    if let Some(limit) = result.weekly_limit_total {
+                        if result.weekly_used_total >= limit {
+                            return Err(ApiKeyError::TokenQuotaExceeded {
+                                quota_type: "weekly_total".to_string(),
+                                limit,
+                                used: result.weekly_used_total,
+                            });
+                        }
+                    }
+                }
+                return Ok(result);
+            }
+        }
+        // 无配额限制时返回默认允许的结果
+        Ok(CheckQuotaResult {
+            allowed: true,
+            daily_used_input: 0,
+            daily_used_output: 0,
+            daily_used_total: 0,
+            daily_limit_input: None,
+            daily_limit_output: None,
+            daily_limit_total: None,
+            daily_remaining_input: None,
+            daily_remaining_output: None,
+            daily_remaining_total: None,
+            weekly_used_input: 0,
+            weekly_used_output: 0,
+            weekly_used_total: 0,
+            weekly_limit_input: None,
+            weekly_limit_output: None,
+            weekly_limit_total: None,
+            weekly_remaining_input: None,
+            weekly_remaining_output: None,
+            weekly_remaining_total: None,
+            reason: None,
+        })
+    }
+
+    /// 检查Token配额（使用key_id版本）
+    pub fn check_token_quota_by_id(&self, key_id: &str) -> Result<CheckQuotaResult, ApiKeyError> {
+        if let Some(checker) = &self.token_quota_checker {
+            let result = checker.check_quota(key_id);
+            if !result.allowed {
+                if let Some(limit) = result.daily_limit_total {
+                    if result.daily_used_total >= limit {
+                        return Err(ApiKeyError::TokenQuotaExceeded {
+                            quota_type: "daily_total".to_string(),
+                            limit,
+                            used: result.daily_used_total,
+                        });
+                    }
+                }
+                if let Some(limit) = result.daily_limit_input {
+                    if result.daily_used_input >= limit {
+                        return Err(ApiKeyError::TokenQuotaExceeded {
+                            quota_type: "daily_input".to_string(),
+                            limit,
+                            used: result.daily_used_input,
+                        });
+                    }
+                }
+                if let Some(limit) = result.daily_limit_output {
+                    if result.daily_used_output >= limit {
+                        return Err(ApiKeyError::TokenQuotaExceeded {
+                            quota_type: "daily_output".to_string(),
+                            limit,
+                            used: result.daily_used_output,
+                        });
+                    }
+                }
+                if let Some(limit) = result.weekly_limit_total {
+                    if result.weekly_used_total >= limit {
+                        return Err(ApiKeyError::TokenQuotaExceeded {
+                            quota_type: "weekly_total".to_string(),
+                            limit,
+                            used: result.weekly_used_total,
+                        });
+                    }
+                }
+            }
+            return Ok(result);
+        }
+        Ok(CheckQuotaResult {
+            allowed: true,
+            daily_used_input: 0,
+            daily_used_output: 0,
+            daily_used_total: 0,
+            daily_limit_input: None,
+            daily_limit_output: None,
+            daily_limit_total: None,
+            daily_remaining_input: None,
+            daily_remaining_output: None,
+            daily_remaining_total: None,
+            weekly_used_input: 0,
+            weekly_used_output: 0,
+            weekly_used_total: 0,
+            weekly_limit_input: None,
+            weekly_limit_output: None,
+            weekly_limit_total: None,
+            weekly_remaining_input: None,
+            weekly_remaining_output: None,
+            weekly_remaining_total: None,
+            reason: None,
+        })
+    }
+
+    /// 同步获取key_id（用于非async上下文）
+    fn get_key_id_sync(&self, key_value: &str) -> Option<String> {
+        // 由于无法使用async/await，我们尝试通过迭代id_index来查找
+        // 这是一个折衷方案，实际使用中应该优先使用key_id
+        Some(crate::api_keys::generate_key_id(key_value))
+    }
+
+    /// 获取token配额检查器
+    pub fn token_quota_checker(&self) -> Option<&Arc<TokenQuotaChecker>> {
+        self.token_quota_checker.as_ref()
     }
 
     pub async fn report_request_result(
@@ -412,6 +580,7 @@ impl ApiKeyManager {
 pub async fn create_api_key_manager(
     config: &crate::config::AppConfig,
     old_manager: Option<&ApiKeyManager>,
+    token_quota_checker: Option<Arc<TokenQuotaChecker>>,
 ) -> Option<ApiKeyManager> {
     let resolved_keys = config.resolved_api_keys();
     if resolved_keys.is_empty() {
@@ -439,7 +608,7 @@ pub async fn create_api_key_manager(
             }
         };
 
-        let new_manager = ApiKeyManager::new(resolved_keys, ban_log_store, global_ban_rules);
+        let new_manager = ApiKeyManager::new(resolved_keys, ban_log_store, global_ban_rules, token_quota_checker);
 
         // 如果有旧的 manager，迁移封禁状态
         if let Some(old) = old_manager {

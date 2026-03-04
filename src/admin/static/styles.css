@@ -1562,9 +1562,17 @@ body {
 }
 
 .sort-icon {
+  width: 14px;
+  height: 14px;
+  vertical-align: middle;
   margin-left: var(--space-1);
   font-size: 12px;
   color: var(--primary-600);
+  opacity: 0.4;
+}
+
+.sort-icon.active {
+  opacity: 1;
 }
 
 .sort-inactive {
@@ -3486,5 +3494,591 @@ body {
 
   .gateway-nav-item {
     white-space: nowrap;
+  }
+}
+
+/* ===== Token 统计页面样式 ===== */
+
+/* Token 统计图表区域 */
+.token-stats-charts {
+  display: grid;
+  grid-template-columns: 2fr 1fr;
+  gap: var(--space-5);
+  margin-bottom: var(--space-6);
+}
+
+@media (max-width: 1024px) {
+  .token-stats-charts {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* 区域标题 */
+.token-stats-section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: var(--space-3);
+}
+
+.token-stats-section-header h3 {
+  font-size: 1rem;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin: 0;
+}
+
+.token-stats-count {
+  font-size: 0.875rem;
+  color: var(--text-tertiary);
+}
+
+/* Token 比例进度条 (总览卡片内) */
+.token-ratio-bar {
+  display: flex;
+  height: 6px;
+  border-radius: var(--radius-full);
+  overflow: hidden;
+  margin-top: var(--space-3);
+  background: var(--bg-tertiary);
+}
+
+.token-ratio-input {
+  background: linear-gradient(90deg, var(--success-500), var(--success-600));
+  transition: width 0.3s ease;
+}
+
+.token-ratio-output {
+  background: linear-gradient(90deg, var(--warning-500), var(--warning-600));
+  transition: width 0.3s ease;
+}
+
+.token-ratio-legend {
+  display: flex;
+  gap: var(--space-3);
+  margin-top: var(--space-2);
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+}
+
+.legend-item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+.legend-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: var(--radius-full);
+}
+
+.legend-dot.input {
+  background: var(--success-500);
+}
+
+.legend-dot.output {
+  background: var(--warning-500);
+}
+
+/* 表格样式增强 */
+.token-stats-table {
+  width: 100%;
+}
+
+.token-stats-table th {
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+
+.token-stats-table th.sortable:hover {
+  background: var(--bg-tertiary);
+}
+
+.token-stats-table th.sorted {
+  color: var(--primary-600);
+}
+
+.token-stats-table .sort-icon {
+  width: 14px;
+  height: 14px;
+  vertical-align: middle;
+  margin-left: var(--space-1);
+  opacity: 0.4;
+}
+
+.token-stats-table .sort-icon.active {
+  opacity: 1;
+}
+
+/* 排名标识 */
+.rank-header {
+  width: 50px;
+  text-align: center;
+}
+
+.rank-cell {
+  text-align: center;
+}
+
+.rank-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  border-radius: var(--radius-md);
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+}
+
+.rank-badge.top1 {
+  background: linear-gradient(135deg, #fbbf24, #f59e0b);
+  color: white;
+}
+
+.rank-badge.top2 {
+  background: linear-gradient(135deg, #94a3b8, #64748b);
+  color: white;
+}
+
+.rank-badge.top3 {
+  background: linear-gradient(135deg, #f97316, #ea580c);
+  color: white;
+}
+
+/* Top 3 行高亮 */
+.token-stats-table tr.top-row {
+  background: linear-gradient(90deg, rgba(20, 184, 166, 0.03), transparent);
+}
+
+/* Token 单元格 */
+.token-cell {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.token-value {
+  font-weight: 500;
+}
+
+/* Token 使用量进度条 */
+.token-usage-bar {
+  display: flex;
+  height: 4px;
+  border-radius: var(--radius-full);
+  overflow: hidden;
+  background: var(--bg-tertiary);
+  width: 100px;
+}
+
+.token-usage-bar-input {
+  background: linear-gradient(90deg, var(--success-500), var(--success-600));
+}
+
+.token-usage-bar-output {
+  background: linear-gradient(90deg, var(--warning-500), var(--warning-600));
+}
+
+/* 总计单元格 */
+.token-total-cell {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.token-progress-bg {
+  height: 4px;
+  background: var(--bg-tertiary);
+  border-radius: var(--radius-full);
+  overflow: hidden;
+  width: 100px;
+}
+
+.token-progress-bar {
+  height: 100%;
+  background: linear-gradient(90deg, var(--primary-500), var(--primary-600));
+  border-radius: var(--radius-full);
+  transition: width 0.3s ease;
+}
+
+/* 详情弹窗增强 */
+.token-stats-detail-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: var(--space-4);
+  margin-bottom: var(--space-6);
+}
+
+@media (max-width: 768px) {
+  .token-stats-detail-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+.stat-box.highlight {
+  background: linear-gradient(135deg, var(--primary-50), var(--bg-secondary));
+  border-color: var(--primary-200);
+}
+
+.stat-box-percent {
+  font-size: 0.75rem;
+  color: var(--text-tertiary);
+  margin-top: var(--space-1);
+}
+
+/* Token 分布图表容器 */
+.token-detail-chart-container {
+  margin: var(--space-5) 0;
+  padding: var(--space-5);
+  background: var(--bg-secondary);
+  border-radius: var(--radius-xl);
+}
+
+.token-detail-chart-container .section-title {
+  margin-bottom: var(--space-4);
+  font-size: 0.875rem;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.token-detail-charts {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--space-5);
+  align-items: center;
+}
+
+.token-detail-chart-item {
+  height: 180px;
+}
+
+.token-detail-stats {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.token-detail-stat-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-2) 0;
+}
+
+.token-detail-stat-row .stat-dot {
+  width: 12px;
+  height: 12px;
+  border-radius: var(--radius-full);
+  flex-shrink: 0;
+}
+
+.token-detail-stat-row .stat-label {
+  flex: 1;
+  font-size: 0.875rem;
+  color: var(--text-secondary);
+}
+
+.token-detail-stat-row .stat-value {
+  font-size: 0.875rem;
+  font-weight: 500;
+  color: var(--text-primary);
+}
+
+.token-detail-stat-row .stat-percent {
+  font-size: 0.75rem;
+  color: var(--text-tertiary);
+  min-width: 50px;
+  text-align: right;
+}
+
+/* 配额环形图 */
+.token-detail-quota {
+  margin-top: var(--space-5);
+  padding: var(--space-5);
+  background: var(--bg-secondary);
+  border-radius: var(--radius-xl);
+}
+
+.token-detail-quota .section-title {
+  margin-bottom: var(--space-4);
+  font-size: 0.875rem;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.quota-rings {
+  display: flex;
+  gap: var(--space-6);
+  flex-wrap: wrap;
+}
+
+.quota-ring-item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+}
+
+.quota-ring {
+  --percent: 0;
+  width: 80px;
+  height: 80px;
+  border-radius: 50%;
+  background: conic-gradient(
+    var(--ring-color, var(--success-500)) calc(var(--percent) * 1%),
+    var(--bg-tertiary) 0
+  );
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+}
+
+.quota-ring.success {
+  --ring-color: var(--success-500);
+}
+
+.quota-ring.warning {
+  --ring-color: var(--warning-500);
+}
+
+.quota-ring.danger {
+  --ring-color: var(--danger-500);
+}
+
+.quota-ring-inner {
+  width: 64px;
+  height: 64px;
+  background: var(--bg-secondary);
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.quota-percent {
+  font-size: 1rem;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.quota-ring-info {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.quota-ring-title {
+  font-size: 0.875rem;
+  color: var(--text-secondary);
+}
+
+.quota-ring-value {
+  font-size: 0.875rem;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+/* 旧样式保留兼容 */
+.stats-overview {
+  margin-bottom: var(--space-8);
+}
+
+.stats-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: var(--space-4);
+}
+
+.stat-card {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+  padding: var(--space-5);
+  background: var(--bg-primary);
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-sm);
+  transition: box-shadow 0.2s ease, transform 0.2s ease;
+}
+
+.stat-card:hover {
+  box-shadow: var(--shadow-md);
+  transform: translateY(-2px);
+}
+
+.stat-card-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 48px;
+  height: 48px;
+  border-radius: var(--radius-xl);
+  flex-shrink: 0;
+}
+
+.stat-card-content {
+  flex: 1;
+  min-width: 0;
+}
+
+.stat-card-value {
+  font-size: 1.5rem;
+  font-weight: 600;
+  color: var(--text-primary);
+  line-height: 1.2;
+  margin-bottom: var(--space-1);
+}
+
+.stat-card-label {
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
+
+/* 统计详情弹窗 */
+.token-stats-modal {
+  max-width: 700px;
+  width: 90%;
+}
+
+.stats-detail-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: var(--space-4);
+  margin-bottom: var(--space-6);
+}
+
+.stat-box {
+  text-align: center;
+  padding: var(--space-5);
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-lg);
+}
+
+.stat-box-value {
+  font-size: 1.75rem;
+  font-weight: 700;
+  color: var(--text-primary);
+  margin-bottom: var(--space-1);
+}
+
+.stat-box-label {
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
+
+/* 配额进度条 */
+.quota-item {
+  margin-bottom: var(--space-4);
+}
+
+.quota-item:last-child {
+  margin-bottom: 0;
+}
+
+.quota-label {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: var(--space-2);
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
+
+.quota-progress {
+  height: 8px;
+  background: var(--bg-tertiary);
+  border-radius: var(--radius-full);
+  overflow: hidden;
+}
+
+.quota-progress-bar {
+  height: 100%;
+  background: linear-gradient(90deg, var(--success-500), var(--success-600));
+  border-radius: var(--radius-full);
+  transition: width 0.3s ease;
+}
+
+.quota-progress-bar.warning {
+  background: linear-gradient(90deg, var(--warning-500), var(--warning-600));
+}
+
+.quota-progress-bar.danger {
+  background: linear-gradient(90deg, var(--danger-500), var(--danger-600));
+}
+
+/* 表格样式优化 */
+.data-table th,
+.data-table td {
+  white-space: nowrap;
+}
+
+.data-table td code {
+  font-size: var(--text-xs);
+  padding: 2px 6px;
+  background: var(--bg-tertiary);
+  border-radius: var(--radius-md);
+}
+
+/* 空状态 */
+.empty-state {
+  text-align: center;
+  padding: var(--space-12) var(--space-6);
+  color: var(--text-secondary);
+}
+
+.empty-state svg {
+  margin-bottom: var(--space-4);
+  opacity: 0.5;
+}
+
+.empty-state p {
+  margin: 0;
+}
+
+.empty-state p:first-of-type {
+  font-size: var(--text-lg);
+  font-weight: 500;
+  color: var(--text-primary);
+  margin-bottom: var(--space-2);
+}
+
+.empty-state .text-secondary {
+  font-size: var(--text-sm);
+  color: var(--text-tertiary);
+}
+
+/* 响应式 */
+@media (max-width: 768px) {
+  .stats-cards {
+    grid-template-columns: repeat(2, 1fr);
+  }
+
+  .stats-detail-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .stat-card {
+    padding: var(--space-4);
+  }
+
+  .stat-card-icon {
+    width: 40px;
+    height: 40px;
+  }
+
+  .stat-card-value {
+    font-size: 1.25rem;
+  }
+}
+
+@media (max-width: 480px) {
+  .stats-cards {
+    grid-template-columns: 1fr;
   }
 }
