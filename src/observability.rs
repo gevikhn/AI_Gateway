@@ -370,13 +370,16 @@ impl GatewayMetrics {
         }
 
         // Update token stats if token_label is provided
+        // Skip if route_id is empty (e.g., failed preflight requests)
         if let Some(label) = token_label {
-            let mut token_stats = self.route_token_stats.entry(route_id.to_string()).or_default();
-            if let Some(bucket) = ensure_request_bucket(
-                token_stats.token_buckets.entry(label.to_string()).or_default(),
-                minute_epoch,
-            ) {
-                bucket.requests = bucket.requests.saturating_add(1);
+            if !route_id.is_empty() {
+                let mut token_stats = self.route_token_stats.entry(route_id.to_string()).or_default();
+                if let Some(bucket) = ensure_request_bucket(
+                    token_stats.token_buckets.entry(label.to_string()).or_default(),
+                    minute_epoch,
+                ) {
+                    bucket.requests = bucket.requests.saturating_add(1);
+                }
             }
         }
 
@@ -580,6 +583,10 @@ impl GatewayMetrics {
         let mut tokens: Vec<TokenWindowSummary> = Vec::new();
         for entry in self.route_token_stats.iter() {
             let route_id = entry.key();
+            // Skip empty route_ids (e.g., from failed preflight requests)
+            if route_id.is_empty() {
+                continue;
+            }
             for (token, buckets) in &entry.token_buckets {
                 let mut requests_1h = 0_u64;
                 let mut requests_24h = 0_u64;

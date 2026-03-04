@@ -85,7 +85,7 @@ impl TokenExtractor {
         let usage = match json_value.get("usage") {
             Some(u) => u,
             None => {
-                tracing::warn!("No 'usage' field found in response body, keys: {:?}", json_value.as_object().map(|o| o.keys().collect::<Vec<_>>()));
+                tracing::debug!("No 'usage' field found in response body, keys: {:?}", json_value.as_object().map(|o| o.keys().collect::<Vec<_>>()));
                 return None;
             }
         };
@@ -253,7 +253,7 @@ impl TokenExtractor {
                 }
             }
         } else {
-            tracing::warn!("No 'usage' field found in SSE JSON");
+            tracing::debug!("No 'usage' field found in SSE JSON");
         }
 
         // 有些SSE流可能将usage放在不同的嵌套位置
