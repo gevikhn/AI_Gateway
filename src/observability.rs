@@ -18,10 +18,8 @@ use prometheus_client::registry::Registry;
 use serde::Serialize;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Pool, Row, Sqlite};
-use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, VecDeque};
 use std::fs;
-use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -972,11 +970,8 @@ fn epoch_millis_now() -> u64 {
 
 pub fn token_label(token: &str) -> String {
     let token = token.trim();
-    let mut hasher = DefaultHasher::new();
-    token.hash(&mut hasher);
-    let short_hash = hasher.finish() as u32;
     if token.is_empty() {
-        return format!("***#{short_hash:08x}");
+        return "***".to_string();
     }
 
     let prefix: String = token.chars().take(3).collect();
@@ -989,9 +984,9 @@ pub fn token_label(token: &str) -> String {
         .rev()
         .collect();
     if token.chars().count() <= 5 {
-        return format!("{prefix}***#{short_hash:08x}");
+        return format!("{prefix}***");
     }
-    format!("{prefix}***{suffix}#{short_hash:08x}")
+    format!("{prefix}***{suffix}")
 }
 
 pub fn extract_or_generate_request_id(headers: &HeaderMap) -> String {

@@ -273,7 +273,34 @@ async fn admin_metrics_handler(
     if !is_admin_authorized(&state, &headers) {
         return json_error(StatusCode::UNAUTHORIZED, "unauthorized");
     }
-    if let Some(summary) = state.observability.snapshot_summary() {
+    if let Some(mut summary) = state.observability.snapshot_summary() {
+        // 获取当前配置中的有效路由 ID 集合
+        let runtime = state.runtime.load();
+        let valid_route_ids: std::collections::HashSet<String> = runtime
+            .config
+            .routes
+            .iter()
+            .map(|r| r.id.clone())
+            .collect();
+
+        // 过滤并标记路由统计
+        // 1. 移除 "__unmatched__" 和空字符串路由
+        // 2. 对于已删除的路由（存在于监控中但不在配置中），添加 "deleted" 标记
+        summary.routes.retain(|r| !r.route_id.is_empty() && r.route_id != "__unmatched__");
+        for route in &mut summary.routes {
+            if !valid_route_ids.contains(&route.route_id) {
+                route.route_id = format!("{} (deleted)", route.route_id);
+            }
+        }
+
+        // 同样处理 token 统计中的路由
+        summary.tokens.retain(|t| !t.route_id.is_empty() && t.route_id != "__unmatched__");
+        for token in &mut summary.tokens {
+            if !valid_route_ids.contains(&token.route_id) {
+                token.route_id = format!("{} (deleted)", token.route_id);
+            }
+        }
+
         json_ok(&summary)
     } else {
         json_error(StatusCode::NOT_FOUND, "metrics_not_available")

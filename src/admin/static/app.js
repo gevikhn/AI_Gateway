@@ -2922,7 +2922,7 @@ function renderMetrics() {
         <canvas id="routeChart"></canvas>
       </div>
       <div class="chart-container">
-        <h3 class="chart-title">Token 使用量分布 (24h)</h3>
+        <h3 class="chart-title">APIKEY 使用量分布 (24h)</h3>
         <canvas id="tokenChart"></canvas>
       </div>
     </div>
@@ -3057,7 +3057,7 @@ function initCharts(routeData, tokenData) {
     });
   }
 
-  // Token 饼图
+  // APIKEY 饼图
   const tokenCtx = document.getElementById('tokenChart');
   if (tokenCtx && tokenData.length > 0) {
     const colors = [
